@@ -1,0 +1,275 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		BB00000000000000000001 /* AuxCamApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000001 /* AuxCamApp.swift */; };
+		BB00000000000000000002 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000002 /* AppSettings.swift */; };
+		BB00000000000000000003 /* StreamPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000003 /* StreamPlayer.swift */; };
+		BB00000000000000000004 /* VideoLayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000004 /* VideoLayerView.swift */; };
+		BB00000000000000000005 /* Recorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000005 /* Recorder.swift */; };
+		BB00000000000000000006 /* VideoPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000006 /* VideoPicker.swift */; };
+		BB00000000000000000007 /* PanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000007 /* PanelView.swift */; };
+		BB00000000000000000008 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000008 /* ContentView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AA00000000000000000001 /* AuxCamApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuxCamApp.swift; sourceTree = "<group>"; };
+		AA00000000000000000002 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		AA00000000000000000003 /* StreamPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamPlayer.swift; sourceTree = "<group>"; };
+		AA00000000000000000004 /* VideoLayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoLayerView.swift; sourceTree = "<group>"; };
+		AA00000000000000000005 /* Recorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Recorder.swift; sourceTree = "<group>"; };
+		AA00000000000000000006 /* VideoPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPicker.swift; sourceTree = "<group>"; };
+		AA00000000000000000007 /* PanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PanelView.swift; sourceTree = "<group>"; };
+		AA00000000000000000008 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		AA00000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		AA00000000000000000010 /* AuxCam.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AuxCam.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		CC00000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		CC00000000000000000003 = {
+			isa = PBXGroup;
+			children = (
+				CC00000000000000000004 /* AuxCam */,
+				CC00000000000000000005 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		CC00000000000000000004 /* AuxCam */ = {
+			isa = PBXGroup;
+			children = (
+				AA00000000000000000001 /* AuxCamApp.swift */,
+				AA00000000000000000002 /* AppSettings.swift */,
+				AA00000000000000000003 /* StreamPlayer.swift */,
+				AA00000000000000000004 /* VideoLayerView.swift */,
+				AA00000000000000000005 /* Recorder.swift */,
+				AA00000000000000000006 /* VideoPicker.swift */,
+				AA00000000000000000007 /* PanelView.swift */,
+				AA00000000000000000008 /* ContentView.swift */,
+				AA00000000000000000009 /* Info.plist */,
+			);
+			path = AuxCam;
+			sourceTree = "<group>";
+		};
+		CC00000000000000000005 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AA00000000000000000010 /* AuxCam.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		DD00000000000000000001 /* AuxCam */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = EE00000000000000000002 /* Build configuration list for PBXNativeTarget "AuxCam" */;
+			buildPhases = (
+				CC00000000000000000001 /* Sources */,
+				CC00000000000000000002 /* Frameworks */,
+				CC00000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AuxCam;
+			productName = AuxCam;
+			productReference = AA00000000000000000010 /* AuxCam.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		DD00000000000000000002 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					DD00000000000000000001 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = EE00000000000000000001 /* Build configuration list for PBXProject "AuxCam" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = CC00000000000000000003;
+			productRefGroup = CC00000000000000000005 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				DD00000000000000000001 /* AuxCam */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		CC00000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		CC00000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BB00000000000000000001 /* AuxCamApp.swift in Sources */,
+				BB00000000000000000002 /* AppSettings.swift in Sources */,
+				BB00000000000000000003 /* StreamPlayer.swift in Sources */,
+				BB00000000000000000004 /* VideoLayerView.swift in Sources */,
+				BB00000000000000000005 /* Recorder.swift in Sources */,
+				BB00000000000000000006 /* VideoPicker.swift in Sources */,
+				BB00000000000000000007 /* PanelView.swift in Sources */,
+				BB00000000000000000008 /* ContentView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		FF00000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		FF00000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		FF00000000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AuxCam/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.auxcam.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		FF00000000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = AuxCam/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.auxcam.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		EE00000000000000000001 /* Build configuration list for PBXProject "AuxCam" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FF00000000000000000001 /* Debug */,
+				FF00000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		EE00000000000000000002 /* Build configuration list for PBXNativeTarget "AuxCam" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FF00000000000000000003 /* Debug */,
+				FF00000000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = DD00000000000000000002 /* Project object */;
+}
