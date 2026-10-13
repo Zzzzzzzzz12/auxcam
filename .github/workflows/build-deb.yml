@@ -8,26 +8,36 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: 装 Theos
+      - uses: Randomblock1/theos-action@v1
+        with:
+          theos-dir: ${{ github.workspace }}/theos
+      - name: 环境检查
         run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "$HOME/theos/bin" >> $GITHUB_PATH
-      - name: 下 SDK
-        run: |
-          curl -L -o /tmp/sdks.zip https://github.com/theos/sdks/archive/master.zip
-          unzip -q /tmp/sdks.zip -d /tmp
-          mkdir -p $THEOS/sdks
-          cp -R /tmp/sdks-master/iPhoneOS16.5.sdk $THEOS/sdks/ 2>/dev/null || true
-          cp -R /tmp/sdks-master/iPhoneOS15.6.sdk $THEOS/sdks/ 2>/dev/null || true
-          ls -1 $THEOS/sdks || true
-      - name: 编译
+          echo "THEOS=$THEOS"
+          ls -1 "$THEOS" | head -30 || true
+          ls -1 "$THEOS/sdks" || true
+          for t in dpkg-deb ldid fakeroot make clang; do
+            printf "%s -> %s\n" "$t" "$(which $t 2>/dev/null || echo 缺)"
+          done
+          ls -la tweak/ || true
+      - name: 编译插件
         working-directory: tweak
+        env:
+          THEOS: ${{ github.workspace }}/theos
         run: |
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless 2>&1 | tail -60
-          ls -la packages/ 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+      - name: 找产物
+        if: always()
+        run: |
+          ls -la tweak/packages/ 2>/dev/null || echo "(没 packages)"
+          find . -name "*.deb" 2>/dev/null || true
+          find tweak/.theos -name "*.dylib" 2>/dev/null | head || true
+      - name: 上传 deb
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: AuxCam-deb
-          path: tweak/packages/*.deb
-          if-no-files-found: error
+          path: |
+            tweak/packages/*.deb
+            tweak/**/*.deb
+          if-no-files-found: warn
