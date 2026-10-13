@@ -1,0 +1,9 @@
+Package: com.auxcam.tweak
+Name: AuxCam Tweak
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 把相机画面换成电脑推过来的视频（越狱插件）
+Maintainer: AuxCam
+Author: AuxCam
+Section: Tweaks
+Depends: mobilesubstrate

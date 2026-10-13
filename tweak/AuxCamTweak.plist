@@ -1,0 +1,1 @@
+{ Filter = { Bundles = ( "com.ss.iphone.ugc.Aweme", "com.ss.iphone.ugc.AwemeMarketing", "com.tencent.xin", "com.apple.camera", "com.apple.MobileSMS", "com.ss.iphone.ugc.Express", "com.kuaishou.nebula", "com.jiangjia.gif" ); }; }
