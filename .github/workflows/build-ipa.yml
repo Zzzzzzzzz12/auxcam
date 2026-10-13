@@ -12,15 +12,14 @@ jobs:
       - name: 编译
         working-directory: ios-app
         run: |
-          xcodebuild -project AuxCam.xcodeproj -target AuxCam -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" build
+          xcodebuild -project AuxCam.xcodeproj -scheme AuxCam -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" build
       - name: 打包 IPA
         working-directory: ios-app
         run: |
-          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
-          if [ -z "$APP" ]; then echo "没编出 app"; exit 1; fi
+          ls -la build/Build/Products/Release-iphoneos/ || true
           rm -rf Payload AuxCam.ipa
           mkdir -p Payload
-          cp -R "$APP" Payload/
+          cp -R build/Build/Products/Release-iphoneos/AuxCam.app Payload/
           zip -qry AuxCam.ipa Payload
           ls -lh AuxCam.ipa
       - name: 上传
