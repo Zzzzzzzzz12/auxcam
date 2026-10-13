@@ -1,56 +1,48 @@
-name: build-deb
-on:
-  push:
-    branches: [main, master]
-  workflow_dispatch:
+name: bd
+on: [push, workflow_dispatch]
 jobs:
-  build:
+  b:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: Randomblock1/theos-action@v1
-        with:
-          theos-dir: ${{ github.workspace }}/theos
-
-      - name: 鍐?Makefile 骞剁紪璇?        working-directory: tweak
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          printf '%s\n' 'TARGET = iphone:latest:15.0' 'include $(THEOS)/makefiles/common.mk' '' 'TWEAK_NAME = AuxCamTweak' 'AuxCamTweak_FILES = Tweak.xm' 'AuxCamTweak_CFLAGS = -fobjc-arc -Wno-deprecated-declarations' 'AuxCamTweak_FRAMEWORKS = UIKit Foundation AVFoundation AVKit CoreMedia CoreVideo CoreImage' '' 'include $(THEOS_MAKE_PATH)/tweak.mk' > Makefile
-          echo "===== Makefile ====="
-          cat Makefile
-          echo "===== 缂栬瘧 ====="
-          make || true
-          echo "===== 浜х墿 ====="
-          find . -name "*.dylib" 2>/dev/null || true
-
-      - name: 鎵?deb
-        working-directory: tweak
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          DYLIB=$(find . -name "AuxCamTweak.dylib" | head -1)
-          echo "dylib=$DYLIB"
-          if [ -z "$DYLIB" ]; then echo "娌＄紪鍑烘潵"; ls -la .theos 2>/dev/null; exit 1; fi
-          rm -rf /tmp/pkg
-          mkdir -p /tmp/pkg/Library/MobileSubstrate/DynamicLibraries
-          mkdir -p /tmp/pkg/DEBIAN
-          cp "$DYLIB" /tmp/pkg/Library/MobileSubstrate/DynamicLibraries/AuxCamTweak.dylib
-          cp AuxCamTweak.plist /tmp/pkg/Library/MobileSubstrate/DynamicLibraries/AuxCamTweak.plist
-          printf '%s\n' 'Package: com.auxcam.tweak' 'Name: AuxCam Tweak' 'Version: 1.0.0' 'Architecture: iphoneos-arm64' 'Description: AuxCam virtual camera' 'Maintainer: AuxCam' 'Author: AuxCam' 'Section: Tweaks' 'Depends: mobilesubstrate' > /tmp/pkg/DEBIAN/control
-          mkdir -p packages
-          dpkg-deb -b /tmp/pkg packages/AuxCamTweak.deb
-          echo "===== 鎵撳ソ浜?====="
-          ls -la packages/
-          dpkg-deb -c packages/AuxCamTweak.deb
-
-      - name: 涓婁紶
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: AuxCam-deb
-          path: |
-            tweak/packages/*.deb
-            tweak/**/*.deb
-          if-no-files-found: warn
+    - uses: actions/checkout@v4
+    - uses: Randomblock1/theos-action@v1
+    - name: build
+      run: |
+        cd tweak
+        echo "TARGET = iphone:latest:15.0" > Makefile
+        echo "include \$(THEOS)/makefiles/common.mk" >> Makefile
+        echo "TWEAK_NAME = AuxCamTweak" >> Makefile
+        echo "AuxCamTweak_FILES = Tweak.xm" >> Makefile
+        echo "AuxCamTweak_CFLAGS = -fobjc-arc" >> Makefile
+        echo "AuxCamTweak_FRAMEWORKS = UIKit Foundation AVFoundation AVKit CoreMedia CoreVideo" >> Makefile
+        echo "include \$(THEOS_MAKE_PATH)/tweak.mk" >> Makefile
+        cat Makefile
+        make
+        find . -name "*.dylib"
+    - name: pack
+      run: |
+        cd tweak
+        D=$(find . -name AuxCamTweak.dylib | head -1)
+        echo "dylib=$D"
+        rm -rf /tmp/p
+        mkdir -p /tmp/p/Library/MobileSubstrate/DynamicLibraries
+        mkdir -p /tmp/p/DEBIAN
+        cp "$D" /tmp/p/Library/MobileSubstrate/DynamicLibraries/AuxCamTweak.dylib
+        cp AuxCamTweak.plist /tmp/p/Library/MobileSubstrate/DynamicLibraries/AuxCamTweak.plist
+        echo "Package: com.auxcam.tweak" > /tmp/p/DEBIAN/control
+        echo "Name: AuxCam Tweak" >> /tmp/p/DEBIAN/control
+        echo "Version: 1.0.0" >> /tmp/p/DEBIAN/control
+        echo "Architecture: iphoneos-arm64" >> /tmp/p/DEBIAN/control
+        echo "Description: AuxCam virtual camera" >> /tmp/p/DEBIAN/control
+        echo "Maintainer: AuxCam" >> /tmp/p/DEBIAN/control
+        echo "Author: AuxCam" >> /tmp/p/DEBIAN/control
+        echo "Section: Tweaks" >> /tmp/p/DEBIAN/control
+        mkdir -p packages
+        dpkg-deb -b /tmp/p packages/AuxCamTweak.deb
+        ls -la packages/
+        dpkg-deb -c packages/AuxCamTweak.deb
+    - uses: actions/upload-artifact@v4
+      with:
+        name: AuxCam-deb
+        path: tweak/packages/*.deb
+        if-no-files-found: warn
