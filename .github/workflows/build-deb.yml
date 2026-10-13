@@ -1,38 +1,53 @@
 name: build-deb
+
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: macos-14
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: Randomblock1/theos-action@v1
-        with:
-          theos-dir: ${{ github.workspace }}/theos
-      - name: 环境检查
+      - name: 鍙栦唬鐮?        uses: actions/checkout@v4
+
+      - name: 瑁?roothide 鐗?Theos
         run: |
+          git clone --recursive --depth 1 https://github.com/roothide/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+          ls -1 $HOME/theos | head -20
+
+      - name: 涓?iOS SDK
+        run: |
+          curl -L -o /tmp/sdks.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q /tmp/sdks.zip -d /tmp
+          mkdir -p $THEOS/sdks
+          for s in iPhoneOS16.5.sdk iPhoneOS15.6.sdk iPhoneOS14.5.sdk; do
+            cp -R /tmp/sdks-master/$s $THEOS/sdks/ 2>/dev/null && echo "鏀惧ソ $s" && break
+          done
+          ls -1 $THEOS/sdks || true
+
+      - name: 鐜妫€鏌?        run: |
           echo "THEOS=$THEOS"
-          ls -1 "$THEOS" | head -30 || true
-          ls -1 "$THEOS/sdks" || true
           for t in dpkg-deb ldid fakeroot make clang; do
-            printf "%s -> %s\n" "$t" "$(which $t 2>/dev/null || echo 缺)"
+            printf "%s -> %s\n" "$t" "$(which $t 2>/dev/null || echo 缂?"
           done
           ls -la tweak/ || true
-      - name: 编译插件
-        working-directory: tweak
+
+      - name: 缂栬瘧锛坮oothide 瑙勬牸锛?        working-directory: tweak
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-      - name: 找产物
-        if: always()
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - name: 鎵句骇鐗?        if: always()
         run: |
-          ls -la tweak/packages/ 2>/dev/null || echo "(没 packages)"
+          ls -la tweak/packages/ 2>/dev/null || echo "(娌?packages)"
           find . -name "*.deb" 2>/dev/null || true
-          find tweak/.theos -name "*.dylib" 2>/dev/null | head || true
-      - name: 上传 deb
+
+      - name: 涓婁紶 deb
         if: always()
         uses: actions/upload-artifact@v4
         with:
