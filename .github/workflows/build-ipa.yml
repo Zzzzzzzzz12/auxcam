@@ -1,0 +1,31 @@
+name: build-ipa
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+      - name: 编译
+        working-directory: ios-app
+        run: |
+          xcodebuild -project AuxCam.xcodeproj -target AuxCam -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" build
+      - name: 打包 IPA
+        working-directory: ios-app
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP" ]; then echo "没编出 app"; exit 1; fi
+          rm -rf Payload AuxCam.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry AuxCam.ipa Payload
+          ls -lh AuxCam.ipa
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuxCam-ipa
+          path: ios-app/AuxCam.ipa
+          if-no-files-found: error
