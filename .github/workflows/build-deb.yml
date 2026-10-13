@@ -1,0 +1,33 @@
+name: build-deb
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: 装 Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+      - name: 下 SDK
+        run: |
+          curl -L -o /tmp/sdks.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q /tmp/sdks.zip -d /tmp
+          mkdir -p $THEOS/sdks
+          cp -R /tmp/sdks-master/iPhoneOS16.5.sdk $THEOS/sdks/ 2>/dev/null || true
+          cp -R /tmp/sdks-master/iPhoneOS15.6.sdk $THEOS/sdks/ 2>/dev/null || true
+          ls -1 $THEOS/sdks || true
+      - name: 编译
+        working-directory: tweak
+        run: |
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless 2>&1 | tail -60
+          ls -la packages/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AuxCam-deb
+          path: tweak/packages/*.deb
+          if-no-files-found: error
