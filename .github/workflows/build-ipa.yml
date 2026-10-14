@@ -2,13 +2,14 @@ name: ba
 on: [push, workflow_dispatch]
 jobs:
   b:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
     - uses: actions/checkout@v4
     - name: tools
       run: |
         brew install xcodegen || true
         xcodegen --version || true
+        xcodebuild -version || true
     - name: build
       run: |
         cd ios-app
