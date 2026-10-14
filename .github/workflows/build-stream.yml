@@ -1,0 +1,32 @@
+name: bs
+on: [push, workflow_dispatch]
+jobs:
+  b:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Randomblock1/theos-action@v1
+    - name: build
+      run: |
+        cd tweak-stream
+        echo "TARGET = iphone:latest:15.0" > Makefile
+        echo "ARCHS = arm64 arm64e" >> Makefile
+        echo "include \$(THEOS)/makefiles/common.mk" >> Makefile
+        echo "TWEAK_NAME = AuxCamStream" >> Makefile
+        echo "AuxCamStream_FILES = Tweak.xm" >> Makefile
+        echo "AuxCamStream_CFLAGS = -fobjc-arc -Wno-everything" >> Makefile
+        echo "AuxCamStream_FRAMEWORKS = Foundation AVFoundation CoreMedia CoreVideo" >> Makefile
+        echo "include \$(THEOS_MAKE_PATH)/tweak.mk" >> Makefile
+        cat Makefile
+        make 2>&1 | tail -60 || true
+        echo "--- 找 dylib ---"
+        find . -name "*.dylib"
+        mkdir -p out
+        D=$(find . -name AuxCamStream.dylib | head -1)
+        echo "dylib=$D"
+        cp "$D" out/ || exit 1
+        ls -l out
+    - uses: actions/upload-artifact@v4
+      with:
+        name: auxcamstream
+        path: tweak-stream/out/
