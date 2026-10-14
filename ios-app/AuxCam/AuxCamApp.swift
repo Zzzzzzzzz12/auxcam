@@ -69,6 +69,7 @@ struct ContentView: View {
     @State private var picker: PhotosPickerItem?
     @State private var pickedName = ""
     @State private var player: AVPlayer?
+    @AppStorage("streamURL") private var streamURL = "http://192.168.31.141:8899/live.m3u8"
 
     var body: some View {
         NavigationStack {
@@ -106,6 +107,26 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: mode) { _, m in Link.send(["cmd": "mode", "mode": m]) }
+
+                // 流地址（局域网）：输入框 + 一键应用
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("电脑推流地址（局域网）").font(.footnote).foregroundStyle(.secondary)
+                    HStack {
+                        TextField("http://192.168.31.141:8899/live.m3u8", text: $streamURL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
+                            .keyboardType(.URL)
+                            .font(.footnote)
+                            .textFieldStyle(.roundedBorder)
+                        Button("用这个") {
+                            Link.send(["cmd": "mode", "mode": mode, "url": streamURL])
+                        }
+                        .font(.footnote)
+                        .buttonStyle(.borderedProminent)
+                    }
+                    Text("填电脑的 IP（可以只填 192.168.31.141，路径自动补）")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
 
                 // 选视频
                 PhotosPicker(selection: $picker, matching: .videos) {
