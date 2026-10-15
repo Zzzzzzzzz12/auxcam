@@ -33,7 +33,7 @@ jobs:
         </plist>
         PLIST
         printf 'APPL????' > out/Payload/AuxCam.app/PkgInfo
-        xcrun -sdk iphoneos swiftc -parse-as-library -O -w -target arm64-apple-ios16.0 -sdk "$SDK" \
+        xcrun -sdk iphoneos swiftc -parse-as-library -O -target arm64-apple-ios17.0 -sdk "$SDK" \
           -o out/Payload/AuxCam.app/AuxCam AuxCam/AuxCamApp.swift \
           -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI -framework CoreMedia -framework AVFoundation 2>&1 | tail -25
         chmod 755 out/Payload/AuxCam.app/AuxCam
