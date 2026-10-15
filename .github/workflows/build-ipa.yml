@@ -5,36 +5,43 @@ jobs:
     runs-on: macos-15
     steps:
     - uses: actions/checkout@v4
-    - name: tools
-      run: |
-        brew install xcodegen || true
-        xcodegen --version || true
-        xcodebuild -version || true
     - name: build
       run: |
         cd ios-app
-        rm -rf build out
-        xcodegen generate
-        xcodebuild -project AuxCam.xcodeproj -scheme AuxCam -configuration Release \
-          -sdk iphoneos -destination 'generic/platform=iOS' \
-          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-          -derivedDataPath build build 2>&1 | tail -25
-        echo "--- 找 app ---"
-        APP=$(find build/Build/Products -maxdepth 3 -name "AuxCam.app" | head -1)
-        echo "app=$APP"
-        ls -la "$APP" || true
-        ls -la "$APP/AuxCam" || true
-        if [ ! -f "$APP/AuxCam" ]; then
-          EXE=$(find build -type f -name AuxCam | grep -v "\.app/" | head -1)
-          echo "补二进制: $EXE"
-          if [ -n "$EXE" ]; then cp "$EXE" "$APP/AuxCam"; chmod 755 "$APP/AuxCam"; fi
-        fi
-        mkdir -p out/Payload
-        ditto "$APP" out/Payload/AuxCam.app
-        ls -la out/Payload/AuxCam.app | head -20
+        rm -rf out
+        mkdir -p out/Payload/AuxCam.app
+        SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+        echo "SDK=$SDK"
+        cat > out/Payload/AuxCam.app/Info.plist <<'PLIST'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>CFBundleExecutable</key><string>AuxCam</string>
+          <key>CFBundleIdentifier</key><string>com.auxcam.app</string>
+          <key>CFBundleName</key><string>AuxCam</string>
+          <key>CFBundleDisplayName</key><string>AuxCam</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>1.0</string>
+          <key>CFBundleVersion</key><string>1</string>
+          <key>MinimumOSVersion</key><string>16.0</string>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UILaunchScreen</key><dict/>
+          <key>NSPhotoLibraryUsageDescription</key><string>需要从相册选择要作为相机画面的视频</string>
+          <key>NSLocalNetworkUsageDescription</key><string>需要连接电脑上的直播流</string>
+        </dict>
+        </plist>
+        PLIST
+        printf 'APPL????' > out/Payload/AuxCam.app/PkgInfo
+        xcrun -sdk iphoneos swiftc -parse-as-library -O -w -target arm64-apple-ios16.0 -sdk "$SDK" \
+          -o out/Payload/AuxCam.app/AuxCam AuxCam/AuxCamApp.swift \
+          -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI -framework CoreMedia -framework AVFoundation 2>&1 | tail -25
+        chmod 755 out/Payload/AuxCam.app/AuxCam
+        ls -la out/Payload/AuxCam.app
+        file out/Payload/AuxCam.app/AuxCam || true
         cd out && ditto -c -k --keepParent Payload AuxCam.ipa
         ls -l AuxCam.ipa
-        unzip -l AuxCam.ipa | head -20
+        unzip -l AuxCam.ipa
     - uses: actions/upload-artifact@v4
       with:
         name: auxcamipa
