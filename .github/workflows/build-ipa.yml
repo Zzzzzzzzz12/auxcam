@@ -30,10 +30,21 @@ jobs:
           <key>NSPhotoLibraryUsageDescription</key><string>需要从相册选择要作为相机画面的视频</string>
           <key>NSLocalNetworkUsageDescription</key><string>需要连接电脑上的直播流</string>
           <key>NSCameraUsageDescription</key><string>需要显示当下相机的画面预览</string>
+          <key>CFBundleIconFiles</key><array><string>Icon-120</string><string>Icon-180</string></array>
+          <key>CFBundleIcons</key>
+          <dict>
+            <key>CFBundlePrimaryIcon</key>
+            <dict>
+              <key>CFBundleIconFiles</key><array><string>Icon-120</string><string>Icon-180</string></array>
+            </dict>
+          </dict>
         </dict>
         </plist>
         PLIST
         printf 'APPL????' > out/Payload/AuxCam.app/PkgInfo
+        cp Icon-180.png out/Payload/AuxCam.app/Icon-180.png
+        cp Icon-120.png out/Payload/AuxCam.app/Icon-120.png
+        cp Icon-1024.png out/Payload/AuxCam.app/Icon-1024.png
         xcrun -sdk iphoneos swiftc -parse-as-library -O -target arm64-apple-ios17.0 -sdk "$SDK" \
           -o out/Payload/AuxCam.app/AuxCam AuxCam/AuxCamApp.swift \
           -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI -framework CoreMedia -framework AVFoundation 2>&1 | tail -25
