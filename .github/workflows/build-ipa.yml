@@ -29,6 +29,7 @@ jobs:
           <key>UILaunchScreen</key><dict/>
           <key>NSPhotoLibraryUsageDescription</key><string>需要从相册选择要作为相机画面的视频</string>
           <key>NSLocalNetworkUsageDescription</key><string>需要连接电脑上的直播流</string>
+          <key>NSCameraUsageDescription</key><string>需要显示当下相机的画面预览</string>
         </dict>
         </plist>
         PLIST
