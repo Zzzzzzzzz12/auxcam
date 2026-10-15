@@ -67,15 +67,18 @@ struct Link {
     }
 }
 
-// 相机实况预览：不是放文件，是"当下相机正在输出的画面"（前置/后置可切）
+// 相机实况预览：不是放文件，是"当下相机正在输出的画面"（前置/后置可切，带自诊断）
 final class Cam: ObservableObject {
     let session = AVCaptureSession()
     @Published var denied = false
+    @Published var diag = "启动中…"
     @Published var position: AVCaptureDevice.Position = .front
 
     func start() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        let st = AVCaptureDevice.authorizationStatus(for: .video)
+        switch st {
         case .notDetermined:
+            diag = "请求相机权限…"
             AVCaptureDevice.requestAccess(for: .video) { ok in
                 DispatchQueue.main.async { ok ? self.begin() : self.markDenied() }
             }
@@ -91,7 +94,10 @@ final class Cam: ObservableObject {
         begin(restart: true)
     }
 
-    private func markDenied() { denied = true }
+    private func markDenied() {
+        denied = true
+        diag = "相机权限被拒（设置里允许 AuxCam）"
+    }
 
     private func begin(restart: Bool = false) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -102,13 +108,22 @@ final class Cam: ObservableObject {
                 self.session.commitConfiguration()
             }
             guard restart || !self.session.isRunning else { return }
-            if let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position),
-               let input = try? AVCaptureDeviceInput(device: dev),
-               self.session.canAddInput(input) {
-                self.session.addInput(input)
+            var dev: AVCaptureDevice?
+            if #available(iOS 13.0, *) {
+                dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position)
             }
+            if dev == nil {
+                dev = AVCaptureDevice.default(for: .video)
+            }
+            DispatchQueue.main.async { self.diag = dev == nil ? "找不到相机" : "相机就绪，开画面中…" }
+            guard let d = dev, let input = try? AVCaptureDeviceInput(device: d), self.session.canAddInput(input) else {
+                DispatchQueue.main.async { self.diag = "相机打不开（可能正被别的 App 占用）" }
+                return
+            }
+            self.session.addInput(input)
             self.session.sessionPreset = .high
             if !self.session.isRunning { self.session.startRunning() }
+            DispatchQueue.main.async { self.diag = self.session.isRunning ? "画面正常" : "会话没起来" }
         }
     }
 }
@@ -175,11 +190,12 @@ struct ContentView: View {
             ZStack {
                 Color.black
                 if cam.denied {
-                    VStack(spacing: 6) {
+                    VStack(spacing: 8) {
                         Image(systemName: "video.slash").font(.largeTitle)
-                        Text("没有相机权限，去设置里允许").font(.footnote)
+                        Text(cam.diag).font(.footnote)
+                        Button("重试") { cam.start() }.font(.footnote).buttonStyle(.bordered)
                     }
-                    .foregroundStyle(.gray)
+                    .foregroundStyle(.white)
                 } else {
                     CamPreview(session: cam.session)
                     VStack {
@@ -197,8 +213,13 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                         }
                         Spacer()
-                        Text("当下相机画面").font(.caption2).padding(5)
-                            .background(.black.opacity(0.55)).clipShape(Capsule())
+                        HStack(spacing: 6) {
+                            Text("当下相机画面").font(.caption2)
+                            Text(cam.diag).font(.caption2).foregroundStyle(.yellow)
+                        }
+                        .padding(5)
+                        .background(.black.opacity(0.55))
+                        .clipShape(Capsule())
                     }
                     .padding(8)
                 }
