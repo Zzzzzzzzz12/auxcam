@@ -107,7 +107,7 @@ final class Cam: ObservableObject {
                self.session.canAddInput(input) {
                 self.session.addInput(input)
             }
-            self.session.sessionPreset = .medium
+            self.session.sessionPreset = .high
             if !self.session.isRunning { self.session.startRunning() }
         }
     }
