@@ -4,6 +4,7 @@
 import SwiftUI
 import AVFoundation
 import PhotosUI
+import Foundation
 
 @main
 struct AuxCamApp: App {
