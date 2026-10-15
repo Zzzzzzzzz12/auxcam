@@ -1,0 +1,32 @@
+name: bf
+on: [push, workflow_dispatch]
+jobs:
+  b:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Randomblock1/theos-action@v1
+    - name: build
+      run: |
+        cd tweak-float
+        echo "TARGET = iphone:latest:15.0" > Makefile
+        echo "ARCHS = arm64 arm64e" >> Makefile
+        echo "include \$(THEOS)/makefiles/common.mk" >> Makefile
+        echo "TWEAK_NAME = AuxCamFloat" >> Makefile
+        echo "AuxCamFloat_FILES = Tweak.xm" >> Makefile
+        echo "AuxCamFloat_CFLAGS = -fobjc-arc -Wno-everything -Wno-error" >> Makefile
+        echo "AuxCamFloat_FRAMEWORKS = UIKit Foundation" >> Makefile
+        echo "include \$(THEOS_MAKE_PATH)/tweak.mk" >> Makefile
+        cat Makefile
+        make 2>&1 | tail -60 || true
+        echo "--- 找 dylib ---"
+        find . -name "*.dylib"
+        mkdir -p out
+        D=$(find . -name AuxCamFloat.dylib | head -1)
+        echo "dylib=$D"
+        cp "$D" out/ || exit 1
+        ls -l out
+    - uses: actions/upload-artifact@v4
+      with:
+        name: auxcamfloat
+        path: tweak-float/out/
