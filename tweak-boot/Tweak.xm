@@ -163,9 +163,9 @@ static void *BootThread(void *arg) {
 }
 
 __attribute__((constructor)) static void AuxCamBootInit(void) {
+    BLog("AuxCamBoot 已加载 pid=%d uid=%d euid=%d", getpid(), getuid(), geteuid());
     if (geteuid() != 0) {
-        // 普通权限进程：什么都做不了，只留个记录，然后彻底不干活
-        if (getenv("AUXCAM_BOOT_VERBOSE")) BLog("普通权限进程，跳过");
+        BLog("普通权限进程，什么都不做");
         return;
     }
     pthread_t t;
