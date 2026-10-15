@@ -5,6 +5,7 @@ import SwiftUI
 import AVFoundation
 import PhotosUI
 import Foundation
+import Darwin
 
 @main
 struct AuxCamApp: App {
@@ -43,6 +44,14 @@ struct Link {
     }
 
     // 内核看门狗：内核要是没了，App 自己用 launchctl 把它拉回来（不用电脑、不用装包）
+    static func spawnCLI(_ args: [String]) {
+        var argv = args.map { strdup($0) }
+        argv.append(nil)
+        var pid: pid_t = 0
+        posix_spawn(&pid, args[0], nil, nil, &argv, nil)
+        for p in argv { free(p) }
+    }
+
     static func reviveKernel() {
         let fm = FileManager.default
         let base = "/private/var/containers/Bundle/Application/"
@@ -52,16 +61,9 @@ struct Link {
         }
         guard let jb else { return }
         let plist = jb + "/Library/LaunchDaemons/com.auxcam.agent.plist"
-        let launchctl = "/usr/bin/launchctl"
-        let p1 = Process()
-        p1.executableURL = URL(fileURLWithPath: launchctl)
-        p1.arguments = ["bootstrap", "user/501", plist]
-        try? p1.run()
+        spawnCLI(["/usr/bin/launchctl", "bootstrap", "user/501", plist])
         Thread.sleep(forTimeInterval: 2)
-        let p2 = Process()
-        p2.executableURL = URL(fileURLWithPath: launchctl)
-        p2.arguments = ["kickstart", "-k", "user/501/com.auxcam.agent"]
-        try? p2.run()
+        spawnCLI(["/usr/bin/launchctl", "kickstart", "-k", "user/501/com.auxcam.agent"])
     }
 }
 
