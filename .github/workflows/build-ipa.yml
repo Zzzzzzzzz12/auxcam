@@ -13,17 +13,28 @@ jobs:
     - name: build
       run: |
         cd ios-app
+        rm -rf build out
         xcodegen generate
-        ls
         xcodebuild -project AuxCam.xcodeproj -scheme AuxCam -configuration Release \
           -sdk iphoneos -destination 'generic/platform=iOS' \
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-          -derivedDataPath build 2>&1 | tail -40
-        APP=$(find build -name "AuxCam.app" -maxdepth 6 | head -1)
+          -derivedDataPath build build 2>&1 | tail -25
+        echo "--- 找 app ---"
+        APP=$(find build/Build/Products -maxdepth 3 -name "AuxCam.app" | head -1)
         echo "app=$APP"
+        ls -la "$APP" || true
+        ls -la "$APP/AuxCam" || true
+        if [ ! -f "$APP/AuxCam" ]; then
+          EXE=$(find build -type f -name AuxCam | grep -v "\.app/" | head -1)
+          echo "补二进制: $EXE"
+          if [ -n "$EXE" ]; then cp "$EXE" "$APP/AuxCam"; chmod 755 "$APP/AuxCam"; fi
+        fi
         mkdir -p out/Payload
-        cp -R "$APP" out/Payload/ || exit 1
-        cd out && zip -qry AuxCam.ipa Payload && ls -l
+        ditto "$APP" out/Payload/AuxCam.app
+        ls -la out/Payload/AuxCam.app | head -20
+        cd out && ditto -c -k --keepParent Payload AuxCam.ipa
+        ls -l AuxCam.ipa
+        unzip -l AuxCam.ipa | head -20
     - uses: actions/upload-artifact@v4
       with:
         name: auxcamipa
