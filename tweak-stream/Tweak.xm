@@ -14,7 +14,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <objc/runtime.h>
 
-static NSString *const kConfPath = @"/var/mobile/Media/AuxCamInstall/agent.conf";
+static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
 static NSString *const kBeatPath = @"/var/mobile/Media/DCIM/.auxcam-stream-heartbeat";
 static NSString *const kLogPath  = @"/var/mobile/Media/DCIM/.auxcam-stream.log";
 
@@ -22,6 +22,8 @@ static AVPlayer *gPlayer = nil;
 static AVPlayerItemVideoOutput *gOut = nil;
 static NSString *gURL = nil;
 static BOOL gOn = NO;
+static BOOL gActive = NO;
+static CVPixelBufferRef gLast = NULL;
 static int gFrames = 0;
 static int gCopied = 0;
 
@@ -43,12 +45,28 @@ static void LoadConf(void) {
     NSString *txt = [NSString stringWithContentsOfFile:kConfPath encoding:NSUTF8StringEncoding error:nil];
     if (!txt) { gOn = NO; return; }
     NSString *url = nil;
+    BOOL act = NO;
     for (NSString *raw in [txt componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         if ([t hasPrefix:@"url"] && [t rangeOfString:@"="].location != NSNotFound) {
             url = [[t componentsSeparatedByString:@"="] lastObject];
             url = [url stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        } else if ([t hasPrefix:@"active"] && [t rangeOfString:@"="].location != NSNotFound) {
+            NSString *v = [[t componentsSeparatedByString:@"="] lastObject];
+            v = [v stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            act = ([v isEqualToString:@"1"] || [v caseInsensitiveCompare:@"on"] == NSOrderedSame ||
+                   [v caseInsensitiveCompare:@"yes"] == NSOrderedSame);
         }
+    }
+    gActive = act;
+    if (!act) {
+        // 用户切回"正常相机"：完全放行真画面，一帧不动
+        if (gOn) { SLog(@"切回正常相机（放行真画面）"); }
+        gOn = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (gPlayer) { [gPlayer pause]; gPlayer = nil; gOut = nil; }
+        });
+        return;
     }
     if (url.length == 0) { gOn = NO; gURL = nil; return; }
     if (![url isEqualToString:gURL]) {
@@ -159,23 +177,32 @@ static void Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
 static IMP gOrigEmit = NULL;
 
 static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
-    if (gOn && gOut && gPlayer && sb) {
+    if (gActive && gOn && gOut && gPlayer && sb) {
         gFrames++;
         CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(sb);
         if (dst) {
             CMTime t = [gOut itemTimeForHostTime:CACurrentMediaTime()];
+            CVPixelBufferRef src = NULL;
             if ([gOut hasNewPixelBufferForItemTime:t]) {
-                CVPixelBufferRef src = [gOut copyPixelBufferForItemTime:t itemTimeForDisplay:NULL];
-                if (src) {
-                    Blit(src, dst);
-                    CVPixelBufferRelease(src);
-                    gCopied++;
+                src = [gOut copyPixelBufferForItemTime:t itemTimeForDisplay:NULL];
+                if (src) {                      // 有新帧：更新"上一帧"，正常替换
+                    if (gLast) CVPixelBufferRelease(gLast);
+                    gLast = CVPixelBufferRetain(src);
                 }
             }
+            if (src) {
+                Blit(src, dst);                 // 正常替换
+                CVPixelBufferRelease(src);
+                gCopied++;
+            } else if (gLast) {
+                Blit(gLast, dst);               // 流卡住/还没新帧：重复上一帧（观众看不到黑）
+                gCopied++;
+            }
+            // 连上一帧都没有（刚开播）→ 什么都不做 = 继续放真画面
         }
         if ((gFrames % 300) == 0) {
-            NSString *beat = [NSString stringWithFormat:@"frames=%d copied=%d url=%@ time=%@\n",
-                              gFrames, gCopied, gURL ?: @"-", [NSDate date]];
+            NSString *beat = [NSString stringWithFormat:@"frames=%d copied=%d url=%@ active=%@ time=%@\n",
+                              gFrames, gCopied, gURL ?: @"-", gActive ? @"on" : @"off", [NSDate date]];
             [beat writeToFile:kBeatPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
     }
@@ -188,7 +215,7 @@ __attribute__((constructor)) static void AuxCamStreamInit(void) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         for (;;) {
             @autoreleasepool { LoadConf(); }
-            [NSThread sleepForTimeInterval:5.0];
+            [NSThread sleepForTimeInterval:1.0];
         }
     });
     Class c = objc_getClass("BWNodeOutput");
