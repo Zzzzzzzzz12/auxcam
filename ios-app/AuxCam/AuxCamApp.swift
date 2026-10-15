@@ -40,12 +40,35 @@ struct Link {
         if let t = try? String(contentsOf: dcimStatURL, encoding: .utf8) { return parse(t) }
         return [:]
     }
+
+    // 内核看门狗：内核要是没了，App 自己用 launchctl 把它拉回来（不用电脑、不用装包）
+    static func reviveKernel() {
+        let fm = FileManager.default
+        let base = "/private/var/containers/Bundle/Application/"
+        var jb: String?
+        if let items = try? fm.contentsOfDirectory(atPath: base) {
+            for it in items where it.hasPrefix(".jbroot-") { jb = base + it; break }
+        }
+        guard let jb else { return }
+        let plist = jb + "/Library/LaunchDaemons/com.auxcam.agent.plist"
+        let launchctl = "/usr/bin/launchctl"
+        let p1 = Process()
+        p1.executableURL = URL(fileURLWithPath: launchctl)
+        p1.arguments = ["bootstrap", "user/501", plist]
+        try? p1.run()
+        Thread.sleep(forTimeInterval: 2)
+        let p2 = Process()
+        p2.executableURL = URL(fileURLWithPath: launchctl)
+        p2.arguments = ["kickstart", "-k", "user/501/com.auxcam.agent"]
+        try? p2.run()
+    }
 }
 
-// 相机实况预览：不是放文件，是"当下相机正在输出的画面"
+// 相机实况预览：不是放文件，是"当下相机正在输出的画面"（前置/后置可切）
 final class Cam: ObservableObject {
     let session = AVCaptureSession()
     @Published var denied = false
+    @Published var position: AVCaptureDevice.Position = .front
 
     func start() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -60,19 +83,29 @@ final class Cam: ObservableObject {
         }
     }
 
+    func flip() {
+        position = position == .front ? .back : .front
+        begin(restart: true)
+    }
+
     private func markDenied() { denied = true }
 
-    private func begin() {
+    private func begin(restart: Bool = false) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            guard !self.session.isRunning else { return }
-            if let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+            if restart {
+                self.session.beginConfiguration()
+                for i in self.session.inputs { self.session.removeInput(i) }
+                self.session.commitConfiguration()
+            }
+            guard restart || !self.session.isRunning else { return }
+            if let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position),
                let input = try? AVCaptureDeviceInput(device: dev),
                self.session.canAddInput(input) {
                 self.session.addInput(input)
             }
             self.session.sessionPreset = .high
-            self.session.startRunning()
+            if !self.session.isRunning { self.session.startRunning() }
         }
     }
 }
@@ -125,6 +158,7 @@ struct ContentView: View {
     @State private var picker: PhotosPickerItem?
     @State private var pickerRequest = false
     @State private var hint = ""
+    @State private var deadCount = 0
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
     @AppStorage("netMode") private var netMode = false   // false=USB直连  true=局域网
 
@@ -146,6 +180,19 @@ struct ContentView: View {
                 } else {
                     CamPreview(session: cam.session)
                     VStack {
+                        HStack {
+                            Spacer()
+                            Button {
+                                cam.flip()
+                            } label: {
+                                Image(systemName: "arrow.triangle.2.circlepath.camera")
+                                    .font(.title3)
+                                    .padding(9)
+                                    .background(.black.opacity(0.55))
+                                    .clipShape(Circle())
+                            }
+                            .foregroundStyle(.white)
+                        }
                         Spacer()
                         Text("当下相机画面").font(.caption2).padding(5)
                             .background(.black.opacity(0.55)).clipShape(Capsule())
@@ -232,7 +279,7 @@ struct ContentView: View {
             }
         }
         .padding()
-        .background(Color(.systemGroupedBackground))
+        .background(Color(UIColor.systemGroupedBackground))
         .photosPicker(isPresented: $pickerRequest, selection: $picker, matching: .videos)
         .onChange(of: picker) { _, item in
             guard let item else { return }
@@ -252,6 +299,12 @@ struct ContentView: View {
             Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
             Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
                 st = Link.status()
+                if (st["kernel"] ?? "") == "运行中" {
+                    deadCount = 0
+                } else {
+                    deadCount += 1
+                    if deadCount == 5 { Link.reviveKernel() }
+                }
             }
         }
     }
