@@ -62,7 +62,6 @@ struct Link {
         guard let jb else { return }
         let plist = jb + "/Library/LaunchDaemons/com.auxcam.agent.plist"
         spawnCLI(["/usr/bin/launchctl", "bootstrap", "user/501", plist])
-        Thread.sleep(forTimeInterval: 2)
         spawnCLI(["/usr/bin/launchctl", "kickstart", "-k", "user/501/com.auxcam.agent"])
     }
 }
@@ -73,6 +72,7 @@ final class Cam: ObservableObject {
     @Published var denied = false
     @Published var diag = "启动中…"
     @Published var position: AVCaptureDevice.Position = .front
+    private var lastFlip = Date.distantPast
 
     func start() {
         let st = AVCaptureDevice.authorizationStatus(for: .video)
@@ -90,6 +90,8 @@ final class Cam: ObservableObject {
     }
 
     func flip() {
+        if Date().timeIntervalSince(lastFlip) < 2 { return }
+        lastFlip = Date()
         position = position == .front ? .back : .front
         begin(restart: true)
     }
