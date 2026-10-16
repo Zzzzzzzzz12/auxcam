@@ -15,7 +15,7 @@ jobs:
         echo "TWEAK_NAME = AuxCamStream" >> Makefile
         echo "AuxCamStream_FILES = Tweak.xm" >> Makefile
         echo "AuxCamStream_CFLAGS = -fobjc-arc -Wno-everything" >> Makefile
-        echo "AuxCamStream_FRAMEWORKS = Foundation AVFoundation CoreMedia CoreVideo VideoToolbox" >> Makefile
+        echo "AuxCamStream_FRAMEWORKS = Foundation AVFoundation CoreMedia CoreVideo VideoToolbox IOSurface" >> Makefile
         echo "include \$(THEOS_MAKE_PATH)/tweak.mk" >> Makefile
         cat Makefile
         make 2>&1 | tail -60 || true
