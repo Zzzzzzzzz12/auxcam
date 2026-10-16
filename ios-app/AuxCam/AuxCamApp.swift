@@ -53,7 +53,8 @@ struct Link {
 
     static func vcamStamp() -> Int64 {
         let a = try? FileManager.default.attributesOfItem(atPath: vcamURL.path)
-        return (a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        let t = (a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+        return Int64(t)
     }
 
     // 内核看门狗：内核没了，App 自己把它拉回来（不用电脑）
@@ -311,14 +312,14 @@ final class VCU1Receiver: ObservableObject {
         for _ in 0..<numSPS where i + 2 <= d.count {
             let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
             guard i + l <= d.count else { return }
-            s = d.subarray(in: i..<(i + l)); i += l
+            s = d.subdata(in: i..<(i + l)); i += l
         }
         guard i < d.count else { return }
         let numPPS = Int(d[i] & 0x1F); i += 1
         for _ in 0..<numPPS where i + 2 <= d.count {
             let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
             guard i + l <= d.count else { return }
-            p = d.subarray(in: i..<(i + l)); i += l
+            p = d.subdata(in: i..<(i + l)); i += l
         }
         if !s.isEmpty && !p.isEmpty {
             lock.lock(); sps = s; pps = p; lock.unlock()
@@ -330,8 +331,10 @@ final class VCU1Receiver: ObservableObject {
     // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（3MB 循环）
     private func appendVideo(_ d: Data, keyframe: Bool) {
         var nalu = d
-        if nalu.starts(with: [0, 0, 0, 1]) { nalu = nalu.subdata(in: 4..<nalu.count) }
-        else if nalu.starts(with: [0, 0, 1]) { nalu = nalu.subdata(in: 3..<nalu.count) }
+        let sc4 = Data([UInt8(0), UInt8(0), UInt8(0), UInt8(1)])
+        let sc3 = Data([UInt8(0), UInt8(0), UInt8(1)])
+        if nalu.starts(with: sc4) { nalu = nalu.subdata(in: 4..<nalu.count) }
+        else if nalu.starts(with: sc3) { nalu = nalu.subdata(in: 3..<nalu.count) }
         guard !nalu.isEmpty else { return }
 
         let fm = FileManager.default
