@@ -332,14 +332,18 @@ final class StreamDecoder {
             blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
             offsetToData: 0, dataLength: total, flags: 0, blockBufferOut: &block)
         guard let block else {
-            if StreamDecoder.feedCount <= 3 { StreamDecoder.dlog("decode: block create fail \(bSt)") }
+            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) block fail \(bSt)")
+            }
             return
         }
         var ptr: UnsafeMutablePointer<Int8>?
         let gpSt = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
                                                totalLengthOut: nil, dataPointerOut: &ptr)
         guard let ptr, gpSt == kCMBlockBufferNoErr else {
-            if StreamDecoder.feedCount <= 3 { StreamDecoder.dlog("decode: getptr fail \(gpSt)") }
+            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) getptr fail \(gpSt)")
+            }
             return
         }
         var lenBE = UInt32(n.count).bigEndian
@@ -365,7 +369,9 @@ final class StreamDecoder {
                 StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sbSt=\(sbSt) submitted n=\(n.count)")
             }
         } else {
-            if StreamDecoder.feedCount <= 5 { StreamDecoder.dlog("decode: sample create fail \(sbSt)") }
+            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sample fail \(sbSt)")
+            }
         }
     }
 }
