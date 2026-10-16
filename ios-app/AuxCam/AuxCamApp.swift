@@ -221,6 +221,7 @@ final class StreamDecoder {
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
     private static var frameCount: Int = 0
     private static var buildCount: Int = 0
+    private static var feedCount: Int = 0
 
     static func dlog(_ s: String) {
         let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
@@ -317,18 +318,30 @@ final class StreamDecoder {
         var n = raw
         if n.starts(with: [UInt8(0), 0, 0, 1]) { n = Data(n.dropFirst(4)) }
         else if n.starts(with: [UInt8(0), 0, 1]) { n = Data(n.dropFirst(3)) }
-        guard n.count > 0, let session, let fmt else { return }
+        StreamDecoder.feedCount += 1
+        guard n.count > 0, let session, let fmt else {
+            if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 90 == 0 {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) skip n=\(n.count) session=\(session != nil) fmt=\(fmt != nil)")
+            }
+            return
+        }
         let total = n.count + 4
         var block: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(
+        let bSt = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: total,
             blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
             offsetToData: 0, dataLength: total, flags: 0, blockBufferOut: &block)
-        guard let block else { return }
+        guard let block else {
+            if StreamDecoder.feedCount <= 3 { StreamDecoder.dlog("decode: block create fail \(bSt)") }
+            return
+        }
         var ptr: UnsafeMutablePointer<Int8>?
-        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
-                                   totalLengthOut: nil, dataPointerOut: &ptr)
-        guard let ptr else { return }
+        let gpSt = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                               totalLengthOut: nil, dataPointerOut: &ptr)
+        guard let ptr, gpSt == kCMBlockBufferNoErr else {
+            if StreamDecoder.feedCount <= 3 { StreamDecoder.dlog("decode: getptr fail \(gpSt)") }
+            return
+        }
         var lenBE = UInt32(n.count).bigEndian
         ptr.withMemoryRebound(to: UInt8.self, capacity: total) { p in
             withUnsafeBytes(of: &lenBE) { b in
@@ -339,15 +352,20 @@ final class StreamDecoder {
             }
         }
         var sb: CMSampleBuffer?
-        CMSampleBufferCreateReady(
+        let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
             sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
             sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
         if let sb {
-            // 同步解码：回调在提交线程内立即触发（异步模式在无 RunLoop 环境可能不回调）
-            VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
-                                              flags: [],
-                                              frameRefcon: nil, infoFlagsOut: nil)
+            // 同步解码：回调在提交线程内立即触发
+            let dSt = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
+                                                        flags: [],
+                                                        frameRefcon: nil, infoFlagsOut: nil)
+            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sbSt=\(sbSt) dSt=\(dSt) n=\(n.count)")
+            }
+        } else {
+            if StreamDecoder.feedCount <= 5 { StreamDecoder.dlog("decode: sample create fail \(sbSt)") }
         }
     }
 }
