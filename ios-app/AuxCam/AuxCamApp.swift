@@ -260,9 +260,9 @@ final class StreamDecoder {
         }
     }
 
-    func feed(_ raw: Data) {
+    func feed(_ raw: Data, keyframe: Bool) {
         queue.async { [weak self] in
-            self?.decode(raw)
+            self?.decode(raw, keyframe: keyframe)
         }
     }
 
@@ -314,7 +314,7 @@ final class StreamDecoder {
         }
     }
 
-    private func decode(_ raw: Data) {
+    private func decode(_ raw: Data, keyframe: Bool) {
         var n = raw
         if n.starts(with: [UInt8(0), 0, 0, 1]) { n = Data(n.dropFirst(4)) }
         else if n.starts(with: [UInt8(0), 0, 1]) { n = Data(n.dropFirst(3)) }
@@ -325,16 +325,26 @@ final class StreamDecoder {
             }
             return
         }
-        let total = n.count + 4
+        // 拼 access unit：关键帧 = SPS+PPS+帧，普通帧 = 单帧（iOS 解码器要求 IDR 带 SPS/PPS）
+        var au = Data()
+        if keyframe {
+            let sp = sps, pp = pps
+            for d in [sp, pp, n] where d.count > 0 {
+                var l = UInt32(d.count).bigEndian
+                withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
+                au.append(d)
+            }
+        } else {
+            var l = UInt32(n.count).bigEndian
+            withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
+            au.append(n)
+        }
+        let total = au.count
         // 自己 malloc 内存（memoryBlock:nil 时 CMBlockBuffer 不会自动分配 → -12707）
         guard let mem = malloc(total) else { return }
         let mp = mem.assumingMemoryBound(to: UInt8.self)
-        var lenBE = UInt32(n.count).bigEndian
-        withUnsafeBytes(of: &lenBE) { b in
-            mp.update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: 4)
-        }
-        n.withUnsafeBytes { b in
-            (mp + 4).update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: n.count)
+        au.withUnsafeBytes { b in
+            mp.update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: total)
         }
         var block: CMBlockBuffer?
         var src = CMBlockBufferCustomBlockSource(
@@ -504,7 +514,7 @@ final class VCU1Receiver: ObservableObject {
                 slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
             case 2:
                 appendVideo(payload, keyframe: (flags & 1) != 0)
-                decoder.feed(payload)
+                decoder.feed(payload, keyframe: (flags & 1) != 0)
                 countFrame()
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
             case 5: lastHb = Date()
