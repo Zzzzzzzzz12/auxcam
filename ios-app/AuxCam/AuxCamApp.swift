@@ -410,7 +410,7 @@ final class VCU1Receiver: ObservableObject {
             close(listenFd); listenFd = -1
             return
         }
-        listen(listenFd, 4)
+        listen(listenFd, 128)
         slog("listening 28765")
         DispatchQueue.main.async { self.status = "已开门(28765)，等电脑连" }
         while shouldRun {
@@ -422,6 +422,9 @@ final class VCU1Receiver: ObservableObject {
                 }
             }
             guard cfd >= 0 else { break }
+            // 读超时 5 秒：对端不送数据就别占着连接（防重连风暴拖死）
+            var tv = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
             DispatchQueue.main.async { self.status = "电脑已连上，收画面中"; self.alive = true }
             handleConnection(cfd)
             close(cfd)
