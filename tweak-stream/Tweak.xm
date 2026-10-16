@@ -121,11 +121,15 @@ static void Feed(NSData *chunk) {
         return;
     }
     if (!gVT) {
-        NSDictionary *attrs = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                                 (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+        // 保守参数：不指定 IOSurface（相机进程里可能建不起来），像素格式交给 VT 自选
         VTDecompressionOutputCallbackRecord cb = { (VTDecompressionOutputCallback)GotFrame, NULL };
-        VTDecompressionSessionCreate(kCFAllocatorDefault, gFmt, NULL, (__bridge CFDictionaryRef)attrs, &cb, &gVT);
-        if (!gVT) return;
+        OSStatus cst = VTDecompressionSessionCreate(kCFAllocatorDefault, gFmt, NULL, NULL, &cb, &gVT);
+        if (cst != noErr || !gVT) {
+            SLog(@"VT 会话创建失败: %d", (int)cst);
+            gVT = NULL;
+            return;
+        }
+        SLog(@"VT 会话已创建");
     }
     const uint8_t *b = (const uint8_t *)gPend.bytes;
     NSUInteger n = gPend.length;
@@ -153,7 +157,10 @@ static void Feed(NSData *chunk) {
                         CMSampleBufferRef sb = NULL;
                         CMSampleBufferCreateReady(kCFAllocatorDefault, bb, gFmt, 1, 0, NULL, 0, NULL, &sb);
                         if (sb) {
-                            VTDecompressionSessionDecodeFrame(gVT, sb, 0, NULL, NULL);
+                            OSStatus dst2 = VTDecompressionSessionDecodeFrame(gVT, sb, 0, NULL, NULL);
+                            if (dst2 != noErr && (gFrames % 90) == 0) {
+                                SLog(@"解码提交失败: %d", (int)dst2);
+                            }
                             CFRelease(sb);
                         }
                     }
