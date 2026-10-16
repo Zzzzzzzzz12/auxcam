@@ -9,6 +9,12 @@
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <objc/runtime.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdlib.h>
 
 static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
 static NSString *const kESPath  = @"/var/mobile/Media/DCIM/stream.h264";
@@ -69,7 +75,7 @@ static void DecoderReset(void) {
 
 static void TryBuildFormat(void) {
     if (gFmtReady || !gPend.length) return;
-    const uint8_t *b = gPend.bytes;
+    const uint8_t *b = (const uint8_t *)gPend.bytes;
     NSUInteger n = gPend.length;
     NSData *sps = nil, *pps = nil;
     for (NSUInteger i = 4; i + 4 < n; i++) {
@@ -89,7 +95,7 @@ static void TryBuildFormat(void) {
         if (sps && pps) break;
     }
     if (!sps || !pps) return;
-    const uint8_t *ps[2] = { sps.bytes, pps.bytes };
+    const uint8_t *ps[2] = { (const uint8_t *)sps.bytes, (const uint8_t *)pps.bytes };
     size_t ls[2] = { sps.length, pps.length };
     OSStatus st = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2, ps, ls, 4, &gFmt);
     if (st == noErr) {
@@ -117,10 +123,11 @@ static void Feed(NSData *chunk) {
     if (!gVT) {
         NSDictionary *attrs = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
                                  (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-        VTDecompressionSessionCreate(kCFAllocatorDefault, gFmt, NULL, (__bridge CFDictionaryRef)attrs, &GotFrame);
+        VTDecompressionSessionCreate(kCFAllocatorDefault, gFmt, NULL, (__bridge CFDictionaryRef)attrs,
+                                     (VTDecompressionOutputCallback)GotFrame, &gVT);
         if (!gVT) return;
     }
-    const uint8_t *b = gPend.bytes;
+    const uint8_t *b = (const uint8_t *)gPend.bytes;
     NSUInteger n = gPend.length;
     NSUInteger lastCut = 0;
     NSUInteger p = 0;
@@ -264,7 +271,7 @@ static void *ReaderThread(void *arg) {
                 if ((uint64_t)st.st_size > off) {
                     size_t want = (size_t)(st.st_size - off);
                     if (want > (1 << 20)) want = 1 << 20;
-                    uint8_t *buf = malloc(want);
+                    uint8_t *buf = (uint8_t *)malloc(want);
                     ssize_t rd = read(fd, buf, want);
                     if (rd > 0) {
                         Feed([NSData dataWithBytesNoCopy:buf length:rd freeWhenDone:YES]);
