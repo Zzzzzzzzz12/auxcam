@@ -334,6 +334,9 @@ final class StreamDecoder {
                 withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
                 au.append(d)
             }
+            if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 60 == 0 {
+                StreamDecoder.dlog("AU hex: " + au.prefix(96).map { String(format: "%02x", $0) }.joined())
+            }
         } else {
             var l = UInt32(n.count).bigEndian
             withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
