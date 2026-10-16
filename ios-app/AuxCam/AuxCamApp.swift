@@ -6,6 +6,8 @@ import AVFoundation
 import PhotosUI
 import Foundation
 import Darwin
+import VideoToolbox
+import IOSurface
 
 @main
 struct AuxCamApp: App {
@@ -206,6 +208,113 @@ struct CamPreview: UIViewRepresentable {
     }
 }
 
+// ───────────────────────── 解码层（App 里解，画面贴公共画布） ─────────────────────────
+// App 解码 H264 → 得到画面帧 → 把帧挂的共享画布编号写进 .frame.surface
+// 相机进程里的插件每秒盯这个文件，有画布就用画布画面替换相机帧（= 相机采集被换成想要的画面）
+final class StreamDecoder {
+    static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
+    private var session: VTDecompressionSession?
+    private var fmt: CMVideoFormatDescription?
+    private var sps = Data()
+    private var pps = Data()
+    private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
+
+    // 解码出一帧：把画布编号公布出去
+    static let frameCallback: VTDecompressionOutputCallback = { (_, _, status, _, imageBuffer, _, _) in
+        guard status == noErr, let img = imageBuffer else { return }
+        guard let surf = CVPixelBufferGetIOSurface(img) else { return }
+        let sid = IOSurfaceGetID(surf)
+        let s = "id=\(sid)\n"
+        try? s.write(toFile: StreamDecoder.surfacePath, atomically: true, encoding: .utf8)
+    }
+
+    func setConfig(sps: Data, pps: Data) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.sps = sps
+            self.pps = pps
+            self.build()
+        }
+    }
+
+    func feed(_ raw: Data) {
+        queue.async { [weak self] in
+            self?.decode(raw)
+        }
+    }
+
+    private func build() {
+        guard sps.count > 3, pps.count > 3 else { return }
+        if let s = session {
+            VTDecompressionSessionInvalidate(s)
+            session = nil
+            fmt = nil
+        }
+        let ps: [UnsafePointer<UInt8>] = sps.withUnsafeBytes { sp in
+            pps.withUnsafeBytes { pp in
+                [sp.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                 pp.baseAddress!.assumingMemoryBound(to: UInt8.self)]
+            }
+        }
+        var sizes = [sps.count, pps.count]
+        var f: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            allocator: kCFAllocatorDefault, parameterSetCount: 2,
+            parameterSetPointers: ps, parameterSetSizes: &sizes,
+            nalUnitHeaderLength: 4, formatDescriptionOut: &f)
+        guard let f else { return }
+        fmt = f
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        var cb = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: StreamDecoder.frameCallback,
+            decompressionOutputRefCon: nil)
+        VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault, formatDescription: f,
+            decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
+            outputCallback: &cb, decompressionSessionOut: &session)
+    }
+
+    private func decode(_ raw: Data) {
+        var n = raw
+        if n.starts(with: [UInt8(0), 0, 0, 1]) { n = Data(n.dropFirst(4)) }
+        else if n.starts(with: [UInt8(0), 0, 1]) { n = Data(n.dropFirst(3)) }
+        guard n.count > 0, let session, let fmt else { return }
+        let total = n.count + 4
+        var block: CMBlockBuffer?
+        CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: total,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: total, flags: 0, blockBufferOut: &block)
+        guard let block else { return }
+        var ptr: UnsafeMutablePointer<Int8>?
+        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                   totalLengthOut: nil, dataPointerOut: &ptr)
+        guard let ptr else { return }
+        var lenBE = UInt32(n.count).bigEndian
+        ptr.withMemoryRebound(to: UInt8.self, capacity: total) { p in
+            withUnsafeBytes(of: &lenBE) { b in
+                p.update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: 4)
+            }
+            n.withUnsafeBytes { b in
+                (p + 4).update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: n.count)
+            }
+        }
+        var sb: CMSampleBuffer?
+        CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
+            sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
+            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
+        if let sb {
+            VTDecompressionSessionDecodeFrame(session, sb,
+                                              flags: [._EnableAsynchronousDecompression],
+                                              frameRefcon: nil, infoFlagsOut: nil)
+        }
+    }
+}
+
 // ───────────────────────── VCU1 接收层（接万相桌面端） ─────────────────────────
 // 万相电脑端通过数据线(usbmux)连 iPhone 的 28765 端口，包格式：
 //   24 字节头: "VCU1" + 版本(1B) + 类型(1B) + flags(2B BE) + 长度(4B BE) + 序号(4B BE) + 时间戳(8B BE 微秒)
@@ -217,6 +326,7 @@ final class VCU1Receiver: ObservableObject {
 
     static let listenPort: UInt16 = 28765
     static let outPath = "/var/mobile/Media/DCIM/stream.h264"
+    let decoder = StreamDecoder()
     private var listenFd: Int32 = -1
     private var shouldRun = false
     private var frameCount: Int32 = 0
@@ -327,9 +437,11 @@ final class VCU1Receiver: ObservableObject {
             switch type {
             case 1:
                 parseAVCC(payload)
+                decoder.setConfig(sps: sps, pps: pps)
                 slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
             case 2:
                 appendVideo(payload, keyframe: (flags & 1) != 0)
+                decoder.feed(payload)
                 countFrame()
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
             case 5: lastHb = Date()
