@@ -218,6 +218,7 @@ final class StreamDecoder {
     private var fmt: CMVideoFormatDescription?
     private var sps = Data()
     private var pps = Data()
+    private var frameIndex: Int64 = 0
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
     private static var frameCount: Int = 0
     private static var buildCount: Int = 0
@@ -368,10 +369,17 @@ final class StreamDecoder {
             return
         }
         var sb: CMSampleBuffer?
+        // 带有效 timing（iOS 解码器无 timing 也判坏数据）
+        var tsIdx = Int64(frameIndex)
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: CMTime(value: tsIdx, timescale: 30),
+            decodeTimeStamp: CMTime.invalid)
         let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
-            sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
+            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
+        frameIndex += 1
         if let sb {
             // 异步解码（同步模式会卡死解码线程，queue 后续全停）
             VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
