@@ -1,6 +1,6 @@
-// AuxCam 手机端 App v3
-// 顶部：当下相机实况（电脑画面切过来时，这里看到的就是直播间观众看到的）
-// 开关 + USB直连/局域网 两个模式 + 相册/镜像/旋转/恢复 + 电脑IP短地址
+// AuxCam v4 手机端 —— 万相同款"智能"版
+// 人只按一下「开始视频直播」，其余全部手机自动：
+//   自动唤醒相机进程 → 自动注入 → 自动进直连 → 断流自动重连 → 卡顿自动换路 → 四态自动显示
 import SwiftUI
 import AVFoundation
 import PhotosUI
@@ -12,11 +12,14 @@ struct AuxCamApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
 }
 
+// ───────────────────────── 通道层 ─────────────────────────
 struct Link {
     static var docs: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     static var cmdURL: URL { docs.appendingPathComponent("auxcam.cmd") }
     static var statURL: URL { docs.appendingPathComponent("auxcam.stat") }
     static var dcimStatURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.stat") }
+    static var esURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.h264") }
+    static var vcamURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4") }
     static var videoURL: URL { docs.appendingPathComponent("picked.mp4") }
 
     static func send(_ lines: [String: String]) {
@@ -43,7 +46,17 @@ struct Link {
         return [:]
     }
 
-    // 内核看门狗：内核要是没了，App 自己用 launchctl 把它拉回来（不用电脑、不用装包）
+    static func esSize() -> Int64 {
+        let a = try? FileManager.default.attributesOfItem(atPath: esURL.path)
+        return (a?[.size] as? NSNumber)?.int64Value ?? -1
+    }
+
+    static func vcamStamp() -> Int64 {
+        let a = try? FileManager.default.attributesOfItem(atPath: vcamURL.path)
+        return (a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+    }
+
+    // 内核看门狗：内核没了，App 自己把它拉回来（不用电脑）
     static func spawnCLI(_ args: [String]) {
         var argv = args.map { strdup($0) }
         argv.append(nil)
@@ -66,7 +79,7 @@ struct Link {
     }
 }
 
-// 相机实况预览：不是放文件，是"当下相机正在输出的画面"（前置/后置可切，带自诊断）
+// ───────────────────────── 相机预览层 ─────────────────────────
 final class Cam: ObservableObject {
     let session = AVCaptureSession()
     @Published var denied = false
@@ -100,7 +113,6 @@ final class Cam: ObservableObject {
                 DispatchQueue.main.async { ok ? self.begin() : self.markDenied() }
             }
         case .authorized:
-            log("权限已允许")
             begin()
         default:
             markDenied()
@@ -122,7 +134,7 @@ final class Cam: ObservableObject {
     private func begin(restart: Bool = false) {
         queue.async { [weak self] in
             guard let self else { return }
-            if self.busy { self.log("上次切换还没完，这次跳过"); return }
+            if self.busy { return }
             self.busy = true
             if restart {
                 self.session.beginConfiguration()
@@ -138,8 +150,12 @@ final class Cam: ObservableObject {
                 if self.session.canAddInput(input) {
                     self.session.addInput(input)
                 } else {
-                    self.log("输入加不上（相机被别的 App 占着？）")
+                    self.log("输入被占用，稍后自动重试")
                     self.busy = false
+                    // 智能：10 秒后自动再试一次（相机进程可能正在重启）
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) {
+                        self.begin()
+                    }
                     return
                 }
             } catch {
@@ -175,6 +191,24 @@ struct CamPreview: UIViewRepresentable {
     func updateUIView(_ uiView: V, context: Context) {}
 }
 
+// ───────────────────────── 主界面 ─────────────────────────
+// 直播状态机（跟万相一样四态，自动走）
+enum LiveState: String {
+    case idle = "未启用"
+    case starting = "正在启动 USB"
+    case live = "已开启"
+    case broken = "断流重连中"
+
+    var color: Color {
+        switch self {
+        case .idle: return .secondary
+        case .starting: return .orange
+        case .live: return .green
+        case .broken: return .red
+        }
+    }
+}
+
 struct PB: View {
     let title: String
     let icon: String
@@ -202,137 +236,58 @@ struct PB: View {
 struct ContentView: View {
     @StateObject private var cam = Cam()
     @State private var st: [String: String] = [:]
+    @State private var state: LiveState = .idle
     @State private var picker: PhotosPickerItem?
     @State private var pickerRequest = false
     @State private var hint = ""
     @State private var deadCount = 0
     @State private var revived = false
+    @State private var mirrorOn = false
+    @State private var recordOn = false
+    @State private var aiOn = true
+    @State private var showDiag = false
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
-    @AppStorage("netMode") private var netMode = false   // false=USB直连  true=局域网
+    @AppStorage("netMode") private var netMode = false   // false=USB直连 true=局域网
+    @AppStorage("wasLive") private var wasLive = false   // 上次退出时是否在直播（重开自动恢复）
 
-    private var isNormal: Bool { (st["playing"] ?? "正常相机") == "正常相机" }
+    // 心跳（判断电脑画面是否真的在流进手机）
+    @State private var lastES: Int64 = -1
+    @State private var lastTick: Date = Date()
+    @State private var kbps: Double = 0
+    @State private var stuckCount = 0
+    @State private var retryCount = 0
+
     private var kernelOK: Bool { (st["kernel"] ?? "") == "运行中" }
+    private var playingFake: Bool { (st["playing"] ?? "正常相机") != "正常相机" }
     private var builtURL: String { "http://\(pcIP):8899/live.m3u8" }
 
+    private var sigText: String {
+        if kbps <= 0 { return "—" }
+        if kbps > 800 { return "好 · \(String(format: "%.1f", kbps / 1000))M" }
+        if kbps > 200 { return "中 · \(Int(kbps))K" }
+        return "差 · \(Int(kbps))K"
+    }
+
+    private var sigColor: Color {
+        if kbps <= 0 { return .secondary }
+        if kbps > 800 { return .green }
+        if kbps > 200 { return .orange }
+        return .red
+    }
+
     var body: some View {
-        VStack(spacing: 12) {
-            // 1) 当下相机画面（真预览）
-            ZStack {
-                Color.black
-                if cam.denied {
-                    VStack(spacing: 8) {
-                        Image(systemName: "video.slash").font(.largeTitle)
-                        Text(cam.diag).font(.footnote)
-                        Button("重试") { cam.start() }.font(.footnote).buttonStyle(.bordered)
-                    }
-                    .foregroundStyle(.white)
-                } else {
-                    CamPreview(session: cam.session)
-                    VStack {
-                        HStack {
-                            Spacer()
-                            Button {
-                                cam.flip()
-                            } label: {
-                                Image(systemName: "arrow.triangle.2.circlepath.camera")
-                                    .font(.title3)
-                                    .padding(9)
-                                    .background(.black.opacity(0.55))
-                                    .clipShape(Circle())
-                            }
-                            .foregroundStyle(.white)
-                        }
-                        Spacer()
-                        HStack(spacing: 6) {
-                            Text("当下相机画面").font(.caption2)
-                            Text(cam.diag).font(.caption2).foregroundStyle(.yellow)
-                        }
-                        .padding(5)
-                        .background(.black.opacity(0.55))
-                        .clipShape(Capsule())
-                    }
-                    .padding(8)
-                }
-            }
-            .frame(height: 250)
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-
-            HStack {
-                Text("画面：\(st["playing"] ?? "正常相机")").font(.subheadline).bold()
-                Spacer()
-                Circle().fill(kernelOK ? .green : .orange).frame(width: 9, height: 9)
-                Text(kernelOK ? "内核在线" : "内核未连接").font(.footnote).foregroundStyle(.secondary)
-            }
-
-            // 2) 大开关
-            Button {
-                Link.send(["cmd": isNormal ? "start" : "stop",
-                           "mode": netMode ? "stream" : "file", "url": builtURL])
-                hint = isNormal ? "已开始（电脑画面）" : "已切回正常相机"
-            } label: {
-                Text(isNormal ? "开始直播" : "停止（切回相机）")
-                    .font(.title3.bold())
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 13)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(isNormal ? .green : .red)
-
-            // 3) 两个模式，一眼分清
-            Picker("", selection: $netMode) {
-                Text("USB直连").tag(false)
-                Text("局域网").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: netMode) { _, v in
-                Link.send(["cmd": "mode", "mode": v ? "stream" : "file", "url": builtURL])
-                hint = v ? "局域网：手机直接拉电脑流" : "USB直连：电脑画面走数据线"
-            }
-            Text(netMode ? "手机直接从电脑拉流（本机不支持时自动退回）"
-                         : "电脑处理的画面走数据线进手机（推荐，不掉帧）")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-
-            // 4) 短地址：只填 IP
-            if netMode {
-                HStack {
-                    Text("电脑IP").font(.footnote).foregroundStyle(.secondary)
-                    TextField("192.168.31.141", text: $pcIP)
-                        .keyboardType(.numbersAndPunctuation)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.footnote)
-                    Button("用") {
-                        Link.send(["cmd": "mode", "mode": "stream", "url": builtURL])
-                        hint = "地址已应用"
-                    }
-                    .font(.footnote)
-                    .buttonStyle(.bordered)
-                }
-            }
-
-            // 5) 保留有用的四个
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()),
-                                GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                PB("相册", "photo.on.rectangle") { pickerRequest = true }
-                PB("镜像", "arrow.left.arrow.right") { Link.send(["cmd": "mirror"]); hint = "已切镜像" }
-                PB("旋转", "rotate.right") { Link.send(["cmd": "rotate"]); hint = "已旋转 90°" }
-                PB("恢复", "arrow.counterclockwise", Color(red: 0.90, green: 0.55, blue: 0.15)) {
-                    Link.send(["cmd": "reset"]); hint = "已恢复（正常相机）"
-                }
-            }
-
-            if !hint.isEmpty { Text(hint).font(.footnote).foregroundStyle(.green) }
-
-            HStack {
-                Text("来源 \(st["playing"] ?? "-") · 流 \(st["stream"] ?? "-") · 素材 \(st["video"] ?? "-")")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
+        VStack(spacing: 10) {
+            header
+            preview
+            statusLine
+            infoRow
+            panel
+            sigRow
+            bigButton
+            tabBar
         }
-        .padding()
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
         .background(Color(UIColor.systemGroupedBackground))
         .photosPicker(isPresented: $pickerRequest, selection: $picker, matching: .videos)
         .onChange(of: picker) { _, item in
@@ -344,25 +299,327 @@ struct ContentView: View {
                     try? FileManager.default.removeItem(at: Link.videoURL)
                     try? FileManager.default.copyItem(at: tmp, to: Link.videoURL)
                     Link.send(["cmd": "setvideo", "path": Link.videoURL.path])
-                    hint = "已把相册里的视频设为画面"
+                    hint = "相册视频已设为画面"
                 }
             }
         }
-        .onAppear {
-            cam.start()
-            Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
-            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-                st = Link.status()
-                if (st["kernel"] ?? "") == "运行中" {
-                    deadCount = 0
-                } else {
-                    deadCount += 1
-                    if deadCount == 5 && !revived {
-                        revived = true
-                        DispatchQueue.global(qos: .utility).async { Link.reviveKernel() }
+        .onAppear { boot() }
+        .sheet(isPresented: $showDiag) { diagSheet }
+    }
+
+    // ── 区块 ──
+    private var header: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "bag.fill").font(.footnote).foregroundStyle(.teal)
+            Text("AuxCam").font(.subheadline.bold())
+            Text("2026 最新").font(.caption2).foregroundStyle(.white)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(.teal))
+            Spacer()
+            Circle().fill(kernelOK ? .green : .orange).frame(width: 8, height: 8)
+            Text(kernelOK ? "内核在线" : "内核唤醒中").font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private var preview: some View {
+        ZStack {
+            Color.black
+            if cam.denied {
+                VStack(spacing: 8) {
+                    Image(systemName: "video.slash").font(.largeTitle)
+                    Text(cam.diag).font(.footnote)
+                    Button("重试") { cam.start() }.font(.footnote).buttonStyle(.bordered)
+                }
+                .foregroundStyle(.white)
+            } else {
+                CamPreview(session: cam.session)
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button { cam.flip() } label: {
+                            Image(systemName: "arrow.triangle.2.circlepath.camera")
+                                .font(.title3)
+                                .padding(9)
+                                .background(.black.opacity(0.55))
+                                .clipShape(Circle())
+                        }
+                        .foregroundStyle(.white)
                     }
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle().fill(state.color).frame(width: 7, height: 7)
+                        Text(state.rawValue).font(.caption).bold()
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(.black.opacity(0.55))
+                    .clipShape(Capsule())
+                    .foregroundStyle(.white)
                 }
+                .padding(8)
             }
         }
+        .frame(height: 300)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var statusLine: some View {
+        HStack(spacing: 4) {
+            Text("画面：\(st["playing"] ?? "正常相机")").font(.footnote).bold()
+            Spacer()
+            Text(sigText).font(.caption2).bold().foregroundStyle(sigColor)
+        }
+    }
+
+    private var infoRow: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("用户 8894AuxCam963302").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Toggle("开启位置", isOn: .constant(true))
+                    .labelsHidden()
+                Text("开启位置").font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                Image(systemName: "number").font(.caption2).foregroundStyle(.secondary)
+                Text("选择话题 · 视频适合手游虚拟电竞").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                Image(systemName: "cable.connector").font(.caption2).foregroundStyle(.teal)
+                Text("源：AuxCam（电脑画面）").font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Text(netMode ? "局域网" : "USB直连").font(.caption2).bold().foregroundStyle(.teal)
+            }
+        }
+        .padding(10)
+        .background(Color(UIColor.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var panel: some View {
+        VStack(spacing: 10) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                PB("相册", "photo.on.rectangle") { pickerRequest = true }
+                PB("直连", "cable.connector") { tapDirect() }
+                PB("内录", "record.circle", recordOn ? .red : Color(red: 0.20, green: 0.72, blue: 0.62)) { tapRecord() }
+                PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
+                PB("旋转", "rotate.right", Color(red: 0.55, green: 0.35, blue: 0.75)) { Link.send(["cmd": "rotate"]); hint = "已旋转 90°" }
+                PB("恢复", "arrow.counterclockwise", Color(red: 0.90, green: 0.55, blue: 0.15)) { tapReset() }
+            }
+        }
+    }
+
+    private var sigRow: some View {
+        HStack {
+            Label(sigText, systemImage: "waveform.path.ecg")
+                .font(.caption2).bold().foregroundStyle(sigColor)
+            Spacer()
+            Toggle("AI实时", isOn: $aiOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+            Text("AI实时").font(.caption2).foregroundStyle(.secondary)
+            Button { showDiag = true } label: {
+                Text("实时分析").font(.caption2).bold()
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(.teal.opacity(0.15)))
+                    .foregroundStyle(.teal)
+            }
+        }
+    }
+
+    private var bigButton: some View {
+        Button { toggleLive() } label: {
+            Text(bigTitle)
+                .font(.title3.bold())
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(bigTint)
+    }
+
+    private var tabBar: some View {
+        HStack {
+            tab("相机", "camera.fill", true)
+            tab("相册", "photo.on.rectangle") { pickerRequest = true }
+            tab("创作灵感", "sparkles") { hint = "灵感：电脑 OBS 推 rtmp://电脑IP:1935/live/auxcam，手机自动接上" }
+            tab("内录", "record.circle", recordOn) { tapRecord() }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func tab(_ t: String, _ i: String, _ on: Bool = false, _ act: (() -> Void)? = nil) -> some View {
+        Button(action: { act?() }) {
+            VStack(spacing: 2) {
+                Image(systemName: i).font(.footnote)
+                Text(t).font(.caption2)
+            }
+            .foregroundStyle(on ? Color.teal : Color.secondary)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var diagSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 10) {
+                diagRow("内核", kernelOK ? "运行中" : "未连接")
+                diagRow("注入", st["inject"] ?? "-")
+                diagRow("画面", st["playing"] ?? "-")
+                diagRow("流", st["stream"] ?? "-")
+                diagRow("素材", st["video"] ?? "-")
+                diagRow("直播状态", state.rawValue)
+                diagRow("实时码率", sigText)
+                diagRow("重连次数", "\(retryCount)")
+                if !hint.isEmpty { Text(hint).font(.caption).foregroundStyle(.green) }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("实时分析")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private func diagRow(_ k: String, _ v: String) -> some View {
+        HStack {
+            Text(k).font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Text(v).font(.caption).bold()
+        }
+    }
+
+    // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
+    private func boot() {
+        cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
+        Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
+        if wasLive {
+            // 上次退出时在直播：自动恢复，不用人再点
+            wasLive = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startLive() }
+        }
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
+    }
+
+    private func tick() {
+        st = Link.status()
+        if kernelOK {
+            deadCount = 0
+        } else {
+            deadCount += 1
+            if deadCount == 5 && !revived {
+                revived = true
+                DispatchQueue.global(qos: .utility).async { Link.reviveKernel() }
+            }
+        }
+        // 心跳：电脑画面每秒都在往手机里写数据 = 直连活着
+        let now = Date()
+        let cur = netMode ? Link.vcamStamp() : Link.esSize()
+        if lastTick.timeIntervalSince(now) > 0.7, cur >= 0, lastES >= 0 {
+            let dt = now.timeIntervalSince(lastTick)
+            kbps = max(0, Double(cur - lastES) * 8.0 / dt / 1000.0)
+        }
+        lastES = cur
+        lastTick = now
+
+        guard state == .starting || state == .live || state == .broken else { return }
+        if playingFake && cur > 0 {
+            if kbps > 0 || st["stream"] == "帧模式" || st["stream"] == "文件模式" {
+                state = .live
+                stuckCount = 0
+            }
+        } else if cur <= 0 || (!playingFake && state == .live) {
+            stuckCount += 1
+            if stuckCount >= 8 {   // 8 秒没动静 = 断了，自己重连
+                stuckCount = 0
+                state = .broken
+                autoRetry()
+            }
+        }
+    }
+
+    private func autoRetry() {
+        if retryCount >= 3 {
+            // 连不上：自动换一条路（直连 ↔ 局域网/文件模式）
+            retryCount = 0
+            netMode.toggle()
+            hint = "已自动切换为" + (netMode ? "局域网" : "USB直连")
+        } else {
+            retryCount += 1
+        }
+        startLive()
+    }
+
+    private func startLive() {
+        state = .starting
+        stuckCount = 0
+        Link.send(["cmd": "start", "mode": netMode ? "stream" : "file", "url": builtURL])
+    }
+
+    private func stopLive() {
+        state = .idle
+        stuckCount = 0
+        retryCount = 0
+        Link.send(["cmd": "stop"])
+    }
+
+    private var bigTitle: String {
+        switch state {
+        case .idle: return "开始视频直播"
+        case .starting: return "正在启动 USB…"
+        case .live: return "停止直连"
+        case .broken: return "断流重连中…"
+        }
+    }
+
+    private var bigTint: Color {
+        switch state {
+        case .idle: return .green
+        case .starting, .broken: return .orange
+        case .live: return .red
+        }
+    }
+
+    private func toggleLive() {
+        switch state {
+        case .idle, .broken:
+            retryCount = 0
+            startLive()
+            wasLive = true
+        case .starting, .live:
+            stopLive()
+            wasLive = false
+        }
+    }
+
+    private func tapDirect() {
+        netMode = false
+        hint = "USB直连：电脑画面走数据线"
+        if state == .live || state == .starting { startLive() } else {
+            Link.send(["cmd": "mode", "mode": "file", "url": builtURL])
+        }
+    }
+
+    private func tapMirror() {
+        mirrorOn.toggle()
+        Link.send(["cmd": "mirror"])
+        hint = mirrorOn ? "镜像已开" : "镜像已关"
+    }
+
+    private func tapRecord() {
+        recordOn.toggle()
+        Link.send(["cmd": recordOn ? "record_on" : "record_off"])
+        hint = recordOn ? "内录已开（自动存档电脑画面）" : "内录已关"
+    }
+
+    private func tapReset() {
+        state = .idle
+        stuckCount = 0
+        retryCount = 0
+        wasLive = false
+        mirrorOn = false
+        recordOn = false
+        Link.send(["cmd": "reset"])
+        hint = "已恢复（正常相机）"
     }
 }
