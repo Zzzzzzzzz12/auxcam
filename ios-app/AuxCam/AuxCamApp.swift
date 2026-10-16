@@ -306,9 +306,9 @@ final class StreamDecoder {
         CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
             sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
-            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBuffer: &sb)
+            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
         if let sb {
-            VTDecompressionSessionDecodeFrame(session, sb,
+            VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
                                               flags: [._EnableAsynchronousDecompression],
                                               frameRefcon: nil, infoFlagsOut: nil)
         }
