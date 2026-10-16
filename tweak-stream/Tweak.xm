@@ -130,20 +130,21 @@ static void Feed(NSData *chunk) {
     const uint8_t *b = (const uint8_t *)gPend.bytes;
     NSUInteger n = gPend.length;
     NSUInteger lastCut = 0;
+    NSUInteger lastHdr = 0;
     NSUInteger p = 0;
     while (p + 3 < n) {
         NSUInteger hdr = 0;
         if (b[p]==0 && b[p+1]==0 && b[p+2]==1) hdr = 3;
         else if (p+3 < n && b[p]==0 && b[p+1]==0 && b[p+2]==0 && b[p+3]==1) hdr = 4;
         if (!hdr) { p++; continue; }
-        if (lastCut && p > lastCut) {
-            NSUInteger len = p - lastCut - 3;   // 去掉头
+        if (lastCut && p > lastCut && lastHdr > 0) {
+            NSUInteger len = p - lastCut - lastHdr;   // 按实际头长去掉 start code
             if (len > 0 && len < (4 << 20)) {
                 CMBlockBufferRef bb = NULL;
                 if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault, NULL, 0, len, 0, &bb) == kCMBlockBufferNoErr) {
                     char *dst = NULL;
                     CMBlockBufferGetDataPointer(bb, 0, NULL, NULL, &dst);
-                    if (dst) memcpy(dst, b + lastCut + 3, len);
+                    if (dst) memcpy(dst, b + lastCut + lastHdr, len);
                     uint8_t hb[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len };
                     CMBlockBufferRef hd = NULL;
                     CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, 4, kCFAllocatorDefault, NULL, 0, 4, 0, &hd);
@@ -166,6 +167,7 @@ static void Feed(NSData *chunk) {
             }
         }
         lastCut = p;
+        lastHdr = hdr;
         p += hdr;
     }
     if (lastCut > 0 && n - lastCut < (4 << 20)) {
