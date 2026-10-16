@@ -222,7 +222,7 @@ final class StreamDecoder {
     // 解码出一帧：把画布编号公布出去
     static let frameCallback: VTDecompressionOutputCallback = { (_, _, status, _, imageBuffer, _, _) in
         guard status == noErr, let img = imageBuffer else { return }
-        guard let surf = CVPixelBufferGetIOSurface(img) else { return }
+        guard let surf = CVPixelBufferGetIOSurface(img)?.takeUnretainedValue() else { return }
         let sid = IOSurfaceGetID(surf)
         let s = "id=\(sid)\n"
         try? s.write(toFile: StreamDecoder.surfacePath, atomically: true, encoding: .utf8)
@@ -306,7 +306,7 @@ final class StreamDecoder {
         CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
             sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
-            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
+            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBuffer: &sb)
         if let sb {
             VTDecompressionSessionDecodeFrame(session, sb,
                                               flags: [._EnableAsynchronousDecompression],
