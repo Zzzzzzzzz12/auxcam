@@ -140,28 +140,23 @@ static void Feed(NSData *chunk) {
         if (lastCut && p > lastCut && lastHdr > 0) {
             NSUInteger len = p - lastCut - lastHdr;   // 按实际头长去掉 start code
             if (len > 0 && len < (4 << 20)) {
+                // 单块内存：4字节长度前缀 + NALU，无引用链（避免 CFRelease 炸）
+                size_t total = 4 + len;
                 CMBlockBufferRef bb = NULL;
-                if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault, NULL, 0, len, 0, &bb) == kCMBlockBufferNoErr) {
+                if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, total,
+                        kCFAllocatorDefault, NULL, 0, total, kCMBlockBufferAssureMemoryNowFlag, &bb) == kCMBlockBufferNoErr) {
                     char *dst = NULL;
-                    CMBlockBufferGetDataPointer(bb, 0, NULL, NULL, &dst);
-                    if (dst) memcpy(dst, b + lastCut + lastHdr, len);
-                    uint8_t hb[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len };
-                    CMBlockBufferRef hd = NULL;
-                    CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, 4, kCFAllocatorDefault, NULL, 0, 4, 0, &hd);
-                    char *hdst = NULL;
-                    CMBlockBufferGetDataPointer(hd, 0, NULL, NULL, &hdst);
-                    if (hdst) memcpy(hdst, hb, 4);
-                    CMBlockBufferRef cat = NULL;
-                    CMBlockBufferCreateContiguous(kCFAllocatorDefault, hd, kCFAllocatorDefault, NULL, 0, 4, 0, &cat);
-                    CMBlockBufferAppendBufferReference(cat, bb, 0, len, 0);
-                    CMSampleBufferRef sb = NULL;
-                    CMSampleBufferCreateReady(kCFAllocatorDefault, cat, gFmt, 1, 0, NULL, 0, NULL, &sb);
-                    if (sb) {
-                        VTDecompressionSessionDecodeFrame(gVT, sb, 0, NULL, NULL);
-                        CFRelease(sb);
+                    if (CMBlockBufferGetDataPointer(bb, 0, NULL, NULL, &dst) == kCMBlockBufferNoErr && dst) {
+                        dst[0] = (char)(len >> 24); dst[1] = (char)(len >> 16);
+                        dst[2] = (char)(len >> 8);  dst[3] = (char)len;
+                        memcpy(dst + 4, b + lastCut + lastHdr, len);
+                        CMSampleBufferRef sb = NULL;
+                        CMSampleBufferCreateReady(kCFAllocatorDefault, bb, gFmt, 1, 0, NULL, 0, NULL, &sb);
+                        if (sb) {
+                            VTDecompressionSessionDecodeFrame(gVT, sb, 0, NULL, NULL);
+                            CFRelease(sb);
+                        }
                     }
-                    CFRelease(cat);
-                    CFRelease(hd);
                     CFRelease(bb);
                 }
             }
