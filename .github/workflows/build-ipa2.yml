@@ -19,7 +19,7 @@ jobs:
         cp Icon-1024.png out/Payload/AuxCam.app/Icon-1024.png
         xcrun -sdk iphoneos swiftc -parse-as-library -O -target arm64-apple-ios17.0 -sdk "$SDK" \
           -o out/Payload/AuxCam.app/AuxCam AuxCam/AuxCamApp.swift \
-          -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI -framework CoreMedia -framework AVFoundation -framework VideoToolbox -framework IOSurface 2>&1 | tail -25
+          -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI -framework CoreMedia -framework AVFoundation -framework VideoToolbox -framework IOSurface -framework VideoToolbox -framework IOSurface 2>&1 | tail -25
         chmod 755 out/Payload/AuxCam.app/AuxCam
         ls -la out/Payload/AuxCam.app
         cd out && ditto -c -k --keepParent Payload AuxCam.ipa
