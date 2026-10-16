@@ -275,37 +275,42 @@ final class StreamDecoder {
             session = nil
             fmt = nil
         }
-        let ps: [UnsafePointer<UInt8>] = sps.withUnsafeBytes { sp in
+        // 全程锁在 withUnsafeBytes 闭包内（Data 指针不能逃逸，逃逸就悬垂 → -12712）
+        sps.withUnsafeBytes { sp in
             pps.withUnsafeBytes { pp in
-                [sp.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                 pp.baseAddress!.assumingMemoryBound(to: UInt8.self)]
+                guard let spb = sp.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let ppb = pp.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    StreamDecoder.dlog("build: no base address")
+                    return
+                }
+                let ps: [UnsafePointer<UInt8>] = [spb, ppb]
+                var sizes = [sps.count, pps.count]
+                var f: CMVideoFormatDescription?
+                let fmtSt = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: kCFAllocatorDefault, parameterSetCount: 2,
+                    parameterSetPointers: ps, parameterSetSizes: &sizes,
+                    nalUnitHeaderLength: 4, formatDescriptionOut: &f)
+                StreamDecoder.buildCount += 1
+                StreamDecoder.dlog("build #\(StreamDecoder.buildCount) fmtSt=\(fmtSt) sps=\(sps.count) pps=\(pps.count)")
+                guard let f else {
+                    StreamDecoder.dlog("build: no format description")
+                    return
+                }
+                fmt = f
+                let attrs: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                ]
+                var cb = VTDecompressionOutputCallbackRecord(
+                    decompressionOutputCallback: StreamDecoder.frameCallback,
+                    decompressionOutputRefCon: nil)
+                let vtSt = VTDecompressionSessionCreate(
+                    allocator: kCFAllocatorDefault, formatDescription: f,
+                    decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
+                    outputCallback: &cb, decompressionSessionOut: &session)
+                StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
             }
         }
-        var sizes = [sps.count, pps.count]
-        var f: CMVideoFormatDescription?
-        let fmtSt = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-            allocator: kCFAllocatorDefault, parameterSetCount: 2,
-            parameterSetPointers: ps, parameterSetSizes: &sizes,
-            nalUnitHeaderLength: 4, formatDescriptionOut: &f)
-        StreamDecoder.buildCount += 1
-        StreamDecoder.dlog("build #\(StreamDecoder.buildCount) fmtSt=\(fmtSt) sps=\(sps.count) pps=\(pps.count)")
-        guard let f else {
-            StreamDecoder.dlog("build: no format description")
-            return
-        }
-        fmt = f
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-        ]
-        var cb = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: StreamDecoder.frameCallback,
-            decompressionOutputRefCon: nil)
-        let vtSt = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault, formatDescription: f,
-            decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
-            outputCallback: &cb, decompressionSessionOut: &session)
-        StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
     }
 
     private func decode(_ raw: Data) {
