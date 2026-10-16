@@ -8,7 +8,6 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
-#import <IOSurface/IOSurface.h>
 #import <objc/runtime.h>
 #include <sys/stat.h>
 #include <pthread.h>
@@ -16,6 +15,10 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+
+// theos SDK 里没有 IOSurface 公开头，手动声明（符号在 IOSurface.framework 里，已链接）
+typedef struct __IOSurface *IOSurfaceRef;
+extern IOSurfaceRef IOSurfaceLookup(uint32_t csid);
 
 static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
 static NSString *const kESPath  = @"/var/mobile/Media/DCIM/stream.h264";
