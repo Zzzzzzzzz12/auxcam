@@ -299,16 +299,14 @@ final class StreamDecoder {
                     return
                 }
                 fmt = f
-                let attrs: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                ]
                 var cb = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: nil)
+                // 先不限定输出格式（IOSurface 属性可能导致输出阶段失败报 -12909），
+                // 回调里拿不到 IOSurface 就走 raw 像素文件兜底
                 let vtSt = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault, formatDescription: f,
-                    decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
+                    decoderSpecification: nil, imageBufferAttributes: nil,
                     outputCallback: &cb, decompressionSessionOut: &session)
                 StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
             }
