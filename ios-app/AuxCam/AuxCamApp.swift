@@ -344,8 +344,9 @@ final class StreamDecoder {
             sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
             sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
         if let sb {
+            // 同步解码：回调在提交线程内立即触发（异步模式在无 RunLoop 环境可能不回调）
             VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
-                                              flags: [._EnableAsynchronousDecompression],
+                                              flags: [],
                                               frameRefcon: nil, infoFlagsOut: nil)
         }
     }
