@@ -73,16 +73,34 @@ final class Cam: ObservableObject {
     @Published var diag = "启动中…"
     @Published var position: AVCaptureDevice.Position = .front
     private var lastFlip = Date.distantPast
+    private var busy = false
+    private let queue = DispatchQueue(label: "auxcam.cam", qos: .userInitiated)
+
+    private func log(_ s: String) {
+        DispatchQueue.main.async { self.diag = s }
+        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
+        if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let f = d.appendingPathComponent("diag.txt")
+            if let h = try? FileHandle(forWritingTo: f) {
+                h.seekToEndOfFile()
+                h.write(line.data(using: .utf8) ?? Data())
+                try? h.close()
+            } else {
+                try? line.write(to: f, atomically: true, encoding: .utf8)
+            }
+        }
+    }
 
     func start() {
         let st = AVCaptureDevice.authorizationStatus(for: .video)
         switch st {
         case .notDetermined:
-            diag = "请求相机权限…"
+            log("权限未定，正在请求")
             AVCaptureDevice.requestAccess(for: .video) { ok in
                 DispatchQueue.main.async { ok ? self.begin() : self.markDenied() }
             }
         case .authorized:
+            log("权限已允许")
             begin()
         default:
             markDenied()
@@ -90,7 +108,7 @@ final class Cam: ObservableObject {
     }
 
     func flip() {
-        if Date().timeIntervalSince(lastFlip) < 2 { return }
+        if Date().timeIntervalSince(lastFlip) < 2.5 { return }
         lastFlip = Date()
         position = position == .front ? .back : .front
         begin(restart: true)
@@ -98,34 +116,43 @@ final class Cam: ObservableObject {
 
     private func markDenied() {
         denied = true
-        diag = "相机权限被拒（设置里允许 AuxCam）"
+        log("相机权限被拒")
     }
 
     private func begin(restart: Bool = false) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        queue.async { [weak self] in
             guard let self else { return }
+            if self.busy { self.log("上次切换还没完，这次跳过"); return }
+            self.busy = true
             if restart {
                 self.session.beginConfiguration()
                 for i in self.session.inputs { self.session.removeInput(i) }
                 self.session.commitConfiguration()
             }
-            guard restart || !self.session.isRunning else { return }
-            var dev: AVCaptureDevice?
-            if #available(iOS 13.0, *) {
-                dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position)
-            }
-            if dev == nil {
-                dev = AVCaptureDevice.default(for: .video)
-            }
-            DispatchQueue.main.async { self.diag = dev == nil ? "找不到相机" : "相机就绪，开画面中…" }
-            guard let d = dev, let input = try? AVCaptureDeviceInput(device: d), self.session.canAddInput(input) else {
-                DispatchQueue.main.async { self.diag = "相机打不开（可能正被别的 App 占用）" }
+            guard restart || !self.session.isRunning else { self.busy = false; return }
+            var dev: AVCaptureDevice? = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position)
+            if dev == nil { dev = AVCaptureDevice.default(for: .video) }
+            guard let d = dev else { self.log("找不到相机"); self.busy = false; return }
+            do {
+                let input = try AVCaptureDeviceInput(device: d)
+                if self.session.canAddInput(input) {
+                    self.session.addInput(input)
+                } else {
+                    self.log("输入加不上（相机被别的 App 占着？）")
+                    self.busy = false
+                    return
+                }
+            } catch {
+                self.log("建输入失败: \(error.localizedDescription)")
+                self.busy = false
                 return
             }
-            self.session.addInput(input)
-            self.session.sessionPreset = .high
-            if !self.session.isRunning { self.session.startRunning() }
-            DispatchQueue.main.async { self.diag = self.session.isRunning ? "画面正常" : "会话没起来" }
+            if !self.session.isRunning {
+                self.session.sessionPreset = .high
+                self.session.startRunning()
+            }
+            self.log("会话运行中=" + String(self.session.isRunning))
+            self.busy = false
         }
     }
 }
@@ -179,6 +206,7 @@ struct ContentView: View {
     @State private var pickerRequest = false
     @State private var hint = ""
     @State private var deadCount = 0
+    @State private var revived = false
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
     @AppStorage("netMode") private var netMode = false   // false=USB直连  true=局域网
 
@@ -329,7 +357,10 @@ struct ContentView: View {
                     deadCount = 0
                 } else {
                     deadCount += 1
-                    if deadCount == 5 { Link.reviveKernel() }
+                    if deadCount == 5 && !revived {
+                        revived = true
+                        DispatchQueue.global(qos: .utility).async { Link.reviveKernel() }
+                    }
                 }
             }
         }
