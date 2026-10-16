@@ -208,7 +208,7 @@ final class VCU1Receiver: ObservableObject {
     private var frameCount: Int32 = 0
     private var lastCountAt = Date()
     private let lock = NSLock()
-    private let maxFile: Int64 = 3 * 1024 * 1024
+    private let maxFile: Int64 = 8 * 1024 * 1024
     private var sps: Data = Data()
     private var pps: Data = Data()
 
