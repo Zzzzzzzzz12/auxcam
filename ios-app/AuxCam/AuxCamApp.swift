@@ -357,12 +357,12 @@ final class StreamDecoder {
             sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
             sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
         if let sb {
-            // 同步解码：回调在提交线程内立即触发
-            let dSt = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
-                                                        flags: [],
-                                                        frameRefcon: nil, infoFlagsOut: nil)
+            // 异步解码（同步模式会卡死解码线程，queue 后续全停）
+            VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
+                                              flags: [._EnableAsynchronousDecompression],
+                                              frameRefcon: nil, infoFlagsOut: nil)
             if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sbSt=\(sbSt) dSt=\(dSt) n=\(n.count)")
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sbSt=\(sbSt) submitted n=\(n.count)")
             }
         } else {
             if StreamDecoder.feedCount <= 5 { StreamDecoder.dlog("decode: sample create fail \(sbSt)") }
