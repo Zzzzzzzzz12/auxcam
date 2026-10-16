@@ -686,9 +686,12 @@ struct ContentView: View {
 
     // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
     private func boot() {
-        cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
+        // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
+            self.keepAliveAudio()   // 静音保活：退后台也继续收画面
+        }
         vcu.start()   // 开门 28765，等万相电脑端连
-        keepAliveAudio()   // 静音保活：退后台也继续收画面
         Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
         if wasLive {
             // 上次退出时在直播：自动恢复，不用人再点
