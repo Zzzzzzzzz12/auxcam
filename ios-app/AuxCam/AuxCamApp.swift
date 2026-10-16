@@ -243,6 +243,7 @@ final class VCU1Receiver: ObservableObject {
         listenFd = socket(AF_INET, SOCK_STREAM, 0)
         guard listenFd >= 0 else {
             DispatchQueue.main.async { self.status = "开监听失败" }
+            slog("socket failed")
             return
         }
         var on: Int32 = 1
@@ -258,10 +259,12 @@ final class VCU1Receiver: ObservableObject {
         }
         if b != 0 {
             DispatchQueue.main.async { self.status = "端口被占" }
+            slog("bind failed errno=\(errno)")
             close(listenFd); listenFd = -1
             return
         }
         listen(listenFd, 4)
+        slog("listening 28765")
         DispatchQueue.main.async { self.status = "已开门(28765)，等电脑连" }
         while shouldRun {
             var caddr = sockaddr_in()
@@ -292,28 +295,47 @@ final class VCU1Receiver: ObservableObject {
         return buf
     }
 
+    // 诊断日志（写到 DCIM，电脑随时能拉）
+    private func slog(_ s: String) {
+        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
+        let path = "/var/mobile/Media/DCIM/.vcu1.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            try? h.close()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
     private func handleConnection(_ fd: Int32) {
         var lastHb = Date()
+        slog("conn accepted")
         while shouldRun {
-            guard let head = readFull(fd, 24) else { return }
+            guard let head = readFull(fd, 24) else { slog("conn closed by peer"); return }
             let magic = String(bytes: head[0..<4], encoding: .ascii) ?? ""
-            guard magic == "VCU1" else { return }
+            guard magic == "VCU1" else { slog("bad magic: " + magic); return }
             let version = Int(head[4])
             let type = Int(head[5])
             let flags = Int(head[6]) << 8 | Int(head[7])
             let len = Int(head[8]) << 24 | Int(head[9]) << 16 | Int(head[10]) << 8 | Int(head[11])
-            guard version == 1, len >= 0, len <= 4 * 1024 * 1024 else { return }
+            guard version == 1, len >= 0, len <= 4 * 1024 * 1024 else {
+                slog("bad ver/len: v=\(version) len=\(len)"); return
+            }
             let payload = len > 0 ? (readFull(fd, len) ?? Data()) : Data()
-            if len > 0 && payload.count < len { return }
+            if len > 0 && payload.count < len { slog("payload short"); return }
             switch type {
-            case 1: parseAVCC(payload)
+            case 1:
+                parseAVCC(payload)
+                slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
             case 2:
                 appendVideo(payload, keyframe: (flags & 1) != 0)
                 countFrame()
+                if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
             case 5: lastHb = Date()
             default: break
             }
-            if Date().timeIntervalSince(lastHb) > 4 { return }   // 心跳断了
+            if Date().timeIntervalSince(lastHb) > 8 { slog("heartbeat timeout"); return }
         }
     }
 
