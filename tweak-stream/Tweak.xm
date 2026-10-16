@@ -123,8 +123,8 @@ static void Feed(NSData *chunk) {
     if (!gVT) {
         NSDictionary *attrs = @{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
                                  (id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
-        VTDecompressionSessionCreate(kCFAllocatorDefault, gFmt, NULL, (__bridge CFDictionaryRef)attrs,
-                                     (VTDecompressionOutputCallback)GotFrame, &gVT);
+        VTDecompressionOutputCallbackRecord cb = { (VTDecompressionOutputCallback)GotFrame, NULL };
+        VTDecompressionSessionCreate(kCFAllocatorDefault, gFmt, NULL, (__bridge CFDictionaryRef)attrs, &cb, &gVT);
         if (!gVT) return;
     }
     const uint8_t *b = (const uint8_t *)gPend.bytes;
