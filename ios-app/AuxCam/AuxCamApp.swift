@@ -213,19 +213,41 @@ struct CamPreview: UIViewRepresentable {
 // 相机进程里的插件每秒盯这个文件，有画布就用画布画面替换相机帧（= 相机采集被换成想要的画面）
 final class StreamDecoder {
     static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
+    static let logPath = "/var/mobile/Media/DCIM/.dec.log"
     private var session: VTDecompressionSession?
     private var fmt: CMVideoFormatDescription?
     private var sps = Data()
     private var pps = Data()
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
+    private static var frameCount: Int = 0
+    private static var buildCount: Int = 0
+
+    static func dlog(_ s: String) {
+        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
+        if let h = FileHandle(forWritingAtPath: logPath) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            try? h.close()
+        } else {
+            try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
+        }
+    }
 
     // 解码出一帧：把画布编号公布出去
     static let frameCallback: VTDecompressionOutputCallback = { (_, _, status, _, imageBuffer, _, _) in
+        frameCount += 1
+        if frameCount <= 3 || frameCount % 90 == 0 {
+            dlog("callback #\(frameCount) status=\(status)")
+        }
         guard status == noErr, let img = imageBuffer else { return }
-        guard let surf = CVPixelBufferGetIOSurface(img)?.takeUnretainedValue() else { return }
+        guard let surf = CVPixelBufferGetIOSurface(img)?.takeUnretainedValue() else {
+            dlog("no iosurface on frame")
+            return
+        }
         let sid = IOSurfaceGetID(surf)
         let s = "id=\(sid)\n"
-        try? s.write(toFile: StreamDecoder.surfacePath, atomically: true, encoding: .utf8)
+        try? s.write(toFile: surfacePath, atomically: true, encoding: .utf8)
+        if frameCount <= 3 { dlog("published surface id=\(sid)") }
     }
 
     func setConfig(sps: Data, pps: Data) {
@@ -244,7 +266,10 @@ final class StreamDecoder {
     }
 
     private func build() {
-        guard sps.count > 3, pps.count > 3 else { return }
+        guard sps.count > 3, pps.count > 3 else {
+            StreamDecoder.dlog("build: sps/pps too small")
+            return
+        }
         if let s = session {
             VTDecompressionSessionInvalidate(s)
             session = nil
@@ -258,11 +283,16 @@ final class StreamDecoder {
         }
         var sizes = [sps.count, pps.count]
         var f: CMVideoFormatDescription?
-        CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        let fmtSt = CMVideoFormatDescriptionCreateFromH264ParameterSets(
             allocator: kCFAllocatorDefault, parameterSetCount: 2,
             parameterSetPointers: ps, parameterSetSizes: &sizes,
             nalUnitHeaderLength: 4, formatDescriptionOut: &f)
-        guard let f else { return }
+        StreamDecoder.buildCount += 1
+        StreamDecoder.dlog("build #\(StreamDecoder.buildCount) fmtSt=\(fmtSt) sps=\(sps.count) pps=\(pps.count)")
+        guard let f else {
+            StreamDecoder.dlog("build: no format description")
+            return
+        }
         fmt = f
         let attrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -271,10 +301,11 @@ final class StreamDecoder {
         var cb = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: StreamDecoder.frameCallback,
             decompressionOutputRefCon: nil)
-        VTDecompressionSessionCreate(
+        let vtSt = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: f,
             decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
             outputCallback: &cb, decompressionSessionOut: &session)
+        StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
     }
 
     private func decode(_ raw: Data) {
