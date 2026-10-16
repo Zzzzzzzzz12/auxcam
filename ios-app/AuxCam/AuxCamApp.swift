@@ -82,10 +82,12 @@ struct Link {
 
 // ───────────────────────── 相机预览层 ─────────────────────────
 final class Cam: ObservableObject {
-    let session = AVCaptureSession()
     @Published var denied = false
     @Published var diag = "启动中…"
+    @Published var sessionReady = false
     @Published var position: AVCaptureDevice.Position = .front
+    private var _session: AVCaptureSession?
+    var session: AVCaptureSession? { _session }
     private var lastFlip = Date.distantPast
     private var busy = false
     private let queue = DispatchQueue(label: "auxcam.cam", qos: .userInitiated)
@@ -137,19 +139,27 @@ final class Cam: ObservableObject {
             guard let self else { return }
             if self.busy { return }
             self.busy = true
-            if restart {
-                self.session.beginConfiguration()
-                for i in self.session.inputs { self.session.removeInput(i) }
-                self.session.commitConfiguration()
+            // 后台建 session（这里的同步 XPC 等待不卡主线程）
+            var s = self._session
+            if s == nil {
+                s = AVCaptureSession()
+                self._session = s
+                DispatchQueue.main.async { self.sessionReady = true }
             }
-            guard restart || !self.session.isRunning else { self.busy = false; return }
+            guard let sess = s else { self.busy = false; return }
+            if restart {
+                sess.beginConfiguration()
+                for i in sess.inputs { sess.removeInput(i) }
+                sess.commitConfiguration()
+            }
+            guard restart || !sess.isRunning else { self.busy = false; return }
             var dev: AVCaptureDevice? = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position)
             if dev == nil { dev = AVCaptureDevice.default(for: .video) }
             guard let d = dev else { self.log("找不到相机"); self.busy = false; return }
             do {
                 let input = try AVCaptureDeviceInput(device: d)
-                if self.session.canAddInput(input) {
-                    self.session.addInput(input)
+                if sess.canAddInput(input) {
+                    sess.addInput(input)
                 } else {
                     self.log("输入被占用，稍后自动重试")
                     self.busy = false
@@ -164,18 +174,18 @@ final class Cam: ObservableObject {
                 self.busy = false
                 return
             }
-            if !self.session.isRunning {
-                self.session.sessionPreset = .high
-                self.session.startRunning()
+            if !sess.isRunning {
+                sess.sessionPreset = .high
+                sess.startRunning()
             }
-            self.log("会话运行中=" + String(self.session.isRunning))
+            self.log("会话运行中=" + String(sess.isRunning))
             self.busy = false
         }
     }
 }
 
 struct CamPreview: UIViewRepresentable {
-    let session: AVCaptureSession
+    let session: AVCaptureSession?
 
     final class V: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -189,7 +199,11 @@ struct CamPreview: UIViewRepresentable {
         return v
     }
 
-    func updateUIView(_ uiView: V, context: Context) {}
+    func updateUIView(_ uiView: V, context: Context) {
+        if let s = session, uiView.pl.session !== s {
+            uiView.pl.session = s
+        }
+    }
 }
 
 // ───────────────────────── VCU1 接收层（接万相桌面端） ─────────────────────────
@@ -525,6 +539,7 @@ struct ContentView: View {
                 .foregroundStyle(.white)
             } else {
                 CamPreview(session: cam.session)
+                    .id(cam.sessionReady)   // session 后台建好后重建视图挂上去
                 VStack {
                     HStack {
                         Spacer()
