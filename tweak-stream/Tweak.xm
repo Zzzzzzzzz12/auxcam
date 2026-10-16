@@ -8,6 +8,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <IOSurface/IOSurface.h>
 #import <objc/runtime.h>
 #include <sys/stat.h>
 #include <pthread.h>
@@ -18,6 +19,7 @@
 
 static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
 static NSString *const kESPath  = @"/var/mobile/Media/DCIM/stream.h264";
+static NSString *const kSurfPath = @"/var/mobile/Media/DCIM/.frame.surface";
 static NSString *const kBeatPath = @"/var/mobile/Media/DCIM/.auxcam-stream-heartbeat";
 static NSString *const kLogPath  = @"/var/mobile/Media/DCIM/.auxcam-stream.log";
 
@@ -252,41 +254,44 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (gOrigEmit) ((void (*)(id, SEL, CMSampleBufferRef))gOrigEmit)(self, _cmd, sb);
 }
 
-// ---------- 读流线程 ----------
+// ---------- 读画布线程（App 解码好写 .frame.surface，这里照着画布换相机帧） ----------
 static void *ReaderThread(void *arg) {
     (void)arg;
-    int fd = -1;
-    uint64_t off = 0;
+    uint32_t lastSid = 0;
     while (1) {
         @autoreleasepool {
-            if (!gActive) { usleep(200 * 1000); if (fd >= 0) { close(fd); fd = -1; } continue; }
-            if (fd < 0) {
-                fd = open(kESPath.UTF8String, O_RDONLY);
-                off = 0;
-                if (fd < 0) { usleep(200 * 1000); continue; }
+            if (!gActive) {
+                if (gLast) { CVPixelBufferRelease(gLast); gLast = NULL; }
+                lastSid = 0;
+                usleep(100 * 1000);
+                continue;
             }
-            struct stat st;
-            if (fstat(fd, &st) == 0) {
-                if ((uint64_t)st.st_size < off) {
-                    off = 0;
-                    lseek(fd, 0, SEEK_SET);
-                    DecoderReset();
-                }
-                if ((uint64_t)st.st_size > off) {
-                    size_t want = (size_t)(st.st_size - off);
-                    if (want > (1 << 20)) want = 1 << 20;
-                    uint8_t *buf = (uint8_t *)malloc(want);
-                    ssize_t rd = read(fd, buf, want);
-                    if (rd > 0) {
-                        Feed([NSData dataWithBytesNoCopy:buf length:rd freeWhenDone:YES]);
-                        off += rd;
-                    } else {
-                        free(buf);
+            NSString *txt = [NSString stringWithContentsOfFile:kSurfPath encoding:NSUTF8StringEncoding error:nil];
+            uint32_t sid = 0;
+            if (txt) {
+                for (NSString *raw in [txt componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+                    NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    if ([t hasPrefix:@"id="]) {
+                        sid = (uint32_t)strtoul([[t substringFromIndex:3] UTF8String], NULL, 10);
+                        break;
                     }
                 }
             }
+            if (sid && sid != lastSid) {
+                lastSid = sid;
+                IOSurfaceRef surf = IOSurfaceLookup(sid);
+                if (surf) {
+                    CVPixelBufferRef pb = NULL;
+                    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surf, NULL, &pb) == kCVReturnSuccess && pb) {
+                        if (gLast) CVPixelBufferRelease(gLast);
+                        gLast = pb;
+                        gDecoded++;
+                    }
+                    CFRelease(surf);
+                }
+            }
         }
-        usleep(40 * 1000);
+        usleep(15 * 1000);
     }
     return NULL;
 }
