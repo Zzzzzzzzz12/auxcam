@@ -326,34 +326,33 @@ final class StreamDecoder {
             return
         }
         let total = n.count + 4
+        // 自己 malloc 内存（memoryBlock:nil 时 CMBlockBuffer 不会自动分配 → -12707）
+        guard let mem = malloc(total) else { return }
+        let mp = mem.assumingMemoryBound(to: UInt8.self)
+        var lenBE = UInt32(n.count).bigEndian
+        withUnsafeBytes(of: &lenBE) { b in
+            mp.update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: 4)
+        }
+        n.withUnsafeBytes { b in
+            (mp + 4).update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: n.count)
+        }
         var block: CMBlockBuffer?
+        var src = CMBlockBufferCustomBlockSource(
+            version: 0,
+            AllocateBlock: nil,
+            FreeBlock: { rawMem, _, _ in if let rawMem { free(rawMem) } },
+            refCon: nil)
         let bSt = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: total,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-            offsetToData: 0, dataLength: total, flags: 0, blockBufferOut: &block)
+            allocator: kCFAllocatorDefault, memoryBlock: mem, blockLength: total,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: &src,
+            offsetToData: 0, dataLength: total,
+            flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
         guard let block else {
             if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
                 StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) block fail \(bSt)")
             }
+            free(mem)
             return
-        }
-        var ptr: UnsafeMutablePointer<Int8>?
-        let gpSt = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
-                                               totalLengthOut: nil, dataPointerOut: &ptr)
-        guard let ptr, gpSt == kCMBlockBufferNoErr else {
-            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) getptr fail \(gpSt)")
-            }
-            return
-        }
-        var lenBE = UInt32(n.count).bigEndian
-        ptr.withMemoryRebound(to: UInt8.self, capacity: total) { p in
-            withUnsafeBytes(of: &lenBE) { b in
-                p.update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: 4)
-            }
-            n.withUnsafeBytes { b in
-                (p + 4).update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: n.count)
-            }
         }
         var sb: CMSampleBuffer?
         let sbSt = CMSampleBufferCreateReady(
