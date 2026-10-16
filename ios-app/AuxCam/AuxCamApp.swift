@@ -191,6 +191,194 @@ struct CamPreview: UIViewRepresentable {
     func updateUIView(_ uiView: V, context: Context) {}
 }
 
+// ───────────────────────── VCU1 接收层（接万相桌面端） ─────────────────────────
+// 万相电脑端通过数据线(usbmux)连 iPhone 的 28765 端口，包格式：
+//   24 字节头: "VCU1" + 版本(1B) + 类型(1B) + flags(2B BE) + 长度(4B BE) + 序号(4B BE) + 时间戳(8B BE 微秒)
+//   类型: 1=视频配置(AVCC SPS/PPS) 2=视频帧(H264 NALU, flags bit0=关键帧) 3=音频配置 4=音频帧(ADTS) 5=心跳(每秒)
+final class VCU1Receiver: ObservableObject {
+    @Published var status = "等待电脑连接"
+    @Published var fps = 0.0
+    @Published var alive = false
+
+    static let listenPort: UInt16 = 28765
+    static let outPath = "/var/mobile/Media/DCIM/stream.h264"
+    private var listenFd: Int32 = -1
+    private var shouldRun = false
+    private var frameCount: Int32 = 0
+    private var lastCountAt = Date()
+    private let lock = NSLock()
+    private let maxFile: Int64 = 3 * 1024 * 1024
+    private var sps: Data = Data()
+    private var pps: Data = Data()
+
+    func start() {
+        if shouldRun { return }
+        shouldRun = true
+        lock.lock(); sps = Data(); pps = Data(); lock.unlock()
+        DispatchQueue.global(qos: .userInitiated).async { self.serve() }
+    }
+
+    func stop() {
+        shouldRun = false
+        if listenFd >= 0 { close(listenFd); listenFd = -1 }
+        DispatchQueue.main.async { self.status = "已停止"; self.alive = false }
+    }
+
+    private func serve() {
+        listenFd = socket(AF_INET, SOCK_STREAM, 0)
+        guard listenFd >= 0 else {
+            DispatchQueue.main.async { self.status = "开监听失败" }
+            return
+        }
+        var on: Int32 = 1
+        setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = VCU1Receiver.listenPort.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let b = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(listenFd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if b != 0 {
+            DispatchQueue.main.async { self.status = "端口被占" }
+            close(listenFd); listenFd = -1
+            return
+        }
+        listen(listenFd, 4)
+        DispatchQueue.main.async { self.status = "已开门(28765)，等电脑连" }
+        while shouldRun {
+            var caddr = sockaddr_in()
+            var clen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let cfd = withUnsafeMutablePointer(to: &caddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(listenFd, $0, &clen)
+                }
+            }
+            guard cfd >= 0 else { break }
+            DispatchQueue.main.async { self.status = "电脑已连上，收画面中"; self.alive = true }
+            handleConnection(cfd)
+            close(cfd)
+            if shouldRun {
+                DispatchQueue.main.async { self.status = "断开，等电脑重连"; self.alive = false }
+            }
+        }
+    }
+
+    private func readFull(_ fd: Int32, _ n: Int) -> Data? {
+        var buf = Data()
+        var tmp = [UInt8](repeating: 0, count: n)
+        while buf.count < n {
+            let r = read(fd, &tmp, n - buf.count)
+            if r <= 0 { return nil }
+            buf.append(tmp, count: r)
+        }
+        return buf
+    }
+
+    private func handleConnection(_ fd: Int32) {
+        var lastHb = Date()
+        while shouldRun {
+            guard let head = readFull(fd, 24) else { return }
+            let magic = String(bytes: head[0..<4], encoding: .ascii) ?? ""
+            guard magic == "VCU1" else { return }
+            let version = Int(head[4])
+            let type = Int(head[5])
+            let flags = Int(head[6]) << 8 | Int(head[7])
+            let len = Int(head[8]) << 24 | Int(head[9]) << 16 | Int(head[10]) << 8 | Int(head[11])
+            guard version == 1, len >= 0, len <= 4 * 1024 * 1024 else { return }
+            let payload = len > 0 ? (readFull(fd, len) ?? Data()) : Data()
+            if len > 0 && payload.count < len { return }
+            switch type {
+            case 1: parseAVCC(payload)
+            case 2:
+                appendVideo(payload, keyframe: (flags & 1) != 0)
+                countFrame()
+            case 5: lastHb = Date()
+            default: break
+            }
+            if Date().timeIntervalSince(lastHb) > 4 { return }   // 心跳断了
+        }
+    }
+
+    // type1: AVCC 配置（AVCDecoderConfigurationRecord）→ 提出 SPS/PPS
+    private func parseAVCC(_ d: Data) {
+        guard d.count > 7, d[0] == 1 else { return }
+        var i = 5
+        let numSPS = Int(d[i] & 0x1F); i += 1
+        var s = Data(); var p = Data()
+        for _ in 0..<numSPS where i + 2 <= d.count {
+            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
+            guard i + l <= d.count else { return }
+            s = d.subarray(in: i..<(i + l)); i += l
+        }
+        guard i < d.count else { return }
+        let numPPS = Int(d[i] & 0x1F); i += 1
+        for _ in 0..<numPPS where i + 2 <= d.count {
+            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
+            guard i + l <= d.count else { return }
+            p = d.subarray(in: i..<(i + l)); i += l
+        }
+        if !s.isEmpty && !p.isEmpty {
+            lock.lock(); sps = s; pps = p; lock.unlock()
+        }
+    }
+
+    private static let startCode = Data([0, 0, 0, 1])
+
+    // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（3MB 循环）
+    private func appendVideo(_ d: Data, keyframe: Bool) {
+        var nalu = d
+        if nalu.starts(with: [0, 0, 0, 1]) { nalu = nalu.subdata(in: 4..<nalu.count) }
+        else if nalu.starts(with: [0, 0, 1]) { nalu = nalu.subdata(in: 3..<nalu.count) }
+        guard !nalu.isEmpty else { return }
+
+        let fm = FileManager.default
+        var size: Int64 = 0
+        if let a = try? fm.attributesOfItem(atPath: VCU1Receiver.outPath) {
+            size = (a[.size] as? NSNumber)?.int64Value ?? 0
+        }
+        var fh = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
+        if fh == nil {
+            fm.createFile(atPath: VCU1Receiver.outPath, contents: nil)
+            fh = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
+        }
+        guard let fh else { return }
+
+        var head = Data()
+        if keyframe {
+            lock.lock()
+            let s = sps, p = pps
+            lock.unlock()
+            if !s.isEmpty && !p.isEmpty {
+                head.append(VCU1Receiver.startCode); head.append(s)
+                head.append(VCU1Receiver.startCode); head.append(p)
+            }
+        }
+        head.append(VCU1Receiver.startCode)
+        head.append(nalu)
+
+        if size + Int64(head.count) > maxFile {
+            try? fh.truncate(atOffset: 0)   // 绕回，解码器会自己重置
+        }
+        try? fh.seekToEnd()
+        try? fh.write(contentsOf: head)
+        try? fh.close()
+    }
+
+    private func countFrame() {
+        frameCount += 1
+        let now = Date()
+        if now.timeIntervalSince(lastCountAt) >= 1 {
+            let f = Double(frameCount) / now.timeIntervalSince(lastCountAt)
+            frameCount = 0
+            lastCountAt = now
+            DispatchQueue.main.async { self.fps = f }
+        }
+    }
+}
+
 // ───────────────────────── 主界面 ─────────────────────────
 // 直播状态机（跟万相一样四态，自动走）
 enum LiveState: String {
@@ -235,6 +423,7 @@ struct PB: View {
 
 struct ContentView: View {
     @StateObject private var cam = Cam()
+    @StateObject private var vcu = VCU1Receiver()
     @State private var st: [String: String] = [:]
     @State private var state: LiveState = .idle
     @State private var picker: PhotosPickerItem?
@@ -386,8 +575,11 @@ struct ContentView: View {
                 Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary)
             }
             HStack {
-                Image(systemName: "cable.connector").font(.caption2).foregroundStyle(.teal)
-                Text("源：AuxCam（电脑画面）").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "cable.connector").font(.caption2).foregroundStyle(vcu.alive ? .green : .teal)
+                Text("源：" + vcu.status).font(.caption2).foregroundStyle(.secondary)
+                if vcu.fps > 0 {
+                    Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.caption2).bold().foregroundStyle(.green)
+                }
                 Spacer()
                 Text(netMode ? "局域网" : "USB直连").font(.caption2).bold().foregroundStyle(.teal)
             }
@@ -492,6 +684,8 @@ struct ContentView: View {
     // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
     private func boot() {
         cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
+        vcu.start()   // 开门 28765，等万相电脑端连
+        keepAliveAudio()   // 静音保活：退后台也继续收画面
         Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
         if wasLive {
             // 上次退出时在直播：自动恢复，不用人再点
@@ -499,6 +693,38 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startLive() }
         }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
+    }
+
+    // 后台保活：循环播静音，iOS 才不会挂起我们（退后台照样收电脑画面）
+    private func keepAliveAudio() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default)
+        try? session.setActive(true)
+        let rate: Int32 = 8000
+        let seconds = 1
+        let dataLen = rate * Int32(seconds) * 2
+        var wav = Data()
+        wav.append("RIFF".data(using: .ascii)!)
+        var n = UInt32(36 + dataLen)
+        withUnsafeBytes(of: &n) { wav.append(contentsOf: $0) }
+        wav.append("WAVE".data(using: .ascii)!)
+        wav.append("fmt ".data(using: .ascii)!)
+        n = 16; withUnsafeBytes(of: &n) { wav.append(contentsOf: $0) }
+        var audioFormat = UInt16(1); withUnsafeBytes(of: &audioFormat) { wav.append(contentsOf: $0) }
+        var channels = UInt16(1); withUnsafeBytes(of: &channels) { wav.append(contentsOf: $0) }
+        var sampleRate = UInt32(rate); withUnsafeBytes(of: &sampleRate) { wav.append(contentsOf: $0) }
+        var byteRate = UInt32(rate * 1 * 2); withUnsafeBytes(of: &byteRate) { wav.append(contentsOf: $0) }
+        var blockAlign = UInt16(2); withUnsafeBytes(of: &blockAlign) { wav.append(contentsOf: $0) }
+        var bits = UInt16(16); withUnsafeBytes(of: &bits) { wav.append(contentsOf: $0) }
+        wav.append("data".data(using: .ascii)!)
+        withUnsafeBytes(of: &n) { wav.append(contentsOf: $0) }
+        wav.append(Data(count: Int(dataLen)))   // 全零 = 静音
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("silence.wav")
+        try? wav.write(to: url)
+        let player = try? AVAudioPlayer(contentsOf: url)
+        player?.numberOfLoops = -1
+        player?.volume = 0.01
+        player?.play()
     }
 
     private func tick() {
