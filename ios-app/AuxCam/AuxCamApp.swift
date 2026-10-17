@@ -25,8 +25,22 @@ struct Link {
     static var dcimStatURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.stat") }
     static var esURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.h264") }
     static var streamCfgURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.cfg") }
+    static var networkModeURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.network") }
     static var vcamURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4") }
     static var videoURL: URL { docs.appendingPathComponent("picked.mp4") }
+
+    static func savedNetworkMode() -> Bool? {
+        guard let value = try? String(contentsOf: networkModeURL, encoding: .utf8) else { return nil }
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "wifi", "1": return true
+        case "usb", "0": return false
+        default: return nil
+        }
+    }
+
+    static func saveNetworkMode(_ enabled: Bool) {
+        try? (enabled ? "wifi\n" : "usb\n").write(to: networkModeURL, atomically: true, encoding: .utf8)
+    }
 
     static func send(_ lines: [String: String]) {
         var t = ""
@@ -895,6 +909,7 @@ final class HLSFrameSource: ObservableObject {
 
     private func log(_ message: String) {
         let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+        StreamDecoder.dlog("HLS \(message)")
         let fd = open(Self.logPath, O_CREAT | O_WRONLY | O_APPEND, mode_t(0o666))
         guard fd >= 0 else { return }
         _ = line.withCString { Darwin.write(fd, $0, strlen($0)) }
@@ -1606,6 +1621,10 @@ struct ContentView: View {
         if UserDefaults.standard.object(forKey: "streamURL") == nil {
             streamURL = "http://\(pcIP):8899/obs/live.m3u8"
         }
+        if let savedMode = Link.savedNetworkMode() {
+            netMode = savedMode
+        }
+        StreamDecoder.dlog("boot netMode=\(netMode) streamCfg=\(Link.streamEnabled()) url=\(builtURL)")
         usingStreamSource = Link.streamEnabled() || netMode
         fakeCameraOn = usingStreamSource
         // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
@@ -1763,6 +1782,7 @@ struct ContentView: View {
 
     private func tapDirect() {
         netMode = false
+        Link.saveNetworkMode(false)
         hasPickedVideo = false
         hint = "USB直连：电脑画面走数据线"
         if state == .live || state == .starting { startLive() } else {
@@ -1773,6 +1793,7 @@ struct ContentView: View {
 
     private func tapNetwork() {
         netMode = true
+        Link.saveNetworkMode(true)
         hasPickedVideo = false
         hint = "局域网：电脑需开启 OBS 或其他直播软件，地址为 \(builtURL)"
         if state == .live || state == .starting { startLive() } else {
@@ -1824,6 +1845,8 @@ struct ContentView: View {
         let useUSBStream = on && !netMode && !hasPickedVideo
         let useHLS = on && netMode
         let useStream = useUSBStream || useHLS
+        Link.saveNetworkMode(netMode)
+        StreamDecoder.dlog("vcamControl on=\(on) netMode=\(netMode) useUSB=\(useUSBStream) useHLS=\(useHLS) url=\(builtURL)")
         if useHLS {
             let scheme = URL(string: builtURL)?.scheme?.lowercased()
             guard scheme == "http" || scheme == "https" else {
@@ -1857,6 +1880,7 @@ struct ContentView: View {
                 try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
                 try setStreamMode(true)
                 if useHLS, let url = URL(string: builtURL) {
+                    StreamDecoder.dlog("HLS start requested \(url.absoluteString)")
                     hlsSource.start(url: url)
                 } else {
                     hlsSource.stop()
