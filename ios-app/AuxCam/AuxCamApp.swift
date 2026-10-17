@@ -720,22 +720,20 @@ final class StreamDecoder {
         var tsIdx = Int64(frameIndex)
         let pts = CMTime(value: tsIdx, timescale: 30)
         var timing = CMSampleTimingInfo(
-            duration: kCMTimeInvalid,
+            duration: .invalid,
             presentationTimeStamp: pts,
-            decodeTimeStamp: kCMTimeInvalid)
+            decodeTimeStamp: .invalid)
         let sbSt = CMSampleBufferCreate(
             allocator: kCFAllocatorDefault, dataBuffer: block, dataReady: true,
-            makeDataReadyCallback: nil, makeDataReadyRefcon: nil,
+            makeDataReadyCallback: nil, refcon: nil,
             formatDescription: fmt, sampleCount: 1,
             sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
         frameIndex += 1
         if let sb {
-            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? NSMutableArray,
-               attachments.count > 0,
-               let attachment = attachments[0] as? NSMutableDictionary {
-                attachment[kCMSampleAttachmentKey_NotSync as String] = NSNumber(value: !hasIDR)
-            }
+            CMSetAttachment(sb, key: kCMSampleAttachmentKey_NotSync,
+                            value: hasIDR ? kCFBooleanFalse : kCFBooleanTrue,
+                            attachmentMode: kCMAttachmentMode_ShouldPropagate)
             decodeCallCount += 1
             let callIndex = decodeCallCount
             let shouldTraceCall = callIndex <= 3 || callIndex % 90 == 0
