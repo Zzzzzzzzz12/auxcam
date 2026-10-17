@@ -714,18 +714,21 @@ final class StreamDecoder {
             return
         }
         var sb: CMSampleBuffer?
-        // 带有效 timing（iOS 解码器无 timing 也判坏数据）
+        // 给解码器单独的显示时间；DTS 和帧时长交给解码器推断。
+        // 这种样本格式与 FFmpeg / Moonlight 的 VideoToolbox 输入方式一致：
+        // 一个样本包含完整 access unit，不单独声明样本字节数。
         var tsIdx = Int64(frameIndex)
         let pts = CMTime(value: tsIdx, timescale: 30)
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 30),
+            duration: kCMTimeInvalid,
             presentationTimeStamp: pts,
-            decodeTimeStamp: pts)
-        var sampleSize = total
-        let sbSt = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
-            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sb)
+            decodeTimeStamp: kCMTimeInvalid)
+        let sbSt = CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault, dataBuffer: block, dataReady: true,
+            makeDataReadyCallback: nil, makeDataReadyRefcon: nil,
+            formatDescription: fmt, sampleCount: 1,
+            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
         frameIndex += 1
         if let sb {
             if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? NSMutableArray,
