@@ -633,10 +633,10 @@ final class StreamDecoder {
         accessUnit.append(raw)
         guard accessUnit.count <= Int(Int32.max) else { return }
 
-        var image: CVPixelBuffer?
+        var unmanagedImage: Unmanaged<CVPixelBuffer>?
         let result = accessUnit.withUnsafeBytes { bytes -> Int32 in
             guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return -1 }
-            return auxh264_decode(softwareDecoder, base, Int32(bytes.count), &image)
+            return auxh264_decode(softwareDecoder, base, Int32(bytes.count), &unmanagedImage)
         }
         decodeCallCount += 1
         if result < 0 {
@@ -647,7 +647,7 @@ final class StreamDecoder {
             return
         }
         if hasIDR { setWaitingForKeyframe(false) }
-        if let image {
+        if let image = unmanagedImage?.takeRetainedValue() {
             frameIndex += 1
             publish(status: noErr, imageBuffer: image, sourceFrameID: frameIndex)
             if frameIndex <= 3 || frameIndex % 90 == 0 {
