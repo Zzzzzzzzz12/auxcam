@@ -271,7 +271,6 @@ final class StreamDecoder {
     private var fmt: CMVideoFormatDescription?
     private var sps = Data()
     private var pps = Data()
-    private var frameIndex: Int64 = 0
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
     private let outputLock = NSLock()
     private var retainedFrame: CVPixelBuffer?
@@ -318,7 +317,6 @@ final class StreamDecoder {
         queue.sync {
             self.sps = sps
             self.pps = pps
-            self.frameIndex = 0
             self.setWaitingForKeyframe(true)
             self.build()
         }
@@ -735,25 +733,25 @@ final class StreamDecoder {
             return
         }
         var sb: CMSampleBuffer?
-        // 带有效 timing（iOS 解码器无 timing 也判坏数据）
-        var tsIdx = Int64(frameIndex)
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMTime(value: tsIdx, timescale: 30),
-            // OBS 的实时发送端按显示顺序传帧，DTS 与 PTS 相同；提供有效的
-            // 解码时间，避免系统解码器把无效 DTS 当成坏 H.264 sample。
-            decodeTimeStamp: CMTime(value: tsIdx, timescale: 30))
+        // 实时 sample 不排队等时间戳，交给解码器后尽快出画面。
         var sampleSize = total
         let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
-            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sb)
-        frameIndex += 1
         if let sb {
-            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? NSMutableArray,
-               attachments.count > 0,
-               let attachment = attachments[0] as? NSMutableDictionary {
-                attachment[kCMSampleAttachmentKey_NotSync as String] = NSNumber(value: !hasIDR)
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
+               CFArrayGetCount(attachments) > 0,
+               let item = CFArrayGetValueAtIndex(attachments, 0) {
+                let attachment = unsafeBitCast(item, to: CFMutableDictionary.self)
+                CFDictionarySetValue(
+                    attachment,
+                    Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                    Unmanaged.passUnretained(hasIDR ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
+                CFDictionarySetValue(
+                    attachment,
+                    Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
             }
             decodeCallCount += 1
             let callIndex = decodeCallCount
@@ -770,7 +768,7 @@ final class StreamDecoder {
             var decodeInfo = VTDecodeInfoFlags()
             let decodeStatus = VTDecompressionSessionDecodeFrame(
                 session, sampleBuffer: sb, flags: [],
-                frameRefcon: UnsafeMutableRawPointer(bitPattern: Int(callIndex)),
+                frameRefcon: nil,
                 infoFlagsOut: &decodeInfo)
             let outputStatus = callbackStatus()
             outputLock.lock()
