@@ -81,9 +81,38 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     CVReturn createStatus = CVPixelBufferCreate(
         kCFAllocatorDefault, (size_t)width, (size_t)height,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pixelBuffer);
+    if (createStatus != kCVReturnSuccess) {
+        static int diagnosticFlags = -1;
+        if (diagnosticFlags < 0) {
+            diagnosticFlags = 0;
+            CVPixelBufferRef probe = NULL;
+            if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height,
+                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                    NULL, &probe) == kCVReturnSuccess && probe != NULL) {
+                diagnosticFlags |= 1;
+            }
+            if (probe != NULL) CVPixelBufferRelease(probe);
+            probe = NULL;
+            if (CVPixelBufferCreate(kCFAllocatorDefault, 64, 64,
+                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                    attrs, &probe) == kCVReturnSuccess && probe != NULL) {
+                diagnosticFlags |= 2;
+            }
+            if (probe != NULL) CVPixelBufferRelease(probe);
+            probe = NULL;
+            if (CVPixelBufferCreate(kCFAllocatorDefault, 64, 64,
+                                    kCVPixelFormatType_32BGRA, attrs,
+                                    &probe) == kCVReturnSuccess && probe != NULL) {
+                diagnosticFlags |= 4;
+            }
+            if (probe != NULL) CVPixelBufferRelease(probe);
+        }
+        CFRelease(surfaceProps);
+        CFRelease(attrs);
+        return -3000 - diagnosticFlags;
+    }
     CFRelease(surfaceProps);
     CFRelease(attrs);
-    if (createStatus != kCVReturnSuccess) return -1000 + (int32_t)createStatus;
     if (pixelBuffer == NULL) return -2000;
 
     CVReturn lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
