@@ -23,6 +23,7 @@ struct Link {
     static var statURL: URL { docs.appendingPathComponent("auxcam.stat") }
     static var dcimStatURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.stat") }
     static var esURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.h264") }
+    static var streamCfgURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.cfg") }
     static var vcamURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4") }
     static var videoURL: URL { docs.appendingPathComponent("picked.mp4") }
 
@@ -53,6 +54,16 @@ struct Link {
     static func esSize() -> Int64 {
         let a = try? FileManager.default.attributesOfItem(atPath: esURL.path)
         return (a?[.size] as? NSNumber)?.int64Value ?? -1
+    }
+
+    static func streamEnabled() -> Bool {
+        guard let t = try? String(contentsOf: streamCfgURL, encoding: .utf8) else { return false }
+        return t.components(separatedBy: .newlines).contains { line in
+            let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "active" else { return false }
+            let value = parts[1].trimmingCharacters(in: .whitespaces).lowercased()
+            return value == "1" || value == "on" || value == "yes"
+        }
     }
 
     static func vcamStamp() -> Int64 {
@@ -248,11 +259,16 @@ final class StreamDecoder {
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
     private let outputLock = NSLock()
     private var retainedFrame: CVPixelBuffer?
+    private var surfaceFD: Int32 = -1
     private var callbackCount = 0
     private var lastCallbackStatus: OSStatus = noErr
     private var waitingForKeyframe = true
     private static var buildCount: Int = 0
     private static var feedCount: Int = 0
+
+    deinit {
+        if surfaceFD >= 0 { close(surfaceFD) }
+    }
 
     static func dlog(_ s: String) {
         let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
@@ -331,12 +347,17 @@ final class StreamDecoder {
             return
         }
         let surfaceID = IOSurfaceGetID(surface)
-        let contents = "id=\(surfaceID)\n"
-        do {
-            try contents.write(toFile: StreamDecoder.surfacePath, atomically: true, encoding: .utf8)
-        } catch {
+        // 插件 15ms 轮询这个小文件。复用 fd 用一次 pwrite 更新固定宽度编号，
+        // 避免每帧创建临时文件再 rename 的元数据开销。
+        if surfaceFD < 0 {
+            surfaceFD = open(StreamDecoder.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
+            if surfaceFD >= 0 { _ = ftruncate(surfaceFD, 0) }
+        }
+        let contents = String(format: "id=%010u\n", surfaceID)
+        let written = contents.withCString { pwrite(surfaceFD, $0, 14, 0) }
+        if surfaceFD < 0 || written != 14 {
             if count <= 3 || count % 90 == 0 {
-                StreamDecoder.dlog("surface publish failed: \(error.localizedDescription)")
+                StreamDecoder.dlog("surface publish failed errno=\(errno)")
             }
             return
         }
@@ -389,13 +410,18 @@ final class StreamDecoder {
                     allocator: kCFAllocatorDefault, formatDescription: f,
                     decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &cb, decompressionSessionOut: &session)
+                if vtSt == noErr, let session {
+                    VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+                }
                 StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
             }
         }
     }
 
     private func decode(_ raw: Data, keyframe: Bool) {
-        let nalUnits = Self.splitAnnexB(raw)
+        // 直接扫描 Data 的底层指针，只保留 NALU 范围，避免先复制整帧到 [UInt8]
+        // 再为每个 NALU 各复制一次。
+        let nalRanges = Self.splitAnnexBRanges(raw)
         StreamDecoder.feedCount += 1
         guard let session, let fmt else {
             if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 90 == 0 {
@@ -406,18 +432,18 @@ final class StreamDecoder {
 
         // SPS/PPS 已经放在 CMVideoFormatDescription 里。sample 只提交 VCL
         // NALU（一个或多个 slice），不能再把 SPS/PPS 当作画面 sample 重复提交。
-        let slices = nalUnits.filter { unit in
-            guard let first = unit.first else { return false }
-            let type = first & 0x1F
+        let slices = nalRanges.filter { range in
+            guard range.lowerBound < raw.count else { return false }
+            let type = raw[range.lowerBound] & 0x1F
             return type == 1 || type == 5
         }
         guard !slices.isEmpty else {
             if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) skip non-VCL NALs=\(nalUnits.count)")
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) skip non-VCL NALs=\(nalRanges.count)")
             }
             return
         }
-        let hasIDR = slices.contains { (($0.first ?? 0) & 0x1F) == 5 }
+        let hasIDR = slices.contains { (raw[$0.lowerBound] & 0x1F) == 5 }
         if keyframe != hasIDR {
             StreamDecoder.dlog("keyframe flag mismatch flag=\(keyframe) IDR=\(hasIDR)")
         }
@@ -425,10 +451,10 @@ final class StreamDecoder {
         if hasIDR { setWaitingForKeyframe(false) }
 
         var au = Data()
-        for unit in slices {
-            var l = UInt32(unit.count).bigEndian
+        for range in slices {
+            var l = UInt32(range.count).bigEndian
             withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
-            au.append(unit)
+            au.append(contentsOf: raw[range])
         }
         let total = au.count
         guard total > 0 else { return }
@@ -445,7 +471,9 @@ final class StreamDecoder {
         var src = CMBlockBufferCustomBlockSource(
             version: 0,
             AllocateBlock: nil,
-            FreeBlock: { rawMem, _, _ in if let rawMem { free(rawMem) } },
+            // FreeBlock 参数顺序是 (refCon, memoryBlock, size)。释放第二个参数，
+            // 否则每帧的 malloc 缓冲都会泄漏，长时间运行会拖慢甚至杀掉 App。
+            FreeBlock: { _, memoryBlock, _ in free(memoryBlock) },
             refCon: nil)
         let bSt = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault, memoryBlock: mem, blockLength: total,
@@ -503,34 +531,35 @@ final class StreamDecoder {
         }
     }
 
-    private static func splitAnnexB(_ data: Data) -> [Data] {
-        let bytes = [UInt8](data)
-        var starts: [(start: Int, payload: Int)] = []
-        var i = 0
-        while i + 3 <= bytes.count {
-            if i + 4 <= bytes.count,
-               bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 0, bytes[i + 3] == 1 {
-                starts.append((i, i + 4))
-                i += 4
-            } else if bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 1 {
-                starts.append((i, i + 3))
-                i += 3
-            } else {
-                i += 1
+    private static func splitAnnexBRanges(_ data: Data) -> [Range<Int>] {
+        data.withUnsafeBytes { rawBuffer in
+            guard let bytes = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return [] }
+            let count = rawBuffer.count
+            var starts: [(start: Int, payload: Int)] = []
+            var i = 0
+            while i + 3 <= count {
+                if i + 4 <= count,
+                   bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 0, bytes[i + 3] == 1 {
+                    starts.append((i, i + 4))
+                    i += 4
+                } else if bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 1 {
+                    starts.append((i, i + 3))
+                    i += 3
+                } else {
+                    i += 1
+                }
             }
-        }
-        guard !starts.isEmpty else { return data.isEmpty ? [] : [data] }
+            guard !starts.isEmpty else { return count == 0 ? [] : [0..<count] }
 
-        var result: [Data] = []
-        for index in starts.indices {
-            let payloadStart = starts[index].payload
-            var end = index + 1 < starts.count ? starts[index + 1].start : bytes.count
-            while end > payloadStart && bytes[end - 1] == 0 { end -= 1 }
-            if end > payloadStart {
-                result.append(Data(bytes[payloadStart..<end]))
+            var result: [Range<Int>] = []
+            for index in starts.indices {
+                let payloadStart = starts[index].payload
+                var end = index + 1 < starts.count ? starts[index + 1].start : count
+                while end > payloadStart && bytes[end - 1] == 0 { end -= 1 }
+                if end > payloadStart { result.append(payloadStart..<end) }
             }
+            return result
         }
-        return result
     }
 }
 
@@ -550,15 +579,21 @@ final class VCU1Receiver: ObservableObject {
     private var shouldRun = false
     private var frameCount: Int32 = 0
     private var lastCountAt = Date()
+    private var totalVideoBytes: Int64 = 0
     private let lock = NSLock()
     private let maxFile: Int64 = 8 * 1024 * 1024
     private var sps: Data = Data()
     private var pps: Data = Data()
+    private var ringHandle: FileHandle?
+    private var ringSize: Int64 = 0
+    private var ringNeedsKeyframe = false
 
     func start() {
         if shouldRun { return }
         shouldRun = true
-        lock.lock(); sps = Data(); pps = Data(); lock.unlock()
+        lock.lock()
+        sps = Data(); pps = Data(); totalVideoBytes = 0; frameCount = 0
+        lock.unlock()
         DispatchQueue.global(qos: .userInitiated).async { self.serve() }
     }
 
@@ -662,9 +697,10 @@ final class VCU1Receiver: ObservableObject {
                 decoder.setConfig(sps: sps, pps: pps)
                 slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
             case 2:
-                appendVideo(payload, keyframe: (flags & 1) != 0)
+                // 先把最新帧送进 VideoToolbox 并发布 IOSurface，兼容环形文件写入放后面。
                 decoder.feed(payload, keyframe: (flags & 1) != 0)
-                countFrame()
+                appendVideo(payload, keyframe: (flags & 1) != 0)
+                countFrame(payload.count)
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
             case 5: lastHb = Date()
             default: break
@@ -698,7 +734,7 @@ final class VCU1Receiver: ObservableObject {
 
     private static let startCode = Data([0, 0, 0, 1])
 
-    // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（3MB 循环）
+    // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（8MB 环形缓存）
     private func appendVideo(_ d: Data, keyframe: Bool) {
         var nalu = d
         let sc4 = Data([UInt8(0), UInt8(0), UInt8(0), UInt8(1)])
@@ -708,16 +744,17 @@ final class VCU1Receiver: ObservableObject {
         guard !nalu.isEmpty else { return }
 
         let fm = FileManager.default
-        var size: Int64 = 0
-        if let a = try? fm.attributesOfItem(atPath: VCU1Receiver.outPath) {
-            size = (a[.size] as? NSNumber)?.int64Value ?? 0
+        if ringHandle == nil {
+            if !fm.fileExists(atPath: VCU1Receiver.outPath) {
+                fm.createFile(atPath: VCU1Receiver.outPath, contents: nil)
+            }
+            ringHandle = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
+            if let attributes = try? fm.attributesOfItem(atPath: VCU1Receiver.outPath) {
+                ringSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            }
+            try? ringHandle?.seekToEnd()
         }
-        var fh = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
-        if fh == nil {
-            fm.createFile(atPath: VCU1Receiver.outPath, contents: nil)
-            fh = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
-        }
-        guard let fh else { return }
+        guard let fh = ringHandle else { return }
 
         var head = Data()
         if keyframe {
@@ -732,22 +769,40 @@ final class VCU1Receiver: ObservableObject {
         head.append(VCU1Receiver.startCode)
         head.append(nalu)
 
-        if size + Int64(head.count) > maxFile {
-            try? fh.truncate(atOffset: 0)   // 绕回，解码器会自己重置
+        if ringNeedsKeyframe && !keyframe { return }
+        if ringSize + Int64(head.count) > maxFile {
+            try? fh.truncate(atOffset: 0)
+            try? fh.seek(toOffset: 0)
+            ringSize = 0
+            ringNeedsKeyframe = true
+            // 环形缓存从完整 GOP 起步，避免绕回后以 P 帧开头。
+            if !keyframe { return }
         }
-        try? fh.seekToEnd()
         try? fh.write(contentsOf: head)
-        try? fh.close()
+        ringSize += Int64(head.count)
+        if keyframe { ringNeedsKeyframe = false }
     }
 
-    private func countFrame() {
+    func videoByteCount() -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return totalVideoBytes
+    }
+
+    private func countFrame(_ payloadBytes: Int) {
+        lock.lock()
         frameCount += 1
+        totalVideoBytes += Int64(payloadBytes)
         let now = Date()
+        var measuredFPS: Double?
         if now.timeIntervalSince(lastCountAt) >= 1 {
             let f = Double(frameCount) / now.timeIntervalSince(lastCountAt)
             frameCount = 0
             lastCountAt = now
-            DispatchQueue.main.async { self.fps = f }
+            measuredFPS = f
+        }
+        lock.unlock()
+        if let measuredFPS {
+            DispatchQueue.main.async { self.fps = measuredFPS }
         }
     }
 }
@@ -803,6 +858,8 @@ struct ContentView: View {
     @State private var pickerRequest = false
     @State private var hint = ""
     @State private var fakeCameraOn = false
+    @State private var usingStreamSource = false
+    @State private var hasPickedVideo = false
     @State private var cameraCommandAt = Date.distantPast
     @State private var deadCount = 0
     @State private var revived = false
@@ -823,6 +880,10 @@ struct ContentView: View {
 
     private var kernelOK: Bool { (st["kernel"] ?? "") == "运行中" }
     private var playingFake: Bool { (st["playing"] ?? "正常相机") != "正常相机" }
+    private var cameraOutputText: String {
+        guard fakeCameraOn else { return st["playing"] ?? "正常相机" }
+        return usingStreamSource ? "电脑实时流" : "素材视频"
+    }
     private var builtURL: String { "http://\(pcIP):8899/live.m3u8" }
 
     private var sigText: String {
@@ -869,6 +930,10 @@ struct ContentView: View {
                         hint = "无法读取所选视频，请重试"
                         return
                     }
+                    try setStreamMode(false)
+                    usingStreamSource = false
+                    hasPickedVideo = true
+                    lastES = -1; lastTick = Date(); kbps = 0
                     Link.send(["cmd": "setvideo", "path": video.url.path])
                     fakeCameraOn = true
                     cameraCommandAt = Date()
@@ -899,7 +964,18 @@ struct ContentView: View {
     private var preview: some View {
         ZStack {
             Color.black
-            if cam.denied {
+            if fakeCameraOn {
+                VStack(spacing: 10) {
+                    Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
+                        .font(.system(size: 38))
+                    Text(usingStreamSource ? "电脑实时流已启用" : "素材视频已启用")
+                        .font(.headline)
+                    Text("切换到相机或直播 App 查看输出")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .foregroundStyle(.white)
+            } else if cam.denied {
                 VStack(spacing: 8) {
                     Image(systemName: "video.slash").font(.largeTitle)
                     Text(cam.diag).font(.footnote)
@@ -940,7 +1016,7 @@ struct ContentView: View {
 
     private var statusLine: some View {
         HStack(spacing: 4) {
-            Text("画面：\(st["playing"] ?? "正常相机")").font(.footnote).bold()
+            Text("画面：\(cameraOutputText)").font(.footnote).bold()
             Spacer()
             Text(sigText).font(.caption2).bold().foregroundStyle(sigColor)
         }
@@ -983,7 +1059,7 @@ struct ContentView: View {
                 PB("直连", "cable.connector") { tapDirect() }
                 PB("内录", "record.circle", recordOn ? .red : Color(red: 0.20, green: 0.72, blue: 0.62)) { tapRecord() }
                 PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
-                PB(fakeCameraOn ? "切回真镜头" : "放视频",
+                PB(fakeCameraOn ? "切回真镜头" : ((!netMode && (vcu.alive || !hasPickedVideo)) ? "放电脑画面" : "放视频"),
                    fakeCameraOn ? "camera.fill" : "play.rectangle.fill",
                    fakeCameraOn ? Color(red: 0.90, green: 0.55, blue: 0.15) : Color(red: 0.55, green: 0.35, blue: 0.75)) {
                     vcamControl(!fakeCameraOn)
@@ -1074,6 +1150,8 @@ struct ContentView: View {
 
     // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
     private func boot() {
+        usingStreamSource = Link.streamEnabled()
+        fakeCameraOn = usingStreamSource
         // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
         DispatchQueue.global(qos: .userInitiated).async {
             self.cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
@@ -1123,7 +1201,7 @@ struct ContentView: View {
 
     private func tick() {
         st = Link.status()
-        if Date().timeIntervalSince(cameraCommandAt) > 2 {
+        if Date().timeIntervalSince(cameraCommandAt) > 2 && !usingStreamSource {
             fakeCameraOn = playingFake
         }
         if kernelOK {
@@ -1137,7 +1215,9 @@ struct ContentView: View {
         }
         // 心跳：电脑画面每秒都在往手机里写数据 = 直连活着
         let now = Date()
-        let cur = netMode ? Link.vcamStamp() : Link.esSize()
+        let previousBytes = lastES
+        let cur = usingStreamSource ? vcu.videoByteCount() : Link.vcamStamp()
+        let progressing = previousBytes >= 0 && cur > previousBytes
         if lastTick.timeIntervalSince(now) > 0.7, cur >= 0, lastES >= 0 {
             let dt = now.timeIntervalSince(lastTick)
             kbps = max(0, Double(cur - lastES) * 8.0 / dt / 1000.0)
@@ -1146,12 +1226,19 @@ struct ContentView: View {
         lastTick = now
 
         guard state == .starting || state == .live || state == .broken else { return }
-        if playingFake && cur > 0 {
-            if kbps > 0 || st["stream"] == "帧模式" || st["stream"] == "文件模式" {
+        if fakeCameraOn && cur > 0 {
+            if progressing || st["stream"] == "帧模式" || st["stream"] == "文件模式" {
                 state = .live
                 stuckCount = 0
+            } else {
+                stuckCount += 1
+                if stuckCount >= 8 {
+                    stuckCount = 0
+                    state = .broken
+                    autoRetry()
+                }
             }
-        } else if cur <= 0 || (!playingFake && state == .live) {
+        } else if cur <= 0 || (!fakeCameraOn && state == .live) {
             stuckCount += 1
             if stuckCount >= 8 {   // 8 秒没动静 = 断了，自己重连
                 stuckCount = 0
@@ -1217,6 +1304,7 @@ struct ContentView: View {
 
     private func tapDirect() {
         netMode = false
+        hasPickedVideo = false
         hint = "USB直连：电脑画面走数据线"
         if state == .live || state == .starting { startLive() } else {
             Link.send(["cmd": "mode", "mode": "file", "url": builtURL])
@@ -1246,17 +1334,31 @@ struct ContentView: View {
         Link.send(["cmd": "reset"])
     }
 
-    // 手机端开关：写 DCIM/vcam.plist，相机进程里的插件 1 秒内生效
+    private func setStreamMode(_ enabled: Bool) throws {
+        let url = Link.streamCfgURL
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        var lines = existing.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        let activeLine = "active=\(enabled ? 1 : 0)"
+        if let index = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("active=") }) {
+            lines[index] = activeLine
+        } else {
+            lines.insert(activeLine, at: 0)
+        }
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    // 直连 USB 使用 App 解码后的 IOSurface；相册/局域网素材继续使用 vcam.mp4。
     private func vcamControl(_ on: Bool) {
         let path = "/var/mobile/Media/DCIM/vcam.mp4"
         let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
-        if on && !FileManager.default.fileExists(atPath: path) {
+        let useStream = on && !netMode && (vcu.alive || !hasPickedVideo)
+        if on && !useStream && !FileManager.default.fileExists(atPath: path) {
             fakeCameraOn = false
             hint = "没有可播放视频，请先选视频或推送素材"
             return
         }
         var p: [String: Any] = [
-            "masterEnabled": true, "enabled": true,
+            "masterEnabled": false, "enabled": false,
             "flipHorizontal": false, "flipVertical": false,
             "rotation": 0,
             "sourcePath": path,
@@ -1266,16 +1368,32 @@ struct ContentView: View {
            let loaded = try? PropertyListSerialization.propertyList(from: d, options: [], format: nil) as? [String: Any] {
             p = loaded
         }
-        p["masterEnabled"] = on
-        p["enabled"] = on
+        p["masterEnabled"] = on && !useStream
+        p["enabled"] = on && !useStream
         p["generation"] = (p["generation"] as? Int ?? 0) + 1
         p["sourcePath"] = path
         do {
             let data = try PropertyListSerialization.data(fromPropertyList: p, format: .xml, options: 0)
-            try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+            if useStream {
+                try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+                try setStreamMode(true)
+            } else {
+                try setStreamMode(false)
+                try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+            }
+            if usingStreamSource != useStream {
+                lastES = -1; lastTick = Date(); kbps = 0
+            }
             fakeCameraOn = on
+            usingStreamSource = useStream
             cameraCommandAt = Date()
-            hint = on ? "已切换：相机放视频" : "已切回真镜头"
+            if !on {
+                hint = "已切回真镜头"
+            } else if useStream {
+                hint = vcu.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
+            } else {
+                hint = "已切换：相机放视频"
+            }
         } catch {
             hint = "切换失败，请检查 AuxCam 文件权限"
         }
