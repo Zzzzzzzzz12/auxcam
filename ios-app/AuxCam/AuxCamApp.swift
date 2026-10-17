@@ -861,7 +861,11 @@ final class HLSFrameSource: NSObject, ObservableObject {
             let item = AVPlayerItem(url: URL(fileURLWithPath: "/var/mobile/Media/DCIM/avplayer-test.mp4"))
             // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
             // Let AVFoundation select a native pixel format for live HLS output.
-            let output = AVPlayerItemVideoOutput(outputSettings: nil)
+            let attributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
 
             let player = AVPlayer(playerItem: item)
             player.isMuted = true
@@ -884,7 +888,6 @@ final class HLSFrameSource: NSObject, ObservableObject {
                 DispatchQueue.main.async { [weak self, weak player] in
                     guard let self, let player, self.player === player else { return }
                     // Attach the video output only after HLS has prepared the item.
-                    output.suppressesPlayerRendering = true
                     item.add(output)
                     self.displayLink?.invalidate()
                     let link = CADisplayLink(target: self, selector: #selector(self.displayLinkDidRefresh(_:)))
