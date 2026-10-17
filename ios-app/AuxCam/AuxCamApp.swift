@@ -821,7 +821,7 @@ final class StreamDecoder {
 // ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
 // AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 IOSurface 编号交给相机插件。
 // 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
-final class HLSFrameSource: ObservableObject {
+final class HLSFrameSource: ObservableObject, AVPlayerItemOutputPullDelegate {
     @Published private(set) var frameCount: Int64 = 0
     @Published private(set) var fps: Double = 0
     @Published private(set) var status = "待机"
@@ -867,7 +867,7 @@ final class HLSFrameSource: ObservableObject {
             ]
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
             item.add(output)
-            output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
+            output.setDelegate(self, queue: self.queue)
 
             let player = AVPlayer(playerItem: item)
             player.isMuted = true
@@ -911,6 +911,7 @@ final class HLSFrameSource: ObservableObject {
             self.timer = timer
             timer.resume()
             player.playImmediately(atRate: 1.0)
+            output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
         }
     }
 
@@ -920,6 +921,14 @@ final class HLSFrameSource: ObservableObject {
 
     private func setStatus(_ value: String) {
         DispatchQueue.main.async { self.status = value }
+    }
+
+    func outputMediaDataWillChange(_ sender: AVPlayerItemOutput) {
+        log("video output media data available")
+    }
+
+    func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) {
+        log("video output sequence flushed")
     }
 
     private func log(_ message: String) {
