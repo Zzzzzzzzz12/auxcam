@@ -394,7 +394,7 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: no first sample readerStatus=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            guard let format = CMSampleBufferGetFormatDescription(sample) as? CMVideoFormatDescription else {
+            guard let format = CMSampleBufferGetFormatDescription(sample) else {
                 StreamDecoder.dlog("golden failed: sample has no video format description")
                 return
             }
@@ -467,7 +467,7 @@ final class StreamDecoder {
 
     private static func sampleFields(_ sample: CMSampleBuffer) -> [String: String] {
         let sampleCount = CMSampleBufferGetNumSamples(sample)
-        let sampleSize = sampleCount > 0 ? CMSampleBufferGetSampleSize(sample, sampleIndex: 0) : 0
+        let sampleSize = sampleCount > 0 ? CMSampleBufferGetSampleSize(sample, at: 0) : 0
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
         let attachmentsText = attachments.map { String(describing: $0) } ?? "nil"
         var blockText = "none"
@@ -479,7 +479,7 @@ final class StreamDecoder {
             let pointerStatus = CMBlockBufferGetDataPointer(
                 block, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset,
                 totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-            let isReady = CMBlockBufferIsDataReady(block)
+            let isReady = pointerStatus == noErr && dataPointer != nil
             blockText = "len:\(length)|ptrStatus:\(pointerStatus)|contiguousAtZero:\(lengthAtOffset)|total:\(totalLength)|ready:\(isReady)"
         }
         var sampleTiming = CMSampleTimingInfo()
