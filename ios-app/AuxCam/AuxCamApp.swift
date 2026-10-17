@@ -889,13 +889,18 @@ final class HLSFrameSource: ObservableObject {
                         self.player?.play()
                     }
                 })
+            self.notificationTokens.append(NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemNewAccessLogEntry, object: item, queue: nil) { [weak self] _ in
+                    guard let event = item.accessLog()?.events.last else { return }
+                    self?.log("access segments=\(event.numberOfSegmentsDownloaded) bytes=\(event.numberOfBytesTransferred) bitrate=\(Int(event.observedBitrate)) stalls=\(event.numberOfStalls)")
+                })
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(33), leeway: .milliseconds(2))
             timer.setEventHandler { [weak self] in self?.copyLatestFrame() }
             self.timer = timer
             timer.resume()
-            player.play()
+            player.playImmediately(atRate: 1.0)
         }
     }
 
@@ -941,22 +946,23 @@ final class HLSFrameSource: ObservableObject {
 
     private func copyLatestFrame() {
         guard let output else { return }
-        let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
-        guard output.hasNewPixelBuffer(forItemTime: itemTime),
-              let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil),
-              let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
-            let now = Date()
-            if now.timeIntervalSince(lastFrameAt) > 5 && now.timeIntervalSince(lastNoFrameReport) > 5 {
-                lastNoFrameReport = now
-                let item = player?.currentItem
-                let error = item?.error?.localizedDescription ?? "none"
-                log("no frame itemStatus=\(item?.status.rawValue ?? -1) playerStatus=\(player?.status.rawValue ?? -1) error=\(error)")
-                if item?.status == .failed {
-                    setStatus("拉流失败：\(error)")
-                } else if item?.status == .readyToPlay {
-                    setStatus("已连接，暂时没有画面")
-                }
-            }
+        var itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
+        var hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
+        // HLS has its own timeline; fall back to the item's current time if host-time mapping is not ready.
+        if !hasFrame, let current = player?.currentItem?.currentTime(), current.isValid {
+            itemTime = current
+            hasFrame = output.hasNewPixelBuffer(forItemTime: current)
+        }
+        guard hasFrame else {
+            reportNoFrame("no new pixel buffer", itemTime: itemTime)
+            return
+        }
+        guard let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
+            reportNoFrame("pixel buffer copy returned nil", itemTime: itemTime)
+            return
+        }
+        guard let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
+            reportNoFrame("pixel buffer has no IOSurface", itemTime: itemTime)
             return
         }
 
@@ -996,6 +1002,21 @@ final class HLSFrameSource: ObservableObject {
                 self.fps = rate
                 self.status = rate > 0 ? "电脑画面已接入" : "等待电脑画面"
             }
+        }
+    }
+
+    private func reportNoFrame(_ reason: String, itemTime: CMTime) {
+        let now = Date()
+        guard now.timeIntervalSince(lastFrameAt) > 5 && now.timeIntervalSince(lastNoFrameReport) > 5 else { return }
+        lastNoFrameReport = now
+        let item = player?.currentItem
+        let error = item?.error?.localizedDescription ?? "none"
+        let access = item?.accessLog()?.events.last
+        log("no frame reason=\(reason) itemStatus=\(item?.status.rawValue ?? -1) playerStatus=\(player?.status.rawValue ?? -1) timeControl=\(player?.timeControlStatus.rawValue ?? -1) rate=\(player?.rate ?? -1) itemTime=\(itemTime.seconds) segments=\(access?.numberOfSegmentsDownloaded ?? -1) bytes=\(access?.numberOfBytesTransferred ?? -1) error=\(error)")
+        if item?.status == .failed {
+            setStatus("拉流失败：\(error)")
+        } else if item?.status == .readyToPlay {
+            setStatus("已连接，暂时没有画面")
         }
     }
 }
