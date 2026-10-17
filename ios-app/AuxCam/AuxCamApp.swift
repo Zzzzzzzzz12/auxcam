@@ -841,7 +841,9 @@ final class HLSFrameSource: ObservableObject {
     private var lastFrameAt = Date.distantPast
     private var lastNoFrameReport = Date.distantPast
     private var statusObservation: NSKeyValueObservation?
+    private var timeControlObservation: NSKeyValueObservation?
     private var notificationTokens: [NSObjectProtocol] = []
+    private var lastPlaybackRecoveryAt = Date.distantPast
 
     deinit {
         timer?.cancel()
@@ -858,8 +860,7 @@ final class HLSFrameSource: ObservableObject {
             self.setStatus("正在连接电脑")
 
             let item = AVPlayerItem(url: url)
-            // 短缓冲优先降低延迟；网络抖动时由播放器自动恢复。
-            item.preferredForwardBufferDuration = 0.25
+            // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
             let attributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
@@ -869,7 +870,7 @@ final class HLSFrameSource: ObservableObject {
 
             let player = AVPlayer(playerItem: item)
             player.isMuted = true
-            player.automaticallyWaitsToMinimizeStalling = false
+            player.automaticallyWaitsToMinimizeStalling = true
             self.player = player
             self.output = output
             DispatchQueue.main.async { self.previewPlayer = player }
@@ -882,6 +883,11 @@ final class HLSFrameSource: ObservableObject {
                 }
                 self?.log("item status=\(item.status.rawValue) error=\(item.error?.localizedDescription ?? "none")")
                 self?.setStatus(value)
+            }
+            self.timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
+                guard let self else { return }
+                let itemTime = player.currentItem?.currentTime().seconds ?? -1
+                self.log("player state timeControl=\(player.timeControlStatus.rawValue) rate=\(player.rate) itemTime=\(itemTime) waiting=\(String(describing: player.reasonForWaitingToPlay))")
             }
             self.notificationTokens.append(NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
@@ -930,6 +936,8 @@ final class HLSFrameSource: ObservableObject {
         timer = nil
         statusObservation?.invalidate()
         statusObservation = nil
+        timeControlObservation?.invalidate()
+        timeControlObservation = nil
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         notificationTokens.removeAll()
         player?.pause()
@@ -949,6 +957,7 @@ final class HLSFrameSource: ObservableObject {
     }
 
     private func copyLatestFrame() {
+        recoverIfPlaybackStopped()
         guard let output else { return }
         var itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
         var hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
@@ -1007,6 +1016,29 @@ final class HLSFrameSource: ObservableObject {
                 self.status = rate > 0 ? "电脑画面已接入" : "等待电脑画面"
             }
         }
+    }
+
+    // HLS 的直播清单会持续滚动；iOS 偶尔会在旧分段末尾进入 paused，主动追到最新可播位置。
+    private func recoverIfPlaybackStopped() {
+        guard let player, let item = player.currentItem, item.status == .readyToPlay,
+              player.timeControlStatus == .paused,
+              Date().timeIntervalSince(lastPlaybackRecoveryAt) >= 2 else { return }
+        lastPlaybackRecoveryAt = Date()
+
+        if let range = item.seekableTimeRanges.last?.timeRangeValue {
+            let end = CMTimeRangeGetEnd(range)
+            let target = CMTimeSubtract(end, CMTime(seconds: 1, preferredTimescale: 600))
+            if end.isValid, target.isValid, CMTimeCompare(target, range.start) >= 0 {
+                log("player recovery seek live edge target=\(target.seconds) end=\(end.seconds)")
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak player] finished in
+                    if finished { player?.playImmediately(atRate: 1.0) }
+                }
+                return
+            }
+        }
+
+        log("player recovery resume currentTime=\(player.currentTime().seconds)")
+        player.playImmediately(atRate: 1.0)
     }
 
     private func reportNoFrame(_ reason: String, itemTime: CMTime) {
