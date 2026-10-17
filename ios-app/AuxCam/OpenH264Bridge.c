@@ -1,6 +1,6 @@
 #include "OpenH264Bridge.h"
 #include "codec_api.h"
-#include <IOSurface/IOSurface.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
