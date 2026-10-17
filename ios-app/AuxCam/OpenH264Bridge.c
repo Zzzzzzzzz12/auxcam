@@ -18,15 +18,40 @@ static bool setSurfaceNumber(CFMutableDictionaryRef dictionary, CFStringRef key,
     return true;
 }
 
-static IOSurfaceRef createNV12Surface(int width, int height) {
+static bool probeBasicIOSurface(void) {
+    CFMutableDictionaryRef properties = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (properties == NULL) return false;
+    bool ok = setSurfaceNumber(properties, kIOSurfaceWidth, 64) &&
+        setSurfaceNumber(properties, kIOSurfaceHeight, 64) &&
+        setSurfaceNumber(properties, kIOSurfacePixelFormat, kCVPixelFormatType_32BGRA) &&
+        setSurfaceNumber(properties, kIOSurfaceBytesPerElement, 4) &&
+        setSurfaceNumber(properties, kIOSurfaceBytesPerRow, 256) &&
+        setSurfaceNumber(properties, kIOSurfaceAllocSize, 16384);
+    CFDictionarySetValue(properties, kIOSurfaceIsGlobal, kCFBooleanTrue);
+    IOSurfaceRef surface = ok ? IOSurfaceCreate(properties) : NULL;
+    CFRelease(properties);
+    if (surface == NULL) return false;
+    CFRelease(surface);
+    return true;
+}
+
+static IOSurfaceRef createNV12Surface(int width, int height, int32_t *failure) {
+    if (failure != NULL) *failure = 0;
     size_t yStride = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, (size_t)width);
     size_t ySize = IOSurfaceAlignProperty(kIOSurfacePlaneSize, yStride * (size_t)height);
     size_t uvStride = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, (size_t)width);
     size_t uvSize = IOSurfaceAlignProperty(kIOSurfacePlaneSize, uvStride * (size_t)(height / 2));
-    if (yStride == 0 || ySize == 0 || uvStride == 0 || uvSize == 0) return NULL;
+    if (yStride == 0 || ySize == 0 || uvStride == 0 || uvSize == 0) {
+        if (failure != NULL) *failure = 1;
+        return NULL;
+    }
     size_t uvOffset = IOSurfaceAlignProperty(kIOSurfacePlaneOffset, ySize);
     size_t totalSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, uvOffset + uvSize);
-    if (uvOffset == 0 || totalSize == 0) return NULL;
+    if (uvOffset == 0 || totalSize == 0) {
+        if (failure != NULL) *failure = 2;
+        return NULL;
+    }
 
     CFMutableDictionaryRef yPlane = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -38,6 +63,7 @@ static IOSurfaceRef createNV12Surface(int width, int height) {
         if (yPlane != NULL) CFRelease(yPlane);
         if (uvPlane != NULL) CFRelease(uvPlane);
         if (properties != NULL) CFRelease(properties);
+        if (failure != NULL) *failure = 3;
         return NULL;
     }
 
@@ -70,6 +96,9 @@ static IOSurfaceRef createNV12Surface(int width, int height) {
     }
 
     IOSurfaceRef surface = ok ? IOSurfaceCreate(properties) : NULL;
+    if (failure != NULL && !ok) *failure = 4;
+    if (failure != NULL && surface == NULL && ok)
+        *failure = probeBasicIOSurface() ? 5 : 6;
     if (planes != NULL) CFRelease(planes);
     CFRelease(properties);
     CFRelease(uvPlane);
@@ -136,8 +165,9 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
         yStride < width || uvStride < width / 2 || ySrc == NULL || uSrc == NULL || vSrc == NULL) return -3;
 
-    IOSurfaceRef surface = createNV12Surface(width, height);
-    if (surface == NULL) return -4001;
+    int32_t surfaceFailure = 0;
+    IOSurfaceRef surface = createNV12Surface(width, height, &surfaceFailure);
+    if (surface == NULL) return -4000 - surfaceFailure;
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn createStatus = CVPixelBufferCreateWithIOSurface(
         kCFAllocatorDefault, surface, NULL, &pixelBuffer);
