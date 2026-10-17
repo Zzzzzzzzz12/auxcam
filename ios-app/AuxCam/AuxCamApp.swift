@@ -4,10 +4,12 @@
 import SwiftUI
 import AVFoundation
 import PhotosUI
+import CoreTransferable
 import Foundation
 import Darwin
 import VideoToolbox
 import IOSurface
+import UniformTypeIdentifiers
 
 @main
 struct AuxCamApp: App {
@@ -79,6 +81,30 @@ struct Link {
         let plist = jb + "/Library/LaunchDaemons/com.auxcam.agent.plist"
         spawnCLI(["/usr/bin/launchctl", "bootstrap", "user/501", plist])
         spawnCLI(["/usr/bin/launchctl", "kickstart", "-k", "user/501/com.auxcam.agent"])
+    }
+}
+
+// PhotosPicker 的视频以文件方式导入，避免把整段视频读进 Data 占用大量内存。
+private struct PickedVideo: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .movie) { received in
+            let source = received.file
+            let destination = Link.videoURL
+            let incoming = destination.appendingPathExtension("incoming")
+            return try await Task.detached(priority: .userInitiated) {
+                let fm = FileManager.default
+                try? fm.removeItem(at: incoming)
+                try fm.copyItem(at: source, to: incoming)
+                if fm.fileExists(atPath: destination.path) {
+                    _ = try fm.replaceItemAt(destination, withItemAt: incoming)
+                } else {
+                    try fm.moveItem(at: incoming, to: destination)
+                }
+                return PickedVideo(url: destination)
+            }.value
+        }
     }
 }
 
@@ -220,7 +246,11 @@ final class StreamDecoder {
     private var pps = Data()
     private var frameIndex: Int64 = 0
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
-    private static var frameCount: Int = 0
+    private let outputLock = NSLock()
+    private var retainedFrame: CVPixelBuffer?
+    private var callbackCount = 0
+    private var lastCallbackStatus: OSStatus = noErr
+    private var waitingForKeyframe = true
     private static var buildCount: Int = 0
     private static var feedCount: Int = 0
 
@@ -235,35 +265,83 @@ final class StreamDecoder {
         }
     }
 
-    // 解码出一帧：把画布编号公布出去
-    static let frameCallback: VTDecompressionOutputCallback = { (_, _, status, _, imageBuffer, _, _) in
-        frameCount += 1
-        if frameCount <= 3 || frameCount % 90 == 0 {
-            dlog("callback #\(frameCount) status=\(status)")
-        }
-        guard status == noErr, let img = imageBuffer else { return }
-        guard let surf = CVPixelBufferGetIOSurface(img)?.takeUnretainedValue() else {
-            dlog("no iosurface on frame")
-            return
-        }
-        let sid = IOSurfaceGetID(surf)
-        let s = "id=\(sid)\n"
-        try? s.write(toFile: surfacePath, atomically: true, encoding: .utf8)
-        if frameCount <= 3 { dlog("published surface id=\(sid)") }
+    // 解码出一帧：保留最新像素缓冲区，避免插件读取 ID 时 IOSurface 已被回收。
+    static let frameCallback: VTDecompressionOutputCallback = { outputRefCon, _, status, _, imageBuffer, _, _ in
+        guard let outputRefCon else { return }
+        let decoder = Unmanaged<StreamDecoder>.fromOpaque(outputRefCon).takeUnretainedValue()
+        decoder.publish(status: status, imageBuffer: imageBuffer)
     }
 
     func setConfig(sps: Data, pps: Data) {
-        queue.async { [weak self] in
-            guard let self else { return }
+        queue.sync {
             self.sps = sps
             self.pps = pps
+            self.frameIndex = 0
+            self.setWaitingForKeyframe(true)
             self.build()
         }
     }
 
     func feed(_ raw: Data, keyframe: Bool) {
-        queue.async { [weak self] in
-            self?.decode(raw, keyframe: keyframe)
+        // VCU1 的接收循环也在后台队列。让 TCP 自然背压，避免 VT 变慢时
+        // 把整段旧帧无限堆进 GCD 队列，造成延迟和内存持续增长。
+        queue.sync {
+            self.decode(raw, keyframe: keyframe)
+        }
+    }
+
+    private func setWaitingForKeyframe(_ value: Bool) {
+        outputLock.lock()
+        waitingForKeyframe = value
+        outputLock.unlock()
+    }
+
+    private func isWaitingForKeyframe() -> Bool {
+        outputLock.lock()
+        let value = waitingForKeyframe
+        outputLock.unlock()
+        return value
+    }
+
+    private func callbackStatus() -> OSStatus {
+        outputLock.lock()
+        let value = lastCallbackStatus
+        outputLock.unlock()
+        return value
+    }
+
+    private func publish(status: OSStatus, imageBuffer: CVImageBuffer?) {
+        outputLock.lock()
+        callbackCount += 1
+        let count = callbackCount
+        lastCallbackStatus = status
+        if status != noErr { waitingForKeyframe = true }
+        guard status == noErr, let imageBuffer else {
+            outputLock.unlock()
+            if count <= 3 || count % 90 == 0 {
+                StreamDecoder.dlog("callback #\(count) status=\(status)")
+            }
+            return
+        }
+        retainedFrame = imageBuffer
+        outputLock.unlock()
+
+        guard let surface = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else {
+            StreamDecoder.dlog("decoded frame has no IOSurface")
+            return
+        }
+        let surfaceID = IOSurfaceGetID(surface)
+        let contents = "id=\(surfaceID)\n"
+        do {
+            try contents.write(toFile: StreamDecoder.surfacePath, atomically: true, encoding: .utf8)
+        } catch {
+            if count <= 3 || count % 90 == 0 {
+                StreamDecoder.dlog("surface publish failed: \(error.localizedDescription)")
+            }
+            return
+        }
+        if count <= 3 || count % 90 == 0 {
+            StreamDecoder.dlog("callback #\(count) status=0 surface=\(surfaceID)")
         }
     }
 
@@ -301,12 +379,15 @@ final class StreamDecoder {
                 fmt = f
                 var cb = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
-                    decompressionOutputRefCon: nil)
-                // 先不限定输出格式（IOSurface 属性可能导致输出阶段失败报 -12909），
-                // 回调里拿不到 IOSurface 就走 raw 像素文件兜底
+                    decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+                // 明确要求 IOSurface backing；不限制像素格式，让 VideoToolbox
+                // 选择设备原生的解码输出格式。
+                let imageAttributes: [String: Any] = [
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                ]
                 let vtSt = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault, formatDescription: f,
-                    decoderSpecification: nil, imageBufferAttributes: nil,
+                    decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &cb, decompressionSessionOut: &session)
                 StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
             }
@@ -314,40 +395,52 @@ final class StreamDecoder {
     }
 
     private func decode(_ raw: Data, keyframe: Bool) {
-        var n = raw
-        if n.starts(with: [UInt8(0), 0, 0, 1]) { n = Data(n.dropFirst(4)) }
-        else if n.starts(with: [UInt8(0), 0, 1]) { n = Data(n.dropFirst(3)) }
+        let nalUnits = Self.splitAnnexB(raw)
         StreamDecoder.feedCount += 1
-        guard n.count > 0, let session, let fmt else {
+        guard let session, let fmt else {
             if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) skip n=\(n.count) session=\(session != nil) fmt=\(fmt != nil)")
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) waiting for config; input=\(raw.count)")
             }
             return
         }
-        // 拼 access unit：关键帧 = SPS+PPS+帧，普通帧 = 单帧（iOS 解码器要求 IDR 带 SPS/PPS）
+
+        // SPS/PPS 已经放在 CMVideoFormatDescription 里。sample 只提交 VCL
+        // NALU（一个或多个 slice），不能再把 SPS/PPS 当作画面 sample 重复提交。
+        let slices = nalUnits.filter { unit in
+            guard let first = unit.first else { return false }
+            let type = first & 0x1F
+            return type == 1 || type == 5
+        }
+        guard !slices.isEmpty else {
+            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) skip non-VCL NALs=\(nalUnits.count)")
+            }
+            return
+        }
+        let hasIDR = slices.contains { (($0.first ?? 0) & 0x1F) == 5 }
+        if keyframe != hasIDR {
+            StreamDecoder.dlog("keyframe flag mismatch flag=\(keyframe) IDR=\(hasIDR)")
+        }
+        if isWaitingForKeyframe() && !hasIDR { return }
+        if hasIDR { setWaitingForKeyframe(false) }
+
         var au = Data()
-        if keyframe {
-            let sp = sps, pp = pps
-            for d in [sp, pp, n] where d.count > 0 {
-                var l = UInt32(d.count).bigEndian
-                withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
-                au.append(d)
-            }
-            if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 60 == 0 {
-                StreamDecoder.dlog("AU hex: " + au.prefix(96).map { String(format: "%02x", $0) }.joined())
-            }
-        } else {
-            var l = UInt32(n.count).bigEndian
+        for unit in slices {
+            var l = UInt32(unit.count).bigEndian
             withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
-            au.append(n)
+            au.append(unit)
         }
         let total = au.count
+        guard total > 0 else { return }
         // 自己 malloc 内存（memoryBlock:nil 时 CMBlockBuffer 不会自动分配 → -12707）
         guard let mem = malloc(total) else { return }
         let mp = mem.assumingMemoryBound(to: UInt8.self)
-        au.withUnsafeBytes { b in
-            mp.update(from: b.bindMemory(to: UInt8.self).baseAddress!, count: total)
+        let copied = au.withUnsafeBytes { b -> Bool in
+            guard let base = b.bindMemory(to: UInt8.self).baseAddress else { return false }
+            mp.update(from: base, count: total)
+            return true
         }
+        guard copied else { free(mem); return }
         var block: CMBlockBuffer?
         var src = CMBlockBufferCustomBlockSource(
             version: 0,
@@ -373,24 +466,71 @@ final class StreamDecoder {
             duration: CMTime(value: 1, timescale: 30),
             presentationTimeStamp: CMTime(value: tsIdx, timescale: 30),
             decodeTimeStamp: CMTime.invalid)
+        var sampleSize = total
         let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
+            sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sb)
         frameIndex += 1
         if let sb {
-            // 同步解码：回调在提交内完成。异步模式下 Swift 会提前释放 sample 内存 → 解码器读垃圾 → -12909
-            VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb,
-                                              flags: [],
-                                              frameRefcon: nil, infoFlagsOut: nil)
-            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sbSt=\(sbSt) submitted n=\(n.count)")
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? NSMutableArray,
+               attachments.count > 0,
+               let attachment = attachments[0] as? NSMutableDictionary {
+                attachment[kCMSampleAttachmentKey_NotSync as String] = NSNumber(value: !hasIDR)
+            }
+            // flags=[] 保持同步解码，确保 block/sample 在 VT 使用期间有效。
+            outputLock.lock()
+            lastCallbackStatus = noErr
+            outputLock.unlock()
+            var decodeInfo = VTDecodeInfoFlags()
+            let decodeStatus = VTDecompressionSessionDecodeFrame(
+                session, sampleBuffer: sb, flags: [], frameRefcon: nil,
+                infoFlagsOut: &decodeInfo)
+            let outputStatus = callbackStatus()
+            if decodeStatus != noErr || outputStatus != noErr {
+                setWaitingForKeyframe(true)
+                // VT 报坏帧后丢弃增量帧，重建会话；收到下一个 IDR 再恢复。
+                build()
+            }
+            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 ||
+               (decodeStatus != noErr || outputStatus != noErr) {
+                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sample=\(sbSt) vt=\(decodeStatus) callback=\(outputStatus) bytes=\(total) idr=\(hasIDR)")
             }
         } else {
             if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
                 StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sample fail \(sbSt)")
             }
         }
+    }
+
+    private static func splitAnnexB(_ data: Data) -> [Data] {
+        let bytes = [UInt8](data)
+        var starts: [(start: Int, payload: Int)] = []
+        var i = 0
+        while i + 3 <= bytes.count {
+            if i + 4 <= bytes.count,
+               bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 0, bytes[i + 3] == 1 {
+                starts.append((i, i + 4))
+                i += 4
+            } else if bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 1 {
+                starts.append((i, i + 3))
+                i += 3
+            } else {
+                i += 1
+            }
+        }
+        guard !starts.isEmpty else { return data.isEmpty ? [] : [data] }
+
+        var result: [Data] = []
+        for index in starts.indices {
+            let payloadStart = starts[index].payload
+            var end = index + 1 < starts.count ? starts[index + 1].start : bytes.count
+            while end > payloadStart && bytes[end - 1] == 0 { end -= 1 }
+            if end > payloadStart {
+                result.append(Data(bytes[payloadStart..<end]))
+            }
+        }
+        return result
     }
 }
 
@@ -662,6 +802,8 @@ struct ContentView: View {
     @State private var picker: PhotosPickerItem?
     @State private var pickerRequest = false
     @State private var hint = ""
+    @State private var fakeCameraOn = false
+    @State private var cameraCommandAt = Date.distantPast
     @State private var deadCount = 0
     @State private var revived = false
     @State private var mirrorOn = false
@@ -704,6 +846,12 @@ struct ContentView: View {
             statusLine
             infoRow
             panel
+            if !hint.isEmpty {
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(hint.contains("失败") ? Color.red : Color.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             sigRow
             bigButton
             tabBar
@@ -714,14 +862,19 @@ struct ContentView: View {
         .photosPicker(isPresented: $pickerRequest, selection: $picker, matching: .videos)
         .onChange(of: picker) { _, item in
             guard let item else { return }
-            Task {
-                if let data = try? await item.loadTransferable(type: Data.self) {
-                    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("pick.mp4")
-                    try? data.write(to: tmp)
-                    try? FileManager.default.removeItem(at: Link.videoURL)
-                    try? FileManager.default.copyItem(at: tmp, to: Link.videoURL)
-                    Link.send(["cmd": "setvideo", "path": Link.videoURL.path])
-                    hint = "相册视频已设为画面"
+            Task { @MainActor in
+                hint = "正在导入相册视频…"
+                do {
+                    guard let video = try await item.loadTransferable(type: PickedVideo.self) else {
+                        hint = "无法读取所选视频，请重试"
+                        return
+                    }
+                    Link.send(["cmd": "setvideo", "path": video.url.path])
+                    fakeCameraOn = true
+                    cameraCommandAt = Date()
+                    hint = "视频已导入，正在切换画面"
+                } catch {
+                    hint = "视频导入失败，请重试"
                 }
             }
         }
@@ -830,7 +983,11 @@ struct ContentView: View {
                 PB("直连", "cable.connector") { tapDirect() }
                 PB("内录", "record.circle", recordOn ? .red : Color(red: 0.20, green: 0.72, blue: 0.62)) { tapRecord() }
                 PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
-                PB("旋转", "rotate.right", Color(red: 0.55, green: 0.35, blue: 0.75)) { Link.send(["cmd": "rotate"]); hint = "已旋转 90°" }
+                PB(fakeCameraOn ? "切回真镜头" : "放视频",
+                   fakeCameraOn ? "camera.fill" : "play.rectangle.fill",
+                   fakeCameraOn ? Color(red: 0.90, green: 0.55, blue: 0.15) : Color(red: 0.55, green: 0.35, blue: 0.75)) {
+                    vcamControl(!fakeCameraOn)
+                }
                 PB("恢复", "arrow.counterclockwise", Color(red: 0.90, green: 0.55, blue: 0.15)) { tapReset() }
             }
         }
@@ -966,6 +1123,9 @@ struct ContentView: View {
 
     private func tick() {
         st = Link.status()
+        if Date().timeIntervalSince(cameraCommandAt) > 2 {
+            fakeCameraOn = playingFake
+        }
         if kernelOK {
             deadCount = 0
         } else {
@@ -1082,7 +1242,42 @@ struct ContentView: View {
         wasLive = false
         mirrorOn = false
         recordOn = false
+        vcamControl(false)   // 真正切回真镜头
         Link.send(["cmd": "reset"])
-        hint = "已恢复（正常相机）"
+    }
+
+    // 手机端开关：写 DCIM/vcam.plist，相机进程里的插件 1 秒内生效
+    private func vcamControl(_ on: Bool) {
+        let path = "/var/mobile/Media/DCIM/vcam.mp4"
+        let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
+        if on && !FileManager.default.fileExists(atPath: path) {
+            fakeCameraOn = false
+            hint = "没有可播放视频，请先选视频或推送素材"
+            return
+        }
+        var p: [String: Any] = [
+            "masterEnabled": true, "enabled": true,
+            "flipHorizontal": false, "flipVertical": false,
+            "rotation": 0,
+            "sourcePath": path,
+            "generation": 1,
+        ]
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
+           let loaded = try? PropertyListSerialization.propertyList(from: d, options: [], format: nil) as? [String: Any] {
+            p = loaded
+        }
+        p["masterEnabled"] = on
+        p["enabled"] = on
+        p["generation"] = (p["generation"] as? Int ?? 0) + 1
+        p["sourcePath"] = path
+        do {
+            let data = try PropertyListSerialization.data(fromPropertyList: p, format: .xml, options: 0)
+            try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+            fakeCameraOn = on
+            cameraCommandAt = Date()
+            hint = on ? "已切换：相机放视频" : "已切回真镜头"
+        } catch {
+            hint = "切换失败，请检查 AuxCam 文件权限"
+        }
     }
 }
