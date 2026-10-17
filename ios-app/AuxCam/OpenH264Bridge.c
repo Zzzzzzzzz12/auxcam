@@ -135,7 +135,7 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn createStatus = CVPixelBufferCreateWithIOSurface(
         kCFAllocatorDefault, surface, NULL, &pixelBuffer);
-    IOSurfaceRelease(surface);
+    CFRelease(surface);
     if (createStatus != kCVReturnSuccess) {
         if (pixelBuffer != NULL) CVPixelBufferRelease(pixelBuffer);
         return -5000 - (int32_t)createStatus;
