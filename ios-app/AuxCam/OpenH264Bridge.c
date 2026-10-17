@@ -19,11 +19,14 @@ static bool setSurfaceNumber(CFMutableDictionaryRef dictionary, CFStringRef key,
 }
 
 static IOSurfaceRef createNV12Surface(int width, int height) {
-    size_t yStride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)width);
-    size_t ySize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, yStride * (size_t)height);
-    size_t uvStride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)width);
-    size_t uvSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, uvStride * (size_t)(height / 2));
+    size_t yStride = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, (size_t)width);
+    size_t ySize = IOSurfaceAlignProperty(kIOSurfacePlaneSize, yStride * (size_t)height);
+    size_t uvStride = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, (size_t)width);
+    size_t uvSize = IOSurfaceAlignProperty(kIOSurfacePlaneSize, uvStride * (size_t)(height / 2));
     if (yStride == 0 || ySize == 0 || uvStride == 0 || uvSize == 0) return NULL;
+    size_t uvOffset = IOSurfaceAlignProperty(kIOSurfacePlaneOffset, ySize);
+    size_t totalSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, uvOffset + uvSize);
+    if (uvOffset == 0 || totalSize == 0) return NULL;
 
     CFMutableDictionaryRef yPlane = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -43,16 +46,19 @@ static IOSurfaceRef createNV12Surface(int width, int height) {
         setSurfaceNumber(yPlane, kIOSurfacePlaneBytesPerRow, (int64_t)yStride) &&
         setSurfaceNumber(yPlane, kIOSurfacePlaneOffset, 0) &&
         setSurfaceNumber(yPlane, kIOSurfacePlaneSize, (int64_t)ySize) &&
+        setSurfaceNumber(yPlane, kIOSurfacePlaneBytesPerElement, 1) &&
         setSurfaceNumber(uvPlane, kIOSurfacePlaneWidth, width / 2) &&
         setSurfaceNumber(uvPlane, kIOSurfacePlaneHeight, height / 2) &&
         setSurfaceNumber(uvPlane, kIOSurfacePlaneBytesPerRow, (int64_t)uvStride) &&
-        setSurfaceNumber(uvPlane, kIOSurfacePlaneOffset, (int64_t)ySize) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneOffset, (int64_t)uvOffset) &&
         setSurfaceNumber(uvPlane, kIOSurfacePlaneSize, (int64_t)uvSize) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneBytesPerElement, 2) &&
         setSurfaceNumber(properties, kIOSurfaceWidth, width) &&
         setSurfaceNumber(properties, kIOSurfaceHeight, height) &&
         setSurfaceNumber(properties, kIOSurfacePixelFormat,
                          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) &&
-        setSurfaceNumber(properties, kIOSurfaceAllocSize, (int64_t)(ySize + uvSize));
+        setSurfaceNumber(properties, kIOSurfaceAllocSize, (int64_t)totalSize);
+    CFDictionarySetValue(properties, kIOSurfaceIsGlobal, kCFBooleanTrue);
 
     CFMutableArrayRef planes = CFArrayCreateMutable(
         kCFAllocatorDefault, 2, &kCFTypeArrayCallBacks);
