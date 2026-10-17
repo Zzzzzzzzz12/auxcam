@@ -278,6 +278,7 @@ final class StreamDecoder {
     private var callbackCount = 0
     private var lastCallbackStatus: OSStatus = noErr
     private var waitingForKeyframe = true
+    private var frameIndex: Int64 = 0
     private var decodeCallCount: Int64 = 0
     private var activeDecodeCall: Int64 = 0
     private var sessionGeneration: Int64 = 0
@@ -317,6 +318,7 @@ final class StreamDecoder {
         queue.sync {
             self.sps = sps
             self.pps = pps
+            self.frameIndex = 0
             self.setWaitingForKeyframe(true)
             self.build()
         }
@@ -733,11 +735,16 @@ final class StreamDecoder {
             return
         }
         var sb: CMSampleBuffer?
-        // 实时 sample 不排队等时间戳，交给解码器后尽快出画面。
+        // 每帧带正常的 30fps 时间戳；VideoToolbox 收到无时间的压缩帧会报坏帧。
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: CMTime(value: frameIndex, timescale: 30),
+            decodeTimeStamp: CMTime.invalid)
+        frameIndex += 1
         var sampleSize = total
         let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
-            sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
+            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sb)
         if let sb {
             if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
