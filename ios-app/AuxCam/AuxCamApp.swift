@@ -10,6 +10,7 @@ import Darwin
 import VideoToolbox
 import IOSurface
 import UniformTypeIdentifiers
+import QuartzCore
 
 @main
 struct AuxCamApp: App {
@@ -263,15 +264,24 @@ final class StreamDecoder {
     private var callbackCount = 0
     private var lastCallbackStatus: OSStatus = noErr
     private var waitingForKeyframe = true
+    private var decodeCallCount: Int64 = 0
+    private var activeDecodeCall: Int64 = 0
+    private var sessionGeneration: Int64 = 0
+    private var goldenTestStarted = false
+    private let goldenTestLock = NSLock()
+    private let goldenDiffLock = NSLock()
+    private var goldenFormatFields: [String: String]?
+    private var goldenSampleFields: [String: String]?
     private static var buildCount: Int = 0
     private static var feedCount: Int = 0
+    private static let runID = String(UUID().uuidString.prefix(8))
 
     deinit {
         if surfaceFD >= 0 { close(surfaceFD) }
     }
 
     static func dlog(_ s: String) {
-        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
+        let line = String(format: "%.6f [%@] %@\n", Date().timeIntervalSince1970, runID, s)
         if let h = FileHandle(forWritingAtPath: logPath) {
             h.seekToEndOfFile()
             h.write(line.data(using: .utf8) ?? Data())
@@ -282,10 +292,11 @@ final class StreamDecoder {
     }
 
     // 解码出一帧：保留最新像素缓冲区，避免插件读取 ID 时 IOSurface 已被回收。
-    static let frameCallback: VTDecompressionOutputCallback = { outputRefCon, _, status, _, imageBuffer, _, _ in
+    static let frameCallback: VTDecompressionOutputCallback = { outputRefCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
         guard let outputRefCon else { return }
         let decoder = Unmanaged<StreamDecoder>.fromOpaque(outputRefCon).takeUnretainedValue()
-        decoder.publish(status: status, imageBuffer: imageBuffer)
+        let sourceFrameID = sourceFrameRefCon.map { Int64(Int(bitPattern: $0)) } ?? 0
+        decoder.publish(status: status, imageBuffer: imageBuffer, sourceFrameID: sourceFrameID)
     }
 
     func setConfig(sps: Data, pps: Data) {
@@ -296,6 +307,218 @@ final class StreamDecoder {
             self.setWaitingForKeyframe(true)
             self.build()
         }
+        testGoldenPath()
+    }
+
+    // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
+    // 这条路径不改 sample、不使用实时 session，也不把测试帧发布给相机插件。
+    // 收到首个 VCU1 配置后自动在 utility 队列运行一次，避免影响主线程和实时解码队列。
+    func testGoldenPath() {
+        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            StreamDecoder.dlog("golden skipped: vcam.mp4 not found")
+            return
+        }
+        goldenTestLock.lock()
+        guard !goldenTestStarted else {
+            goldenTestLock.unlock()
+            return
+        }
+        goldenTestStarted = true
+        goldenTestLock.unlock()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.runGoldenPath(url: url)
+        }
+    }
+
+    private final class GoldenProbe {
+        private let lock = NSLock()
+        private var callbackCount = 0
+        private var callbackStatus: OSStatus?
+        private var gotImage = false
+        private var retainedImage: CVImageBuffer?
+
+        func record(status: OSStatus, imageBuffer: CVImageBuffer?) {
+            lock.lock()
+            callbackCount += 1
+            callbackStatus = status
+            gotImage = imageBuffer != nil
+            retainedImage = imageBuffer
+            lock.unlock()
+        }
+
+        func summary() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return "callbacks=\(callbackCount) callbackStatus=\(callbackStatus.map { String($0) } ?? "none") image=\(gotImage)"
+        }
+    }
+
+    private static let goldenCallback: VTDecompressionOutputCallback = { outputRefCon, _, status, _, imageBuffer, _, _ in
+        guard let outputRefCon else { return }
+        let probe = Unmanaged<GoldenProbe>.fromOpaque(outputRefCon).takeUnretainedValue()
+        probe.record(status: status, imageBuffer: imageBuffer)
+        StreamDecoder.dlog("golden callback status=\(status) image=\(imageBuffer != nil)")
+    }
+
+    private func runGoldenPath(url: URL) {
+        StreamDecoder.dlog("golden begin path=\(url.path)")
+        var reader: AVAssetReader?
+        var decoderSession: VTDecompressionSession?
+        defer {
+            if let decoderSession { VTDecompressionSessionInvalidate(decoderSession) }
+            reader?.cancelReading()
+        }
+
+        do {
+            let asset = AVURLAsset(url: url)
+            guard let track = asset.tracks(withMediaType: .video).first else {
+                StreamDecoder.dlog("golden failed: no video track")
+                return
+            }
+            let r = try AVAssetReader(asset: asset)
+            reader = r
+            // nil 表示读取 MP4 中原始压缩样本；不让 AVAssetReader 先解码/转码。
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            output.alwaysCopiesSampleData = false
+            guard r.canAdd(output) else {
+                StreamDecoder.dlog("golden failed: reader cannot add track output")
+                return
+            }
+            r.add(output)
+            guard r.startReading() else {
+                StreamDecoder.dlog("golden failed: startReading status=\(String(describing: r.status)) error=\(String(describing: r.error))")
+                return
+            }
+            guard let sample = output.copyNextSampleBuffer() else {
+                StreamDecoder.dlog("golden failed: no first sample readerStatus=\(String(describing: r.status)) error=\(String(describing: r.error))")
+                return
+            }
+            guard let format = CMSampleBufferGetFormatDescription(sample) as? CMVideoFormatDescription else {
+                StreamDecoder.dlog("golden failed: sample has no video format description")
+                return
+            }
+
+            StreamDecoder.dlog("golden format \(Self.formatSummary(format))")
+            StreamDecoder.dlog("golden sample \(Self.sampleSummary(sample))")
+            goldenDiffLock.lock()
+            goldenFormatFields = Self.formatFields(format)
+            goldenSampleFields = Self.sampleFields(sample)
+            goldenDiffLock.unlock()
+            let probe = GoldenProbe()
+            var callback = VTDecompressionOutputCallbackRecord(
+                decompressionOutputCallback: StreamDecoder.goldenCallback,
+                decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
+            let imageAttributes: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let createStatus = VTDecompressionSessionCreate(
+                allocator: kCFAllocatorDefault, formatDescription: format,
+                decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
+                outputCallback: &callback, decompressionSessionOut: &decoderSession)
+            guard createStatus == noErr, let session = decoderSession else {
+                StreamDecoder.dlog("golden create failed status=\(createStatus) session=\(decoderSession != nil)")
+                return
+            }
+            VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+
+            var info = VTDecodeInfoFlags()
+            StreamDecoder.dlog("golden DecodeFrame begin sample=\(Self.sampleSummary(sample))")
+            let decodeStatus = VTDecompressionSessionDecodeFrame(
+                session, sampleBuffer: sample, flags: [], frameRefcon: nil, infoFlagsOut: &info)
+            StreamDecoder.dlog("golden DecodeFrame returned status=\(decodeStatus) info=\(info.rawValue)")
+            let waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(session)
+            StreamDecoder.dlog("golden result create=\(createStatus) decode=\(decodeStatus) wait=\(waitStatus) \(probe.summary())")
+        } catch {
+            StreamDecoder.dlog("golden failed: \(error.localizedDescription)")
+        }
+    }
+
+    private static func formatSummary(_ format: CMVideoFormatDescription) -> String {
+        formatFields(format).keys.sorted().map { "\($0)=\(formatFields(format)[$0] ?? "nil")" }.joined(separator: " ")
+    }
+
+    private static func formatFields(_ format: CMVideoFormatDescription) -> [String: String] {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+        var parameterSetPointer: UnsafePointer<UInt8>?
+        var parameterSetSize = 0
+        var parameterSetCount = 0
+        var nalUnitHeaderLength: Int32 = 0
+        let parameterSetStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            format, parameterSetIndex: 0,
+            parameterSetPointerOut: &parameterSetPointer,
+            parameterSetSizeOut: &parameterSetSize,
+            parameterSetCountOut: &parameterSetCount,
+            nalUnitHeaderLengthOut: &nalUnitHeaderLength)
+        let subtype = CMFormatDescriptionGetMediaSubType(format)
+        return [
+            "subtype": "0x\(String(subtype, radix: 16))",
+            "dimensions": "\(dimensions.width)x\(dimensions.height)",
+            "parameterSetStatus": String(parameterSetStatus),
+            "parameterSetCount": String(parameterSetCount),
+            "firstParameterSetSize": String(parameterSetSize),
+            "nalUnitHeaderLength": String(nalUnitHeaderLength),
+        ]
+    }
+
+    private static func sampleSummary(_ sample: CMSampleBuffer) -> String {
+        sampleFields(sample).keys.sorted().map { "\($0)=\(sampleFields(sample)[$0] ?? "nil")" }.joined(separator: " ")
+    }
+
+    private static func sampleFields(_ sample: CMSampleBuffer) -> [String: String] {
+        let sampleCount = CMSampleBufferGetNumSamples(sample)
+        let sampleSize = sampleCount > 0 ? CMSampleBufferGetSampleSize(sample, sampleIndex: 0) : 0
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+        let attachmentsText = attachments.map { String(describing: $0) } ?? "nil"
+        var blockText = "none"
+        if let block = CMSampleBufferGetDataBuffer(sample) {
+            let length = CMBlockBufferGetDataLength(block)
+            var lengthAtOffset = 0
+            var totalLength = 0
+            var dataPointer: UnsafeMutablePointer<Int8>?
+            let pointerStatus = CMBlockBufferGetDataPointer(
+                block, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset,
+                totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
+            let isReady = CMBlockBufferIsDataReady(block)
+            blockText = "len:\(length)|ptrStatus:\(pointerStatus)|contiguousAtZero:\(lengthAtOffset)|total:\(totalLength)|ready:\(isReady)"
+        }
+        var sampleTiming = CMSampleTimingInfo()
+        let timingStatus = sampleCount > 0 ? CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &sampleTiming) : -1
+        return [
+            "sampleCount": String(sampleCount),
+            "sampleSize[0]": String(sampleSize),
+            "block": blockText,
+            "bufferPTS": String(describing: CMSampleBufferGetPresentationTimeStamp(sample)),
+            "bufferDTS": String(describing: CMSampleBufferGetDecodeTimeStamp(sample)),
+            "bufferDuration": String(describing: CMSampleBufferGetDuration(sample)),
+            "timingStatus": String(timingStatus),
+            "timing.duration": String(describing: sampleTiming.duration),
+            "timing.pts": String(describing: sampleTiming.presentationTimeStamp),
+            "timing.dts": String(describing: sampleTiming.decodeTimeStamp),
+            "attachments": attachmentsText,
+        ]
+    }
+
+    private static func fieldDiff(reference: [String: String], candidate: [String: String]) -> String {
+        let keys = Set(reference.keys).union(candidate.keys).sorted()
+        let differences = keys.compactMap { key -> String? in
+            let left = reference[key] ?? "<missing>"
+            let right = candidate[key] ?? "<missing>"
+            guard left != right else { return nil }
+            return "\(key){golden=\(left),manual=\(right)}"
+        }
+        return differences.isEmpty ? "no differences" : differences.joined(separator: " ")
+    }
+
+    private func logGoldenDiff(kind: String, candidate: [String: String]) {
+        goldenDiffLock.lock()
+        let reference = kind == "format" ? goldenFormatFields : goldenSampleFields
+        goldenDiffLock.unlock()
+        guard let reference else {
+            StreamDecoder.dlog("golden diff \(kind): baseline not ready")
+            return
+        }
+        StreamDecoder.dlog("golden diff \(kind): \(Self.fieldDiff(reference: reference, candidate: candidate))")
     }
 
     func feed(_ raw: Data, keyframe: Bool) {
@@ -326,16 +549,17 @@ final class StreamDecoder {
         return value
     }
 
-    private func publish(status: OSStatus, imageBuffer: CVImageBuffer?) {
+    private func publish(status: OSStatus, imageBuffer: CVImageBuffer?, sourceFrameID: Int64) {
         outputLock.lock()
         callbackCount += 1
         let count = callbackCount
         lastCallbackStatus = status
+        let activeCall = activeDecodeCall
         if status != noErr { waitingForKeyframe = true }
         guard status == noErr, let imageBuffer else {
             outputLock.unlock()
             if count <= 3 || count % 90 == 0 {
-                StreamDecoder.dlog("callback #\(count) status=\(status)")
+                StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=\(status)")
             }
             return
         }
@@ -362,7 +586,7 @@ final class StreamDecoder {
             return
         }
         if count <= 3 || count % 90 == 0 {
-            StreamDecoder.dlog("callback #\(count) status=0 surface=\(surfaceID)")
+            StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=0 surface=\(surfaceID)")
         }
     }
 
@@ -398,6 +622,7 @@ final class StreamDecoder {
                     return
                 }
                 fmt = f
+                StreamDecoder.dlog("manual format \(Self.formatSummary(f))")
                 var cb = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
@@ -411,9 +636,10 @@ final class StreamDecoder {
                     decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &cb, decompressionSessionOut: &session)
                 if vtSt == noErr, let session {
+                    sessionGeneration += 1
                     VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
                 }
-                StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil)")
+                StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil) generation=\(sessionGeneration)")
             }
         }
     }
@@ -506,22 +732,36 @@ final class StreamDecoder {
                let attachment = attachments[0] as? NSMutableDictionary {
                 attachment[kCMSampleAttachmentKey_NotSync as String] = NSNumber(value: !hasIDR)
             }
+            decodeCallCount += 1
+            let callIndex = decodeCallCount
+            let shouldTraceCall = callIndex <= 3 || callIndex % 90 == 0
+            if shouldTraceCall {
+                StreamDecoder.dlog("manual sample #\(callIndex) \(Self.sampleSummary(sb))")
+                StreamDecoder.dlog("manual DecodeFrame begin #\(callIndex) sessionGeneration=\(sessionGeneration)")
+            }
             // flags=[] 保持同步解码，确保 block/sample 在 VT 使用期间有效。
             outputLock.lock()
             lastCallbackStatus = noErr
+            activeDecodeCall = callIndex
             outputLock.unlock()
             var decodeInfo = VTDecodeInfoFlags()
             let decodeStatus = VTDecompressionSessionDecodeFrame(
-                session, sampleBuffer: sb, flags: [], frameRefcon: nil,
+                session, sampleBuffer: sb, flags: [],
+                frameRefcon: UnsafeMutableRawPointer(bitPattern: Int(callIndex)),
                 infoFlagsOut: &decodeInfo)
             let outputStatus = callbackStatus()
+            outputLock.lock()
+            activeDecodeCall = 0
+            outputLock.unlock()
+            if shouldTraceCall {
+                StreamDecoder.dlog("manual DecodeFrame returned #\(callIndex) vt=\(decodeStatus) callback=\(outputStatus) info=\(decodeInfo.rawValue)")
+            }
             if decodeStatus != noErr || outputStatus != noErr {
                 setWaitingForKeyframe(true)
                 // VT 报坏帧后丢弃增量帧，重建会话；收到下一个 IDR 再恢复。
                 build()
             }
-            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 ||
-               (decodeStatus != noErr || outputStatus != noErr) {
+            if shouldTraceCall {
                 StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sample=\(sbSt) vt=\(decodeStatus) callback=\(outputStatus) bytes=\(total) idr=\(hasIDR)")
             }
         } else {
@@ -559,6 +799,151 @@ final class StreamDecoder {
                 if end > payloadStart { result.append(payloadStart..<end) }
             }
             return result
+        }
+    }
+}
+
+// ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
+// AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 IOSurface 编号交给相机插件。
+// 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
+final class HLSFrameSource: ObservableObject {
+    @Published private(set) var frameCount: Int64 = 0
+    @Published private(set) var fps: Double = 0
+    @Published private(set) var status = "待机"
+
+    private static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
+    private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
+    private var player: AVPlayer?
+    private var output: AVPlayerItemVideoOutput?
+    private var timer: DispatchSourceTimer?
+    private var retainedFrame: CVPixelBuffer?
+    private var surfaceFD: Int32 = -1
+    private var deliveredFrames: Int64 = 0
+    private var reportFrames: Int64 = 0
+    private var lastReport = Date()
+    private var statusObservation: NSKeyValueObservation?
+    private var notificationTokens: [NSObjectProtocol] = []
+
+    deinit {
+        timer?.cancel()
+        if surfaceFD >= 0 { close(surfaceFD) }
+    }
+
+    func start(url: URL) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.stopOnQueue()
+            self.setStatus("正在连接电脑")
+
+            let item = AVPlayerItem(url: url)
+            // 短缓冲优先降低延迟；网络抖动时由播放器自动恢复。
+            item.preferredForwardBufferDuration = 0.25
+            let attributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+            item.add(output)
+
+            let player = AVPlayer(playerItem: item)
+            player.isMuted = true
+            player.automaticallyWaitsToMinimizeStalling = false
+            self.player = player
+            self.output = output
+            self.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+                let value: String
+                switch item.status {
+                case .readyToPlay: value = "已连接，等待画面"
+                case .failed: value = "拉流失败：\(item.error?.localizedDescription ?? "未知错误")"
+                default: value = "正在连接电脑"
+                }
+                self?.setStatus(value)
+            }
+            self.notificationTokens.append(NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
+                    guard let self else { return }
+                    self.setStatus("网络卡顿，正在恢复")
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) {
+                        self.player?.play()
+                    }
+                })
+
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(33), leeway: .milliseconds(2))
+            timer.setEventHandler { [weak self] in self?.copyLatestFrame() }
+            self.timer = timer
+            timer.resume()
+            player.play()
+        }
+    }
+
+    func stop() {
+        queue.async { [weak self] in self?.stopOnQueue() }
+    }
+
+    private func setStatus(_ value: String) {
+        DispatchQueue.main.async { self.status = value }
+    }
+
+    private func stopOnQueue() {
+        timer?.setEventHandler {}
+        timer?.cancel()
+        timer = nil
+        statusObservation?.invalidate()
+        statusObservation = nil
+        notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        notificationTokens.removeAll()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        output = nil
+        retainedFrame = nil
+        deliveredFrames = 0
+        reportFrames = 0
+        lastReport = Date()
+        DispatchQueue.main.async {
+            self.frameCount = 0
+            self.fps = 0
+            self.status = "待机"
+        }
+    }
+
+    private func copyLatestFrame() {
+        guard let output else { return }
+        let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
+        guard output.hasNewPixelBuffer(forItemTime: itemTime),
+              let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil),
+              let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else { return }
+
+        retainedFrame = pixelBuffer
+        if surfaceFD < 0 {
+            surfaceFD = open(Self.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
+            if surfaceFD >= 0 { _ = ftruncate(surfaceFD, 0) }
+        }
+        guard surfaceFD >= 0 else {
+            setStatus("无法发布相机画面")
+            return
+        }
+        let contents = String(format: "id=%010u\n", IOSurfaceGetID(surface))
+        let written = contents.withCString { pwrite(surfaceFD, $0, 14, 0) }
+        guard written == 14 else {
+            setStatus("发布相机画面失败")
+            return
+        }
+
+        deliveredFrames += 1
+        let now = Date()
+        if now.timeIntervalSince(lastReport) >= 1 {
+            let elapsed = now.timeIntervalSince(lastReport)
+            let rate = Double(deliveredFrames - reportFrames) / elapsed
+            let currentFrameCount = deliveredFrames
+            reportFrames = deliveredFrames
+            lastReport = now
+            DispatchQueue.main.async {
+                self.frameCount = currentFrameCount
+                self.fps = rate
+                self.status = rate > 0 ? "电脑画面已接入" : "等待电脑画面"
+            }
         }
     }
 }
@@ -852,6 +1237,7 @@ struct PB: View {
 struct ContentView: View {
     @StateObject private var cam = Cam()
     @StateObject private var vcu = VCU1Receiver()
+    @StateObject private var hlsSource = HLSFrameSource()
     @State private var st: [String: String] = [:]
     @State private var state: LiveState = .idle
     @State private var picker: PhotosPickerItem?
@@ -859,6 +1245,7 @@ struct ContentView: View {
     @State private var hint = ""
     @State private var fakeCameraOn = false
     @State private var usingStreamSource = false
+    @State private var usingHLSSource = false
     @State private var hasPickedVideo = false
     @State private var cameraCommandAt = Date.distantPast
     @State private var deadCount = 0
@@ -868,6 +1255,7 @@ struct ContentView: View {
     @State private var aiOn = true
     @State private var showDiag = false
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
+    @AppStorage("streamURL") private var streamURL = ""
     @AppStorage("netMode") private var netMode = false   // false=USB直连 true=局域网
     @AppStorage("wasLive") private var wasLive = false   // 上次退出时是否在直播（重开自动恢复）
 
@@ -884,9 +1272,17 @@ struct ContentView: View {
         guard fakeCameraOn else { return st["playing"] ?? "正常相机" }
         return usingStreamSource ? "电脑实时流" : "素材视频"
     }
-    private var builtURL: String { "http://\(pcIP):8899/live.m3u8" }
+    private var builtURL: String {
+        streamURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    private var streamURLBinding: Binding<String> {
+        Binding(get: { streamURL }, set: { streamURL = $0 })
+    }
 
     private var sigText: String {
+        if usingHLSSource {
+            return hlsSource.fps > 0 ? "Wi-Fi · \(Int(hlsSource.fps)) 帧/秒" : hlsSource.status
+        }
         if kbps <= 0 { return "—" }
         if kbps > 800 { return "好 · \(String(format: "%.1f", kbps / 1000))M" }
         if kbps > 200 { return "中 · \(Int(kbps))K" }
@@ -894,6 +1290,10 @@ struct ContentView: View {
     }
 
     private var sigColor: Color {
+        if usingHLSSource {
+            if hlsSource.fps >= 24 { return .green }
+            return hlsSource.fps > 0 ? .orange : .secondary
+        }
         if kbps <= 0 { return .secondary }
         if kbps > 800 { return .green }
         if kbps > 200 { return .orange }
@@ -931,7 +1331,10 @@ struct ContentView: View {
                         return
                     }
                     try setStreamMode(false)
+                    hlsSource.stop()
+                    netMode = false
                     usingStreamSource = false
+                    usingHLSSource = false
                     hasPickedVideo = true
                     lastES = -1; lastTick = Date(); kbps = 0
                     Link.send(["cmd": "setvideo", "path": video.url.path])
@@ -1025,22 +1428,33 @@ struct ContentView: View {
     private var infoRow: some View {
         VStack(spacing: 8) {
             HStack {
-                Text("用户 8894AuxCam963302").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: netMode ? "wifi" : "cable.connector")
+                    .font(.caption2).foregroundStyle(.teal)
+                Text(netMode ? "局域网推流" : "USB 直连")
+                    .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                Toggle("开启位置", isOn: .constant(true))
-                    .labelsHidden()
-                Text("开启位置").font(.caption2).foregroundStyle(.secondary)
+                Text(netMode ? "Wi-Fi" : "端口 28765")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             HStack {
-                Image(systemName: "number").font(.caption2).foregroundStyle(.secondary)
-                Text("选择话题 · 视频适合手游虚拟电竞").font(.caption2).foregroundStyle(.secondary)
+                Text("电脑直播地址").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.secondary)
+                TextField("http://电脑IP:8899/obs/live.m3u8", text: streamURLBinding)
+                    .font(.caption2)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: 250)
             }
             HStack {
-                Image(systemName: "cable.connector").font(.caption2).foregroundStyle(vcu.alive ? .green : .teal)
-                Text("源：" + vcu.status).font(.caption2).foregroundStyle(.secondary)
-                if vcu.fps > 0 {
+                Image(systemName: usingHLSSource ? "wifi" : "cable.connector")
+                    .font(.caption2).foregroundStyle(usingHLSSource ? .green : (vcu.alive ? .green : .teal))
+                Text("源：" + (usingHLSSource ? hlsSource.status : vcu.status))
+                    .font(.caption2).foregroundStyle(.secondary)
+                if usingHLSSource && hlsSource.fps > 0 {
+                    Text(String(format: "%.0f 帧/秒", hlsSource.fps)).font(.caption2).bold().foregroundStyle(.green)
+                } else if !usingHLSSource && vcu.fps > 0 {
                     Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.caption2).bold().foregroundStyle(.green)
                 }
                 Spacer()
@@ -1057,6 +1471,7 @@ struct ContentView: View {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 PB("相册", "photo.on.rectangle") { pickerRequest = true }
                 PB("直连", "cable.connector") { tapDirect() }
+                PB(netMode ? "局域网已选" : "Wi-Fi", "wifi") { tapNetwork() }
                 PB("内录", "record.circle", recordOn ? .red : Color(red: 0.20, green: 0.72, blue: 0.62)) { tapRecord() }
                 PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
                 PB(fakeCameraOn ? "切回真镜头" : ((!netMode && (vcu.alive || !hasPickedVideo)) ? "放电脑画面" : "放视频"),
@@ -1150,6 +1565,10 @@ struct ContentView: View {
 
     // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
     private func boot() {
+        // 老版本保存的是电脑 IP；首次升级时把它带到新的完整直播地址设置里。
+        if UserDefaults.standard.object(forKey: "streamURL") == nil {
+            streamURL = "http://\(pcIP):8899/obs/live.m3u8"
+        }
         usingStreamSource = Link.streamEnabled()
         fakeCameraOn = usingStreamSource
         // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
@@ -1158,6 +1577,7 @@ struct ContentView: View {
             self.keepAliveAudio()   // 静音保活：退后台也继续收画面
         }
         vcu.start()   // 开门 28765，等万相电脑端连
+        if fakeCameraOn { vcamControl(true) }
         Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
         if wasLive {
             // 上次退出时在直播：自动恢复，不用人再点
@@ -1216,7 +1636,7 @@ struct ContentView: View {
         // 心跳：电脑画面每秒都在往手机里写数据 = 直连活着
         let now = Date()
         let previousBytes = lastES
-        let cur = usingStreamSource ? vcu.videoByteCount() : Link.vcamStamp()
+        let cur = usingHLSSource ? hlsSource.frameCount : (usingStreamSource ? vcu.videoByteCount() : Link.vcamStamp())
         let progressing = previousBytes >= 0 && cur > previousBytes
         if lastTick.timeIntervalSince(now) > 0.7, cur >= 0, lastES >= 0 {
             let dt = now.timeIntervalSince(lastTick)
@@ -1254,6 +1674,7 @@ struct ContentView: View {
             retryCount = 0
             netMode.toggle()
             hint = "已自动切换为" + (netMode ? "局域网" : "USB直连")
+            if fakeCameraOn { vcamControl(true) }
         } else {
             retryCount += 1
         }
@@ -1276,8 +1697,8 @@ struct ContentView: View {
     private var bigTitle: String {
         switch state {
         case .idle: return "开始视频直播"
-        case .starting: return "正在启动 USB…"
-        case .live: return "停止直连"
+        case .starting: return netMode ? "正在连接局域网…" : "正在启动 USB…"
+        case .live: return netMode ? "停止局域网接收" : "停止直连"
         case .broken: return "断流重连中…"
         }
     }
@@ -1309,6 +1730,17 @@ struct ContentView: View {
         if state == .live || state == .starting { startLive() } else {
             Link.send(["cmd": "mode", "mode": "file", "url": builtURL])
         }
+        if fakeCameraOn { vcamControl(true) }
+    }
+
+    private func tapNetwork() {
+        netMode = true
+        hasPickedVideo = false
+        hint = "局域网：电脑需开启 OBS 或其他直播软件，地址为 \(builtURL)"
+        if state == .live || state == .starting { startLive() } else {
+            Link.send(["cmd": "mode", "mode": "stream", "url": builtURL])
+        }
+        if fakeCameraOn { vcamControl(true) }
     }
 
     private func tapMirror() {
@@ -1347,11 +1779,20 @@ struct ContentView: View {
         try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
-    // 直连 USB 使用 App 解码后的 IOSurface；相册/局域网素材继续使用 vcam.mp4。
+    // USB 直连用 VCU1 解码帧；局域网用 AVPlayer 拉 HLS 并发布 IOSurface；相册仍走文件模式。
     private func vcamControl(_ on: Bool) {
         let path = "/var/mobile/Media/DCIM/vcam.mp4"
         let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
-        let useStream = on && !netMode && (vcu.alive || !hasPickedVideo)
+        let useUSBStream = on && !netMode && !hasPickedVideo
+        let useHLS = on && netMode
+        let useStream = useUSBStream || useHLS
+        if useHLS {
+            let scheme = URL(string: builtURL)?.scheme?.lowercased()
+            guard scheme == "http" || scheme == "https" else {
+                hint = "请先填写完整的电脑直播地址（http://...）"
+                return
+            }
+        }
         if on && !useStream && !FileManager.default.fileExists(atPath: path) {
             fakeCameraOn = false
             hint = "没有可播放视频，请先选视频或推送素材"
@@ -1377,19 +1818,29 @@ struct ContentView: View {
             if useStream {
                 try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
                 try setStreamMode(true)
+                if useHLS, let url = URL(string: builtURL) {
+                    hlsSource.start(url: url)
+                } else {
+                    hlsSource.stop()
+                }
             } else {
+                hlsSource.stop()
                 try setStreamMode(false)
                 try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
             }
-            if usingStreamSource != useStream {
+            let activeStreamSource = useStream
+            if usingStreamSource != activeStreamSource || usingHLSSource != useHLS {
                 lastES = -1; lastTick = Date(); kbps = 0
             }
             fakeCameraOn = on
-            usingStreamSource = useStream
+            usingStreamSource = activeStreamSource
+            usingHLSSource = useHLS
             cameraCommandAt = Date()
             if !on {
                 hint = "已切回真镜头"
-            } else if useStream {
+            } else if useHLS {
+                hint = "正在连接电脑画面：\(builtURL)"
+            } else if useUSBStream {
                 hint = vcu.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
             } else {
                 hint = "已切换：相机放视频"
