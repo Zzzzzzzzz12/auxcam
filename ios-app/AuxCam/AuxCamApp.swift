@@ -9,7 +9,6 @@ import CoreTransferable
 import Foundation
 import Darwin
 import VideoToolbox
-import IOSurface
 import UniformTypeIdentifiers
 import QuartzCore
 
@@ -248,10 +247,8 @@ struct CamPreview: UIViewRepresentable {
 }
 
 // ───────────────────────── 解码层（App 里解，画面贴公共画布） ─────────────────────────
-// App 解码 H264 → 得到画面帧 → 把帧挂的共享画布编号写进 .frame.surface
-// 相机进程里的插件每秒盯这个文件，有画布就用画布画面替换相机帧（= 相机采集被换成想要的画面）
+// App 解码 H264 → 把最新画面写进共享内存；插件读取它并替换相机帧。
 final class StreamDecoder {
-    static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
     static let logPath = "/var/mobile/Media/DCIM/.dec.log"
     private var softwareDecoder: UnsafeMutableRawPointer?
     private var sps = Data()
@@ -260,7 +257,6 @@ final class StreamDecoder {
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
     private let outputLock = NSLock()
     private var retainedFrame: CVPixelBuffer?
-    private var surfaceFD: Int32 = -1
     private var callbackCount = 0
     private var lastCallbackStatus: OSStatus = noErr
     private var waitingForKeyframe = true
@@ -278,7 +274,6 @@ final class StreamDecoder {
 
     deinit {
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
-        if surfaceFD >= 0 { close(surfaceFD) }
     }
     static func dlog(_ s: String) {
         let line = String(format: "%.6f [%@] %@\n", Date().timeIntervalSince1970, runID, s)
@@ -291,7 +286,7 @@ final class StreamDecoder {
         }
     }
 
-    // 解码出一帧：保留最新像素缓冲区，避免插件读取 ID 时 IOSurface 已被回收。
+    // 解码帧在这里同步写入 App 与相机插件共享的画面文件。
     static let frameCallback: VTDecompressionOutputCallback = { outputRefCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
         guard let outputRefCon else { return }
         let decoder = Unmanaged<StreamDecoder>.fromOpaque(outputRefCon).takeUnretainedValue()
@@ -409,7 +404,6 @@ final class StreamDecoder {
                 decompressionOutputCallback: StreamDecoder.goldenCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
             let imageAttributes: [String: Any] = [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
             let createStatus = VTDecompressionSessionCreate(
                 allocator: kCFAllocatorDefault, formatDescription: format,
@@ -567,27 +561,15 @@ final class StreamDecoder {
 
         StreamPictureInPicture.shared.enqueue(imageBuffer)
 
-        guard let surface = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else {
-            StreamDecoder.dlog("decoded frame has no IOSurface")
-            return
-        }
-        let surfaceID = IOSurfaceGetID(surface)
-        // 插件 15ms 轮询这个小文件。复用 fd 用一次 pwrite 更新固定宽度编号，
-        // 避免每帧创建临时文件再 rename 的元数据开销。
-        if surfaceFD < 0 {
-            surfaceFD = open(StreamDecoder.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
-            if surfaceFD >= 0 { _ = ftruncate(surfaceFD, 0) }
-        }
-        let contents = String(format: "id=%010u\n", surfaceID)
-        let written = contents.withCString { pwrite(surfaceFD, $0, 14, 0) }
-        if surfaceFD < 0 || written != 14 {
+        let publishResult = auxcam_publish_shared_frame(imageBuffer)
+        if publishResult != 1 {
             if count <= 3 || count % 90 == 0 {
-                StreamDecoder.dlog("surface publish failed errno=\(errno)")
+                StreamDecoder.dlog("shared frame publish failed result=\(publishResult) errno=\(errno)")
             }
             return
         }
         if count <= 3 || count % 90 == 0 {
-            StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=0 surface=\(surfaceID)")
+            StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=0 sharedFrame=ok")
         }
     }
 
@@ -688,20 +670,18 @@ final class StreamDecoder {
 }
 
 // ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
-// AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 IOSurface 编号交给相机插件。
+// AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 共享画面交给相机插件。
 // 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
 final class HLSFrameSource: ObservableObject {
     @Published private(set) var frameCount: Int64 = 0
     @Published private(set) var fps: Double = 0
     @Published private(set) var status = "待机"
 
-    private static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
     private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
     private var player: AVPlayer?
     private var output: AVPlayerItemVideoOutput?
     private var timer: DispatchSourceTimer?
     private var retainedFrame: CVPixelBuffer?
-    private var surfaceFD: Int32 = -1
     private var deliveredFrames: Int64 = 0
     private var reportFrames: Int64 = 0
     private var lastReport = Date()
@@ -710,7 +690,6 @@ final class HLSFrameSource: ObservableObject {
 
     deinit {
         timer?.cancel()
-        if surfaceFD >= 0 { close(surfaceFD) }
     }
 
     func start(url: URL) {
@@ -724,7 +703,6 @@ final class HLSFrameSource: ObservableObject {
             item.preferredForwardBufferDuration = 0.25
             let attributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
             item.add(output)
@@ -796,21 +774,10 @@ final class HLSFrameSource: ObservableObject {
         guard let output else { return }
         let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
         guard output.hasNewPixelBuffer(forItemTime: itemTime),
-              let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil),
-              let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else { return }
+              let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else { return }
 
         retainedFrame = pixelBuffer
-        if surfaceFD < 0 {
-            surfaceFD = open(Self.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
-            if surfaceFD >= 0 { _ = ftruncate(surfaceFD, 0) }
-        }
-        guard surfaceFD >= 0 else {
-            setStatus("无法发布相机画面")
-            return
-        }
-        let contents = String(format: "id=%010u\n", IOSurfaceGetID(surface))
-        let written = contents.withCString { pwrite(surfaceFD, $0, 14, 0) }
-        guard written == 14 else {
+        guard auxcam_publish_shared_frame(pixelBuffer) == 1 else {
             setStatus("发布相机画面失败")
             return
         }
@@ -966,7 +933,7 @@ final class VCU1Receiver: ObservableObject {
                 decoder.setConfig(sps: sps, pps: pps)
                 slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
             case 2:
-                // 先把最新帧送进 VideoToolbox 并发布 IOSurface，兼容环形文件写入放后面。
+                // 先把最新帧送进 VideoToolbox 并发布共享画面，兼容环形文件写入放后面。
                 decoder.feed(payload, keyframe: (flags & 1) != 0)
                 appendVideo(payload, keyframe: (flags & 1) != 0)
                 countFrame(payload.count)
@@ -1833,7 +1800,7 @@ struct ContentView: View {
         try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
-    // USB 直连用 VCU1 解码帧；局域网用 AVPlayer 拉 HLS 并发布 IOSurface；相册仍走文件模式。
+    // USB 直连用 VCU1 解码帧；局域网用 AVPlayer 拉 HLS 并发布共享画面；相册仍走文件模式。
     private func vcamControl(_ on: Bool) {
         let path = "/var/mobile/Media/DCIM/vcam.mp4"
         let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
