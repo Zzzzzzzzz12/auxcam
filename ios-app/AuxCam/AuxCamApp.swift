@@ -879,9 +879,12 @@ final class HLSFrameSource: NSObject, ObservableObject {
                 self?.log("item status=\(item.status.rawValue) error=\(item.error?.localizedDescription ?? "none")")
                 self?.setStatus(value)
                 guard item.status == .readyToPlay else { return }
+                let videoTracks = item.tracks.filter { $0.assetTrack?.mediaType == .video }
+                self?.log("ready tracks total=\(item.tracks.count) video=\(videoTracks.count) enabled=\(videoTracks.map(\.isEnabled))")
                 DispatchQueue.main.async { [weak self, weak player] in
                     guard let self, let player, self.player === player else { return }
                     // Attach the video output only after HLS has prepared the item.
+                    output.suppressesPlayerRendering = true
                     item.add(output)
                     self.displayLink?.invalidate()
                     let link = CADisplayLink(target: self, selector: #selector(self.displayLinkDidRefresh(_:)))
