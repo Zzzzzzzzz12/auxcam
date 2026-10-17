@@ -821,7 +821,7 @@ final class StreamDecoder {
 // ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
 // AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 IOSurface 编号交给相机插件。
 // 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
-final class HLSFrameSource: ObservableObject, AVPlayerItemOutputPullDelegate {
+final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDelegate {
     @Published private(set) var frameCount: Int64 = 0
     @Published private(set) var fps: Double = 0
     @Published private(set) var status = "待机"
