@@ -812,6 +812,7 @@ final class HLSFrameSource: ObservableObject {
     @Published private(set) var status = "待机"
 
     private static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
+    private static let logPath = "/var/mobile/Media/DCIM/.hls.log"
     private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
     private var player: AVPlayer?
     private var output: AVPlayerItemVideoOutput?
@@ -821,6 +822,8 @@ final class HLSFrameSource: ObservableObject {
     private var deliveredFrames: Int64 = 0
     private var reportFrames: Int64 = 0
     private var lastReport = Date()
+    private var lastFrameAt = Date.distantPast
+    private var lastNoFrameReport = Date.distantPast
     private var statusObservation: NSKeyValueObservation?
     private var notificationTokens: [NSObjectProtocol] = []
 
@@ -833,6 +836,9 @@ final class HLSFrameSource: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             self.stopOnQueue()
+            self.lastFrameAt = .distantPast
+            self.lastNoFrameReport = .distantPast
+            self.log("start url=\(url.absoluteString)")
             self.setStatus("正在连接电脑")
 
             let item = AVPlayerItem(url: url)
@@ -857,11 +863,13 @@ final class HLSFrameSource: ObservableObject {
                 case .failed: value = "拉流失败：\(item.error?.localizedDescription ?? "未知错误")"
                 default: value = "正在连接电脑"
                 }
+                self?.log("item status=\(item.status.rawValue) error=\(item.error?.localizedDescription ?? "none")")
                 self?.setStatus(value)
             }
             self.notificationTokens.append(NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
                     guard let self else { return }
+                    self.log("playback stalled")
                     self.setStatus("网络卡顿，正在恢复")
                     self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) {
                         self.player?.play()
@@ -883,6 +891,14 @@ final class HLSFrameSource: ObservableObject {
 
     private func setStatus(_ value: String) {
         DispatchQueue.main.async { self.status = value }
+    }
+
+    private func log(_ message: String) {
+        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
+        let fd = open(Self.logPath, O_CREAT | O_WRONLY | O_APPEND, mode_t(0o666))
+        guard fd >= 0 else { return }
+        _ = line.withCString { Darwin.write(fd, $0, strlen($0)) }
+        close(fd)
     }
 
     private func stopOnQueue() {
@@ -913,12 +929,31 @@ final class HLSFrameSource: ObservableObject {
         let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
         guard output.hasNewPixelBuffer(forItemTime: itemTime),
               let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil),
-              let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else { return }
+              let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
+            let now = Date()
+            if now.timeIntervalSince(lastFrameAt) > 5 && now.timeIntervalSince(lastNoFrameReport) > 5 {
+                lastNoFrameReport = now
+                let item = player?.currentItem
+                let error = item?.error?.localizedDescription ?? "none"
+                log("no frame itemStatus=\(item?.status.rawValue ?? -1) playerStatus=\(player?.status.rawValue ?? -1) error=\(error)")
+                if item?.status == .failed {
+                    setStatus("拉流失败：\(error)")
+                } else if item?.status == .readyToPlay {
+                    setStatus("已连接，暂时没有画面")
+                }
+            }
+            return
+        }
 
         retainedFrame = pixelBuffer
         if surfaceFD < 0 {
             surfaceFD = open(Self.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
-            if surfaceFD >= 0 { _ = ftruncate(surfaceFD, 0) }
+            if surfaceFD >= 0 {
+                _ = ftruncate(surfaceFD, 0)
+                log("surface file opened")
+            } else {
+                log("surface open failed errno=\(errno)")
+            }
         }
         guard surfaceFD >= 0 else {
             setStatus("无法发布相机画面")
@@ -932,6 +967,8 @@ final class HLSFrameSource: ObservableObject {
         }
 
         deliveredFrames += 1
+        lastFrameAt = Date()
+        if deliveredFrames == 1 { log("first decoded frame width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer))") }
         let now = Date()
         if now.timeIntervalSince(lastReport) >= 1 {
             let elapsed = now.timeIntervalSince(lastReport)
@@ -1569,7 +1606,7 @@ struct ContentView: View {
         if UserDefaults.standard.object(forKey: "streamURL") == nil {
             streamURL = "http://\(pcIP):8899/obs/live.m3u8"
         }
-        usingStreamSource = Link.streamEnabled()
+        usingStreamSource = Link.streamEnabled() || netMode
         fakeCameraOn = usingStreamSource
         // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1684,6 +1721,7 @@ struct ContentView: View {
     private func startLive() {
         state = .starting
         stuckCount = 0
+        vcamControl(true)
         Link.send(["cmd": "start", "mode": netMode ? "stream" : "file", "url": builtURL])
     }
 
@@ -1730,7 +1768,7 @@ struct ContentView: View {
         if state == .live || state == .starting { startLive() } else {
             Link.send(["cmd": "mode", "mode": "file", "url": builtURL])
         }
-        if fakeCameraOn { vcamControl(true) }
+        vcamControl(true)
     }
 
     private func tapNetwork() {
@@ -1740,7 +1778,7 @@ struct ContentView: View {
         if state == .live || state == .starting { startLive() } else {
             Link.send(["cmd": "mode", "mode": "stream", "url": builtURL])
         }
-        if fakeCameraOn { vcamControl(true) }
+        vcamControl(true)
     }
 
     private func tapMirror() {
