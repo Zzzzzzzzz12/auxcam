@@ -860,11 +860,8 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
 
             let item = AVPlayerItem(url: url)
             // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
-            let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            let output = AVPlayerItemVideoOutput(outputSettings: attributes)
+            // Let AVFoundation select a native pixel format for live HLS output.
+            let output = AVPlayerItemVideoOutput(outputSettings: nil)
 
             let player = AVPlayer(playerItem: item)
             player.isMuted = true
