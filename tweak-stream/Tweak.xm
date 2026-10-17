@@ -8,6 +8,7 @@
 #include "AuxCamSharedFrame.h"
 #import <objc/runtime.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <pthread.h>
@@ -26,6 +27,7 @@ static pthread_mutex_t gFrameMutex = PTHREAD_MUTEX_INITIALIZER;
 static CVPixelBufferRef gLast = NULL;
 static int gFrames = 0, gCopied = 0, gDecoded = 0;
 static int gFrameFD = -1;
+static unsigned int gMapFailures = 0;
 static void *gFrameMap = MAP_FAILED;
 static const size_t kFrameMapBytes = sizeof(AuxSharedFrameHeader) +
     (size_t)AUX_SHARED_FRAME_SLOT_COUNT * AUX_SHARED_FRAME_SLOT_CAPACITY;
@@ -66,22 +68,47 @@ static CVPixelBufferRef CopyLastFrame(void) {
 static BOOL MapSharedFrame(void) {
     if (gFrameMap != MAP_FAILED) return YES;
     int fd = shm_open(kFrameShmName, O_RDWR, 0);
-    if (fd < 0) return NO;
+    if (fd < 0) {
+        gMapFailures++;
+        if (gMapFailures == 1 || (gMapFailures % 100) == 0)
+            SLog(@"共享内存打开失败 errno=%d", errno);
+        return NO;
+    }
     struct stat st;
-    if (fstat(fd, &st) != 0 || (size_t)st.st_size < kFrameMapBytes) {
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
         close(fd);
+        gMapFailures++;
+        if (gMapFailures == 1 || (gMapFailures % 100) == 0)
+            SLog(@"共享内存检查失败 errno=%d", e);
+        return NO;
+    }
+    if ((size_t)st.st_size < kFrameMapBytes) {
+        size_t actual = (size_t)st.st_size;
+        close(fd);
+        gMapFailures++;
+        if (gMapFailures == 1 || (gMapFailures % 100) == 0)
+            SLog(@"共享内存尺寸不对 actual=%zu expected=%zu", actual, kFrameMapBytes);
         return NO;
     }
     void *map = mmap(NULL, kFrameMapBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
+        int e = errno;
         close(fd);
+        gMapFailures++;
+        if (gMapFailures == 1 || (gMapFailures % 100) == 0)
+            SLog(@"共享内存映射失败 errno=%d", e);
         return NO;
     }
     AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)map;
-    if (__atomic_load_n(&header->magic, __ATOMIC_ACQUIRE) != AUX_SHARED_FRAME_MAGIC ||
-        header->version != AUX_SHARED_FRAME_VERSION) {
+    uint32_t magic = __atomic_load_n(&header->magic, __ATOMIC_ACQUIRE);
+    if (magic != AUX_SHARED_FRAME_MAGIC || header->version != AUX_SHARED_FRAME_VERSION) {
+        uint32_t version = header->version;
         munmap(map, kFrameMapBytes);
         close(fd);
+        gMapFailures++;
+        if (gMapFailures == 1 || (gMapFailures % 100) == 0)
+            SLog(@"共享内存版本不对 magic=%u version=%u", magic, version);
         return NO;
     }
     gFrameFD = fd;
