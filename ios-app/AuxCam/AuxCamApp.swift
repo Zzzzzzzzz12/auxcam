@@ -818,34 +818,31 @@ final class StreamDecoder {
     }
 }
 
-// ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
-// AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 IOSurface 编号交给相机插件。
-// 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
+// ─────────────────────── Wi-Fi 视频分段接收层 ───────────────────────
+// 电脑把 OBS 原编码切成短 MP4 段；手机下载最新完整片段，用 AVAssetReader 解码，
+// 再把 IOSurface 编号交给相机替换插件。网络传输不会再次压缩画面。
 final class HLSFrameSource: NSObject, ObservableObject {
     @Published private(set) var frameCount: Int64 = 0
     @Published private(set) var fps: Double = 0
     @Published private(set) var status = "待机"
-    @Published private(set) var previewPlayer: AVPlayer?
 
     private static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
-    private static let logPath = "/var/mobile/Media/DCIM/.hls.log"
-    private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
-    private var player: AVPlayer?
-    private var output: AVPlayerItemVideoOutput?
-    private var displayLink: CADisplayLink?
+    private static let logPath = "/var/mobile/Media/DCIM/.network.log"
+    private let queue = DispatchQueue(label: "auxcam.network.frames", qos: .userInitiated)
+    private var timer: DispatchSourceTimer?
+    private var session: URLSession?
     private var retainedFrame: CVPixelBuffer?
     private var surfaceFD: Int32 = -1
-    private var deliveredFrames: Int64 = 0
-    private var reportFrames: Int64 = 0
-    private var lastReport = Date()
-    private var lastFrameAt = Date.distantPast
-    private var lastNoFrameReport = Date.distantPast
-    private var statusObservation: NSKeyValueObservation?
-    private var timeControlObservation: NSKeyValueObservation?
-    private var notificationTokens: [NSObjectProtocol] = []
-    private var lastPlaybackRecoveryAt = Date.distantPast
+    private var manifestURL: URL?
+    private var activeSegment: String?
+    private var lastSegment = ""
+    private var decodedFrames: Int64 = 0
+    private var lastManifestAt = Date.distantPast
+    private var lastErrorAt = Date.distantPast
 
     deinit {
+        timer?.cancel()
+        session?.invalidateAndCancel()
         if surfaceFD >= 0 { close(surfaceFD) }
     }
 
@@ -853,85 +850,18 @@ final class HLSFrameSource: NSObject, ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             self.stopOnQueue()
-            self.lastFrameAt = .distantPast
-            self.lastNoFrameReport = .distantPast
             self.log("start url=\(url.absoluteString)")
             self.setStatus("正在连接电脑")
-
-            let item = AVPlayerItem(url: url)
-            // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
-            // Let AVFoundation select a native pixel format for live HLS output.
-            let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-
-            let player = AVPlayer(playerItem: item)
-            player.isMuted = true
-            player.automaticallyWaitsToMinimizeStalling = true
-            self.player = player
-            self.output = output
-            DispatchQueue.main.async { self.previewPlayer = player }
-            self.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-                let value: String
-                switch item.status {
-                case .readyToPlay: value = "已连接，等待画面"
-                case .failed: value = "拉流失败：\(item.error?.localizedDescription ?? "未知错误")"
-                default: value = "正在连接电脑"
-                }
-                self?.log("item status=\(item.status.rawValue) error=\(item.error?.localizedDescription ?? "none")")
-                self?.setStatus(value)
-                guard item.status == .readyToPlay else { return }
-                let videoTracks = item.tracks.filter { $0.assetTrack?.mediaType == .video }
-                self?.log("ready tracks total=\(item.tracks.count) video=\(videoTracks.count) enabled=\(videoTracks.map(\.isEnabled))")
-                DispatchQueue.main.async { [weak self, weak player] in
-                    guard let self, let player, self.player === player else { return }
-                    // Attach the video output only after HLS has prepared the item.
-                    item.add(output)
-                    self.displayLink?.invalidate()
-                    let link = CADisplayLink(target: self, selector: #selector(self.displayLinkDidRefresh(_:)))
-                    self.displayLink = link
-                    link.add(to: .main, forMode: .common)
-                    player.playImmediately(atRate: 1.0)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                        guard let self,
-                              let window = UIApplication.shared.connectedScenes
-                                .compactMap({ $0 as? UIWindowScene })
-                                .flatMap({ $0.windows })
-                                .first(where: \.isKeyWindow) else { return }
-                        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
-                            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
-                        }
-                        let path = "/var/mobile/Media/DCIM/.preview.png"
-                        if let data = image.pngData(), (try? data.write(to: URL(fileURLWithPath: path))) != nil {
-                            self.log("preview screenshot saved size=\(data.count)")
-                        } else {
-                            self.log("preview screenshot failed")
-                        }
-                    }
-                }
-            }
-            self.timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
-                guard let self else { return }
-                let itemTime = player.currentItem?.currentTime().seconds ?? -1
-                self.log("player state timeControl=\(player.timeControlStatus.rawValue) rate=\(player.rate) itemTime=\(itemTime) waiting=\(String(describing: player.reasonForWaitingToPlay))")
-            }
-            self.notificationTokens.append(NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
-                    guard let self else { return }
-                    self.log("playback stalled")
-                    self.setStatus("网络卡顿，正在恢复")
-                    self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) {
-                        self.player?.play()
-                    }
-                })
-            self.notificationTokens.append(NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemNewAccessLogEntry, object: item, queue: nil) { [weak self] _ in
-                    guard let event = item.accessLog()?.events.last else { return }
-                    self?.log("access bytes=\(event.numberOfBytesTransferred) bitrate=\(event.observedBitrate) stalls=\(event.numberOfStalls)")
-                })
-
+            self.manifestURL = url
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            configuration.timeoutIntervalForRequest = 5
+            self.session = URLSession(configuration: configuration)
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(250), leeway: .milliseconds(40))
+            timer.setEventHandler { [weak self] in self?.pollLatestSegment() }
+            self.timer = timer
+            timer.resume()
         }
     }
 
@@ -945,7 +875,7 @@ final class HLSFrameSource: NSObject, ObservableObject {
 
     private func log(_ message: String) {
         let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-        StreamDecoder.dlog("HLS \(message)")
+        StreamDecoder.dlog("Network \(message)")
         let fd = open(Self.logPath, O_CREAT | O_WRONLY | O_APPEND, mode_t(0o666))
         guard fd >= 0 else { return }
         _ = line.withCString { Darwin.write(fd, $0, strlen($0)) }
@@ -953,58 +883,151 @@ final class HLSFrameSource: NSObject, ObservableObject {
     }
 
     private func stopOnQueue() {
-        DispatchQueue.main.sync {
-            displayLink?.invalidate()
-            displayLink = nil
-        }
-        statusObservation?.invalidate()
-        statusObservation = nil
-        timeControlObservation?.invalidate()
-        timeControlObservation = nil
-        notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
-        notificationTokens.removeAll()
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-        output = nil
+        timer?.cancel()
+        timer = nil
+        session?.invalidateAndCancel()
+        session = nil
+        manifestURL = nil
+        activeSegment = nil
+        lastSegment = ""
         retainedFrame = nil
-        deliveredFrames = 0
-        reportFrames = 0
-        lastReport = Date()
         DispatchQueue.main.async {
-            self.previewPlayer = nil
             self.frameCount = 0
             self.fps = 0
             self.status = "待机"
         }
     }
 
-    @objc private func displayLinkDidRefresh(_ link: CADisplayLink) {
-        copyLatestFrame(hostTime: CACurrentMediaTime())
+    private func pollLatestSegment() {
+        guard let manifestURL, let session,
+              activeSegment == nil,
+              Date().timeIntervalSince(lastManifestAt) >= 0.2 else { return }
+        lastManifestAt = Date()
+        var request = URLRequest(url: manifestURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            self.queue.async {
+                if let error {
+                    self.reportError("manifest: \(error.localizedDescription)")
+                    return
+                }
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let data,
+                      let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let name = manifest["name"] as? String,
+                      let path = manifest["url"] as? String else {
+                    self.reportError("电脑没有返回有效的视频信息")
+                    return
+                }
+                guard !name.isEmpty else {
+                    self.setStatus("电脑还没有收到 OBS 画面")
+                    return
+                }
+                guard name != self.lastSegment else { return }
+                guard let segmentURL = URL(string: path, relativeTo: manifestURL)?.absoluteURL else {
+                    self.reportError("电脑返回了无效的视频地址")
+                    return
+                }
+                self.activeSegment = name
+                self.setStatus("正在接收电脑画面")
+                self.log("segment begin name=\(name) bytes=\(manifest["size"] ?? "?")")
+                var segmentRequest = URLRequest(url: segmentURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+                segmentRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+                session.dataTask(with: segmentRequest) { [weak self] segmentData, segmentResponse, segmentError in
+                    guard let self else { return }
+                    self.queue.async {
+                        defer { self.activeSegment = nil }
+                        if let segmentError {
+                            self.reportError("下载视频失败：\(segmentError.localizedDescription)")
+                            return
+                        }
+                        guard let http = segmentResponse as? HTTPURLResponse, http.statusCode == 200,
+                              let segmentData, !segmentData.isEmpty else {
+                            self.reportError("电脑没有返回完整视频片段")
+                            return
+                        }
+                        self.decodeSegment(segmentData, name: name)
+                    }
+                }.resume()
+            }
+        }.resume()
     }
 
-    private func copyLatestFrame(hostTime: CFTimeInterval) {
-        recoverIfPlaybackStopped()
-        guard let output else { return }
-        var itemTime = output.itemTime(forHostTime: hostTime)
-        var hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
-        if !hasFrame, let current = player?.currentItem?.currentTime(), current.isValid {
-            itemTime = current
-            hasFrame = output.hasNewPixelBuffer(forItemTime: current)
-        }
-        guard hasFrame else {
-            reportNoFrame("no new pixel buffer", itemTime: itemTime)
-            return
-        }
-        guard let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
-            reportNoFrame("pixel buffer copy returned nil", itemTime: itemTime)
-            return
-        }
-        guard let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
-            reportNoFrame("pixel buffer has no IOSurface", itemTime: itemTime)
-            return
-        }
+    private func decodeSegment(_ data: Data, name: String) {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("auxcam-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: url) }
+        do {
+            try data.write(to: url, options: .atomic)
+            let asset = AVURLAsset(url: url)
+            guard let track = asset.tracks(withMediaType: .video).first else {
+                reportError("视频片段里没有画面")
+                return
+            }
+            let reader = try AVAssetReader(asset: asset)
+            let settings: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+            output.alwaysCopiesSampleData = false
+            guard reader.canAdd(output) else {
+                reportError("手机不能解码这个视频格式")
+                return
+            }
+            reader.add(output)
+            guard reader.startReading() else {
+                reportError("手机解码启动失败：\(reader.error?.localizedDescription ?? "未知错误")")
+                return
+            }
 
+            var firstPTS: Double?
+            var playbackStart = CACurrentMediaTime()
+            var segmentFrames = 0
+            var lastPTS = 0.0
+            while let sample = output.copyNextSampleBuffer() {
+                guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                if firstPTS == nil {
+                    firstPTS = pts.isFinite ? pts : 0
+                    playbackStart = CACurrentMediaTime()
+                }
+                let relativePTS = max(0, (pts.isFinite ? pts : (firstPTS ?? 0)) - (firstPTS ?? 0))
+                let wait = playbackStart + relativePTS - CACurrentMediaTime()
+                if wait > 0 { Thread.sleep(forTimeInterval: min(wait, 0.25)) }
+                guard publish(pixelBuffer) else { continue }
+                segmentFrames += 1
+                lastPTS = relativePTS
+            }
+            if reader.status == .failed {
+                reportError("手机解码失败：\(reader.error?.localizedDescription ?? "未知错误")")
+                return
+            }
+            guard segmentFrames > 0 else {
+                reportError("视频下载成功，但手机没有解出画面")
+                return
+            }
+            lastSegment = name
+            let duration = max(lastPTS, track.nominalFrameRate > 0 ? 1.0 / Double(track.nominalFrameRate) : 0.033)
+            let rate = Double(segmentFrames) / duration
+            decodedFrames += Int64(segmentFrames)
+            let total = decodedFrames
+            DispatchQueue.main.async {
+                self.frameCount = total
+                self.fps = rate
+                self.status = "电脑画面已接入"
+            }
+            log("segment decoded name=\(name) frames=\(segmentFrames) fps=\(String(format: "%.1f", rate)) size=\(track.naturalSize.width)x\(track.naturalSize.height)")
+        } catch {
+            reportError("读取视频失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func publish(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        guard let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
+            reportError("手机解出的画面不能共享给相机")
+            return false
+        }
         retainedFrame = pixelBuffer
         if surfaceFD < 0 {
             surfaceFD = open(Self.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
@@ -1017,69 +1040,23 @@ final class HLSFrameSource: NSObject, ObservableObject {
         }
         guard surfaceFD >= 0 else {
             setStatus("无法发布相机画面")
-            return
+            return false
         }
         let contents = String(format: "id=%010u\n", IOSurfaceGetID(surface))
         let written = contents.withCString { pwrite(surfaceFD, $0, 14, 0) }
         guard written == 14 else {
             setStatus("发布相机画面失败")
-            return
+            return false
         }
-
-        deliveredFrames += 1
-        lastFrameAt = Date()
-        if deliveredFrames == 1 { log("first decoded frame width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer))") }
-        let now = Date()
-        if now.timeIntervalSince(lastReport) >= 1 {
-            let elapsed = now.timeIntervalSince(lastReport)
-            let rate = Double(deliveredFrames - reportFrames) / elapsed
-            let currentFrameCount = deliveredFrames
-            reportFrames = deliveredFrames
-            lastReport = now
-            DispatchQueue.main.async {
-                self.frameCount = currentFrameCount
-                self.fps = rate
-                self.status = rate > 0 ? "电脑画面已接入" : "等待电脑画面"
-            }
-        }
+        return true
     }
 
-    // HLS 的直播清单会持续滚动；iOS 偶尔会在旧分段末尾进入 paused，主动追到最新可播位置。
-    private func recoverIfPlaybackStopped() {
-        guard let player, let item = player.currentItem, item.status == .readyToPlay,
-              player.timeControlStatus == .paused,
-              Date().timeIntervalSince(lastPlaybackRecoveryAt) >= 2 else { return }
-        lastPlaybackRecoveryAt = Date()
-
-        if let range = item.seekableTimeRanges.last?.timeRangeValue {
-            let end = CMTimeRangeGetEnd(range)
-            let target = CMTimeSubtract(end, CMTime(seconds: 1, preferredTimescale: 600))
-            if end.isValid, target.isValid, CMTimeCompare(target, range.start) >= 0 {
-                log("player recovery seek live edge target=\(target.seconds) end=\(end.seconds)")
-                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak player] finished in
-                    if finished { player?.playImmediately(atRate: 1.0) }
-                }
-                return
-            }
-        }
-
-        log("player recovery resume currentTime=\(player.currentTime().seconds)")
-        player.playImmediately(atRate: 1.0)
-    }
-
-    private func reportNoFrame(_ reason: String, itemTime: CMTime) {
+    private func reportError(_ message: String) {
         let now = Date()
-        guard now.timeIntervalSince(lastFrameAt) > 5 && now.timeIntervalSince(lastNoFrameReport) > 5 else { return }
-        lastNoFrameReport = now
-        let item = player?.currentItem
-        let error = item?.error?.localizedDescription ?? "none"
-        let access = item?.accessLog()?.events.last
-        log("no frame reason=\(reason) itemStatus=\(item?.status.rawValue ?? -1) playerStatus=\(player?.status.rawValue ?? -1) timeControl=\(player?.timeControlStatus.rawValue ?? -1) rate=\(player?.rate ?? -1) itemTime=\(itemTime.seconds) bytes=\(access?.numberOfBytesTransferred ?? -1) error=\(error)")
-        if item?.status == .failed {
-            setStatus("拉流失败：\(error)")
-        } else if item?.status == .readyToPlay {
-            setStatus("已连接，暂时没有画面")
-        }
+        guard now.timeIntervalSince(lastErrorAt) >= 3 else { return }
+        lastErrorAt = now
+        log("error \(message)")
+        setStatus(message)
     }
 }
 
@@ -1502,15 +1479,17 @@ struct ContentView: View {
     private var preview: some View {
         ZStack {
             Color.black
-            if fakeCameraOn && usingHLSSource, let player = hlsSource.previewPlayer {
-                VideoPlayer(player: player)
-                    .allowsHitTesting(false)
-            } else if fakeCameraOn {
+            if fakeCameraOn {
                 VStack(spacing: 10) {
-                    Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
+                    Image(systemName: usingStreamSource ? (usingHLSSource ? "wifi" : "cable.connector") : "play.rectangle.fill")
                         .font(.system(size: 38))
-                    Text(usingStreamSource ? "电脑实时流已启用" : "素材视频已启用")
+                    Text(usingHLSSource ? hlsSource.status : (usingStreamSource ? "电脑实时流已启用" : "素材视频已启用"))
                         .font(.headline)
+                    if usingHLSSource && hlsSource.fps > 0 {
+                        Text("已解出 \(hlsSource.frameCount) 帧 · \(Int(hlsSource.fps)) 帧/秒")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
                     Text("切换到相机或直播 App 查看输出")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
@@ -1577,7 +1556,7 @@ struct ContentView: View {
             HStack {
                 Text("电脑直播地址").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                TextField("http://电脑IP:8899/obs/live.m3u8", text: streamURLBinding)
+                TextField("http://电脑IP:8899/push/latest.json", text: streamURLBinding)
                     .font(.caption2)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
@@ -1705,7 +1684,10 @@ struct ContentView: View {
     private func boot() {
         // 老版本保存的是电脑 IP；首次升级时把它带到新的完整直播地址设置里。
         if UserDefaults.standard.object(forKey: "streamURL") == nil {
-            streamURL = "http://\(pcIP):8899/obs/live.m3u8"
+            streamURL = "http://\(pcIP):8899/push/latest.json"
+        } else if streamURL.hasSuffix("/obs/live.m3u8") {
+            // 把旧版 HLS 地址自动迁移到新的视频分段接口，保留原来的电脑 IP。
+            streamURL = String(streamURL.dropLast("/obs/live.m3u8".count)) + "/push/latest.json"
         }
         if let savedMode = Link.savedNetworkMode() {
             netMode = savedMode
@@ -1924,7 +1906,7 @@ struct ContentView: View {
         try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
-    // USB 直连用 VCU1 解码帧；局域网用 AVPlayer 拉 HLS 并发布 IOSurface；相册仍走文件模式。
+    // USB 直连用 VCU1；局域网下载电脑生成的短 MP4 片段并解码；相册仍走文件模式。
     private func vcamControl(_ on: Bool) {
         let path = "/var/mobile/Media/DCIM/vcam.mp4"
         let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
@@ -1966,7 +1948,7 @@ struct ContentView: View {
                 try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
                 try setStreamMode(true)
                 if useHLS, let url = URL(string: builtURL) {
-                    StreamDecoder.dlog("HLS start requested \(url.absoluteString)")
+                    StreamDecoder.dlog("network stream start requested \(url.absoluteString)")
                     hlsSource.start(url: url)
                 } else {
                     hlsSource.stop()
