@@ -858,7 +858,7 @@ final class HLSFrameSource: NSObject, ObservableObject {
             self.log("start url=\(url.absoluteString)")
             self.setStatus("正在连接电脑")
 
-            let item = AVPlayerItem(url: URL(fileURLWithPath: "/var/mobile/Media/DCIM/avplayer-test.mp4"))
+            let item = AVPlayerItem(url: url)
             // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
             // Let AVFoundation select a native pixel format for live HLS output.
             let attributes: [String: Any] = [
@@ -894,6 +894,22 @@ final class HLSFrameSource: NSObject, ObservableObject {
                     self.displayLink = link
                     link.add(to: .main, forMode: .common)
                     player.playImmediately(atRate: 1.0)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                        guard let self,
+                              let window = UIApplication.shared.connectedScenes
+                                .compactMap({ $0 as? UIWindowScene })
+                                .flatMap({ $0.windows })
+                                .first(where: \.isKeyWindow) else { return }
+                        let image = UIGraphicsImageRenderer(bounds: window.bounds).image { _ in
+                            window.drawHierarchy(in: window.bounds, afterScreenUpdates: true)
+                        }
+                        let path = "/var/mobile/Media/DCIM/.preview.png"
+                        if let data = image.pngData(), (try? data.write(to: URL(fileURLWithPath: path))) != nil {
+                            self.log("preview screenshot saved size=\(data.count)")
+                        } else {
+                            self.log("preview screenshot failed")
+                        }
+                    }
                 }
             }
             self.timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
