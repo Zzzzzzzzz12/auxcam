@@ -832,7 +832,7 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
     private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
     private var player: AVPlayer?
     private var output: AVPlayerItemVideoOutput?
-    private var timer: DispatchSourceTimer?
+    private var displayLink: CADisplayLink?
     private var retainedFrame: CVPixelBuffer?
     private var surfaceFD: Int32 = -1
     private var deliveredFrames: Int64 = 0
@@ -846,7 +846,6 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
     private var lastPlaybackRecoveryAt = Date.distantPast
 
     deinit {
-        timer?.cancel()
         if surfaceFD >= 0 { close(surfaceFD) }
     }
 
@@ -866,8 +865,6 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-            item.add(output)
-            output.setDelegate(self, queue: self.queue)
 
             let player = AVPlayer(playerItem: item)
             player.isMuted = true
@@ -884,6 +881,19 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
                 }
                 self?.log("item status=\(item.status.rawValue) error=\(item.error?.localizedDescription ?? "none")")
                 self?.setStatus(value)
+                guard item.status == .readyToPlay else { return }
+                DispatchQueue.main.async { [weak self, weak player] in
+                    guard let self, let player, self.player === player else { return }
+                    // Attach the video output only after HLS has prepared the item.
+                    item.add(output)
+                    output.setDelegate(self, queue: self.queue)
+                    self.displayLink?.invalidate()
+                    let link = CADisplayLink(target: self, selector: #selector(self.displayLinkDidRefresh(_:)))
+                    self.displayLink = link
+                    link.add(to: .main, forMode: .common)
+                    player.playImmediately(atRate: 1.0)
+                    output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
+                }
             }
             self.timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
                 guard let self else { return }
@@ -905,13 +915,6 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
                     self?.log("access bytes=\(event.numberOfBytesTransferred) bitrate=\(event.observedBitrate) stalls=\(event.numberOfStalls)")
                 })
 
-            let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(33), leeway: .milliseconds(2))
-            timer.setEventHandler { [weak self] in self?.copyLatestFrame() }
-            self.timer = timer
-            timer.resume()
-            player.playImmediately(atRate: 1.0)
-            output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
         }
     }
 
@@ -941,9 +944,10 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
     }
 
     private func stopOnQueue() {
-        timer?.setEventHandler {}
-        timer?.cancel()
-        timer = nil
+        DispatchQueue.main.sync {
+            displayLink?.invalidate()
+            displayLink = nil
+        }
         statusObservation?.invalidate()
         statusObservation = nil
         timeControlObservation?.invalidate()
@@ -966,19 +970,24 @@ final class HLSFrameSource: NSObject, ObservableObject, AVPlayerItemOutputPullDe
         }
     }
 
-    private func copyLatestFrame() {
+    @objc private func displayLinkDidRefresh(_ link: CADisplayLink) {
+        copyLatestFrame(hostTime: CACurrentMediaTime())
+    }
+
+    private func copyLatestFrame(hostTime: CFTimeInterval) {
         recoverIfPlaybackStopped()
-        guard let output, let current = player?.currentItem?.currentTime(), current.isValid else { return }
-        // HLS has its own live timeline; use AVPlayer's current time instead of mapping the system host clock.
-        let itemTime = current
-        let hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
+        guard let output else { return }
+        var itemTime = output.itemTime(forHostTime: hostTime)
+        var hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
+        if !hasFrame, let current = player?.currentItem?.currentTime(), current.isValid {
+            itemTime = current
+            hasFrame = output.hasNewPixelBuffer(forItemTime: current)
+        }
         guard hasFrame else {
             reportNoFrame("no new pixel buffer", itemTime: itemTime)
             return
         }
-        var displayTime = CMTime.invalid
-        let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime)
-        guard let pixelBuffer else {
+        guard let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
             reportNoFrame("pixel buffer copy returned nil", itemTime: itemTime)
             return
         }
