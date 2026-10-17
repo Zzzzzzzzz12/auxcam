@@ -15,7 +15,7 @@ static int32_t makeDecoder(AuxH264Decoder *decoder) {
     parameters.uiTargetDqLayer = UCHAR_MAX;
     parameters.eEcActiveIdc = ERROR_CON_SLICE_COPY;
     parameters.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-    if (decoder->api->Initialize(decoder->api, &parameters) != 0) {
+    if ((*decoder->api)->Initialize(decoder->api, &parameters) != 0) {
         WelsDestroyDecoder(decoder->api);
         decoder->api = NULL;
         return -2;
@@ -37,7 +37,7 @@ void auxh264_destroy(void *opaque) {
     AuxH264Decoder *decoder = (AuxH264Decoder *)opaque;
     if (decoder == NULL) return;
     if (decoder->api != NULL) {
-        decoder->api->Uninitialize(decoder->api);
+        (*decoder->api)->Uninitialize(decoder->api);
         WelsDestroyDecoder(decoder->api);
     }
     free(decoder);
@@ -52,7 +52,7 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     SBufferInfo info;
     unsigned char *planes[3] = { NULL, NULL, NULL };
     memset(&info, 0, sizeof(info));
-    DECODING_STATE state = decoder->api->DecodeFrameNoDelay(
+    DECODING_STATE state = (*decoder->api)->DecodeFrameNoDelay(
         decoder->api, bytes, length, planes, &info);
     if (state != dsErrorFree) return -2;
     if (info.iBufferStatus != 1) return 0;
