@@ -403,8 +403,7 @@ final class StreamDecoder {
             var callback = VTDecompressionOutputCallbackRecord(
                 decompressionOutputCallback: StreamDecoder.goldenCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
-            let imageAttributes: [String: Any] = [
-            ]
+            let imageAttributes: [String: Any] = [:]
             let createStatus = VTDecompressionSessionCreate(
                 allocator: kCFAllocatorDefault, formatDescription: format,
                 decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
