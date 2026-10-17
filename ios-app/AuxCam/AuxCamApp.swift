@@ -2,6 +2,7 @@
 // 人只按一下「开始视频直播」，其余全部手机自动：
 //   自动唤醒相机进程 → 自动注入 → 自动进直连 → 断流自动重连 → 卡顿自动换路 → 四态自动显示
 import SwiftUI
+import AVKit
 import AVFoundation
 import PhotosUI
 import CoreTransferable
@@ -824,6 +825,7 @@ final class HLSFrameSource: ObservableObject {
     @Published private(set) var frameCount: Int64 = 0
     @Published private(set) var fps: Double = 0
     @Published private(set) var status = "待机"
+    @Published private(set) var previewPlayer: AVPlayer?
 
     private static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
     private static let logPath = "/var/mobile/Media/DCIM/.hls.log"
@@ -870,6 +872,7 @@ final class HLSFrameSource: ObservableObject {
             player.automaticallyWaitsToMinimizeStalling = false
             self.player = player
             self.output = output
+            DispatchQueue.main.async { self.previewPlayer = player }
             self.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
                 let value: String
                 switch item.status {
@@ -938,6 +941,7 @@ final class HLSFrameSource: ObservableObject {
         reportFrames = 0
         lastReport = Date()
         DispatchQueue.main.async {
+            self.previewPlayer = nil
             self.frameCount = 0
             self.fps = 0
             self.status = "待机"
@@ -1440,7 +1444,10 @@ struct ContentView: View {
     private var preview: some View {
         ZStack {
             Color.black
-            if fakeCameraOn {
+            if fakeCameraOn && usingHLSSource, let player = hlsSource.previewPlayer {
+                VideoPlayer(player: player)
+                    .allowsHitTesting(false)
+            } else if fakeCameraOn {
                 VStack(spacing: 10) {
                     Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
                         .font(.system(size: 38))
