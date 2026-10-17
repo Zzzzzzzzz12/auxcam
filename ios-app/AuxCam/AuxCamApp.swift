@@ -609,6 +609,11 @@ final class StreamDecoder {
                 var cb = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+                // 先用 VideoToolbox 软件解码做兼容性验证。手机收到的 OBS H.264
+                // 不会因此重新编码，画质和 USB 传输内容不变。
+                let decoderSpecification: [String: Any] = [
+                    kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: false
+                ]
                 // 明确使用相机链路最常见的 NV12 格式，并要求 IOSurface backing，
                 // 让解码出的同一块画面可以直接交给相机替换插件。
                 let imageAttributes: [String: Any] = [
@@ -617,11 +622,16 @@ final class StreamDecoder {
                 ]
                 let vtSt = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault, formatDescription: f,
-                    decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
+                    decoderSpecification: decoderSpecification as CFDictionary, imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &cb, decompressionSessionOut: &session)
                 if vtSt == noErr, let session {
                     sessionGeneration += 1
                     VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+                    var hardwareValue: CFTypeRef?
+                    let hardwareStatus = VTSessionCopyProperty(
+                        session, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                        allocator: kCFAllocatorDefault, valueOut: &hardwareValue)
+                    StreamDecoder.dlog("build: hardware decoder property st=\(hardwareStatus) value=\(String(describing: hardwareValue))")
                 }
                 StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil) generation=\(sessionGeneration)")
             }
