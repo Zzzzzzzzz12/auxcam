@@ -2,7 +2,6 @@
 // 人只按一下「开始视频直播」，其余全部手机自动：
 //   自动唤醒相机进程 → 自动注入 → 自动进直连 → 断流自动重连 → 卡顿自动换路 → 四态自动显示
 import SwiftUI
-import AVKit
 import AVFoundation
 import PhotosUI
 import CoreTransferable
@@ -26,22 +25,8 @@ struct Link {
     static var dcimStatURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.stat") }
     static var esURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.h264") }
     static var streamCfgURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.cfg") }
-    static var networkModeURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.network") }
     static var vcamURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4") }
     static var videoURL: URL { docs.appendingPathComponent("picked.mp4") }
-
-    static func savedNetworkMode() -> Bool? {
-        guard let value = try? String(contentsOf: networkModeURL, encoding: .utf8) else { return nil }
-        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "wifi", "1": return true
-        case "usb", "0": return false
-        default: return nil
-        }
-    }
-
-    static func saveNetworkMode(_ enabled: Bool) {
-        try? (enabled ? "wifi\n" : "usb\n").write(to: networkModeURL, atomically: true, encoding: .utf8)
-    }
 
     static func send(_ lines: [String: String]) {
         var t = ""
@@ -271,6 +256,7 @@ final class StreamDecoder {
     private var fmt: CMVideoFormatDescription?
     private var sps = Data()
     private var pps = Data()
+    private var frameIndex: Int64 = 0
     private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
     private let outputLock = NSLock()
     private var retainedFrame: CVPixelBuffer?
@@ -278,7 +264,6 @@ final class StreamDecoder {
     private var callbackCount = 0
     private var lastCallbackStatus: OSStatus = noErr
     private var waitingForKeyframe = true
-    private var frameIndex: Int64 = 0
     private var decodeCallCount: Int64 = 0
     private var activeDecodeCall: Int64 = 0
     private var sessionGeneration: Int64 = 0
@@ -325,10 +310,11 @@ final class StreamDecoder {
         testGoldenPath()
     }
 
-    // 用手机上的标准 MP4 测 AVAssetReader 能否直接解出 IOSurface，作为 USB 硬解路径的对照。
-    // 收到首个 VCU1 配置后只运行一次，诊断结果写进 .dec.log。
+    // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
+    // 这条路径不改 sample、不使用实时 session，也不把测试帧发布给相机插件。
+    // 收到首个 VCU1 配置后自动在 utility 队列运行一次，避免影响主线程和实时解码队列。
     func testGoldenPath() {
-        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/avplayer-test.mp4")
+        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4")
         guard FileManager.default.fileExists(atPath: url.path) else {
             StreamDecoder.dlog("golden skipped: vcam.mp4 not found")
             return
@@ -379,12 +365,9 @@ final class StreamDecoder {
         StreamDecoder.dlog("golden begin path=\(url.path)")
         var reader: AVAssetReader?
         var decoderSession: VTDecompressionSession?
-        let probe = GoldenProbe()
         defer {
+            if let decoderSession { VTDecompressionSessionInvalidate(decoderSession) }
             reader?.cancelReading()
-            if let decoderSession {
-                VTDecompressionSessionInvalidate(decoderSession)
-            }
         }
 
         do {
@@ -395,8 +378,7 @@ final class StreamDecoder {
             }
             let r = try AVAssetReader(asset: asset)
             reader = r
-            // 不让 AVAssetReader 先解码。取出容器中标准的压缩 CMSampleBuffer，
-            // 直接交给 VT，与下面 USB 手工组装的 sample 做对照。
+            // nil 表示读取 MP4 中原始压缩样本；不让 AVAssetReader 先解码/转码。
             let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
             output.alwaysCopiesSampleData = false
             guard r.canAdd(output) else {
@@ -408,37 +390,45 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: startReading status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            var compressedSample: CMSampleBuffer?
-            let readDeadline = Date().addingTimeInterval(5)
-            while compressedSample == nil && r.status == .reading && Date() < readDeadline {
-                compressedSample = output.copyNextSampleBuffer()
-                if compressedSample == nil { Thread.sleep(forTimeInterval: 0.01) }
-            }
-            guard let sample = compressedSample,
-                  let format = CMSampleBufferGetFormatDescription(sample) else {
-                StreamDecoder.dlog("golden failed: no compressed sample status=\(String(describing: r.status)) error=\(String(describing: r.error))")
+            guard let sample = output.copyNextSampleBuffer() else {
+                StreamDecoder.dlog("golden failed: no first sample readerStatus=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
+            guard let format = CMSampleBufferGetFormatDescription(sample) else {
+                StreamDecoder.dlog("golden failed: sample has no video format description")
+                return
+            }
+
+            StreamDecoder.dlog("golden format \(Self.formatSummary(format))")
+            StreamDecoder.dlog("golden sample \(Self.sampleSummary(sample))")
+            goldenDiffLock.lock()
+            goldenFormatFields = Self.formatFields(format)
+            goldenSampleFields = Self.sampleFields(sample)
+            goldenDiffLock.unlock()
+            let probe = GoldenProbe()
             var callback = VTDecompressionOutputCallbackRecord(
                 decompressionOutputCallback: StreamDecoder.goldenCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
-            let outputAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            let imageAttributes: [String: Any] = [
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
             let createStatus = VTDecompressionSessionCreate(
                 allocator: kCFAllocatorDefault, formatDescription: format,
-                decoderSpecification: nil, imageBufferAttributes: outputAttributes as CFDictionary,
+                decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
                 outputCallback: &callback, decompressionSessionOut: &decoderSession)
-            guard createStatus == noErr, let decoderSession else {
-                StreamDecoder.dlog("golden failed: VT session create=\(createStatus)")
+            guard createStatus == noErr, let session = decoderSession else {
+                StreamDecoder.dlog("golden create failed status=\(createStatus) session=\(decoderSession != nil)")
                 return
             }
-            var decodeInfo = VTDecodeInfoFlags()
+            VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+
+            var info = VTDecodeInfoFlags()
+            StreamDecoder.dlog("golden DecodeFrame begin sample=\(Self.sampleSummary(sample))")
             let decodeStatus = VTDecompressionSessionDecodeFrame(
-                decoderSession, sampleBuffer: sample, flags: [], frameRefcon: nil,
-                infoFlagsOut: &decodeInfo)
-            StreamDecoder.dlog("golden compressed sample decode vt=\(decodeStatus) info=\(decodeInfo.rawValue) \(probe.summary())")
+                session, sampleBuffer: sample, flags: [], frameRefcon: nil, infoFlagsOut: &info)
+            StreamDecoder.dlog("golden DecodeFrame returned status=\(decodeStatus) info=\(info.rawValue)")
+            let waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(session)
+            StreamDecoder.dlog("golden result create=\(createStatus) decode=\(decodeStatus) wait=\(waitStatus) \(probe.summary())")
         } catch {
             StreamDecoder.dlog("golden failed: \(error.localizedDescription)")
         }
@@ -568,7 +558,7 @@ final class StreamDecoder {
         if status != noErr { waitingForKeyframe = true }
         guard status == noErr, let imageBuffer else {
             outputLock.unlock()
-            if status != noErr || count <= 3 || count % 90 == 0 {
+            if count <= 3 || count % 90 == 0 {
                 StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=\(status)")
             }
             return
@@ -636,29 +626,18 @@ final class StreamDecoder {
                 var cb = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-                // 先用 VideoToolbox 软件解码做兼容性验证。手机收到的 OBS H.264
-                // 不会因此重新编码，画质和 USB 传输内容不变。
-                let decoderSpecification: [String: Any] = [
-                    kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: false
-                ]
-                // 明确使用相机链路最常见的 NV12 格式，并要求 IOSurface backing，
-                // 让解码出的同一块画面可以直接交给相机替换插件。
+                // 明确要求 IOSurface backing；不限制像素格式，让 VideoToolbox
+                // 选择设备原生的解码输出格式。
                 let imageAttributes: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
                     kCVPixelBufferIOSurfacePropertiesKey as String: [:]
                 ]
                 let vtSt = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault, formatDescription: f,
-                    decoderSpecification: decoderSpecification as CFDictionary, imageBufferAttributes: imageAttributes as CFDictionary,
+                    decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &cb, decompressionSessionOut: &session)
                 if vtSt == noErr, let session {
                     sessionGeneration += 1
                     VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-                    var hardwareValue: CFTypeRef?
-                    let hardwareStatus = VTSessionCopyProperty(
-                        session, key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-                        allocator: kCFAllocatorDefault, valueOut: &hardwareValue)
-                    StreamDecoder.dlog("build: hardware decoder property st=\(hardwareStatus) value=\(String(describing: hardwareValue))")
                 }
                 StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil) generation=\(sessionGeneration)")
             }
@@ -735,30 +714,24 @@ final class StreamDecoder {
             return
         }
         var sb: CMSampleBuffer?
-        // 每帧带正常的 30fps 时间戳；VideoToolbox 收到无时间的压缩帧会报坏帧。
+        // 带有效 timing（iOS 解码器无 timing 也判坏数据）
+        var tsIdx = Int64(frameIndex)
+        let pts = CMTime(value: tsIdx, timescale: 30)
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMTime(value: frameIndex, timescale: 30),
-            decodeTimeStamp: CMTime.invalid)
-        frameIndex += 1
+            presentationTimeStamp: pts,
+            decodeTimeStamp: pts)
         var sampleSize = total
         let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize, sampleBufferOut: &sb)
+        frameIndex += 1
         if let sb {
-            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
-               CFArrayGetCount(attachments) > 0,
-               let item = CFArrayGetValueAtIndex(attachments, 0) {
-                let attachment = unsafeBitCast(item, to: CFMutableDictionary.self)
-                CFDictionarySetValue(
-                    attachment,
-                    Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
-                    Unmanaged.passUnretained(hasIDR ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
-                CFDictionarySetValue(
-                    attachment,
-                    Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                    Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? NSMutableArray,
+               attachments.count > 0,
+               let attachment = attachments[0] as? NSMutableDictionary {
+                attachment[kCMSampleAttachmentKey_NotSync as String] = NSNumber(value: !hasIDR)
             }
             decodeCallCount += 1
             let callIndex = decodeCallCount
@@ -775,7 +748,7 @@ final class StreamDecoder {
             var decodeInfo = VTDecodeInfoFlags()
             let decodeStatus = VTDecompressionSessionDecodeFrame(
                 session, sampleBuffer: sb, flags: [],
-                frameRefcon: nil,
+                frameRefcon: UnsafeMutableRawPointer(bitPattern: Int(callIndex)),
                 infoFlagsOut: &decodeInfo)
             let outputStatus = callbackStatus()
             outputLock.lock()
@@ -831,31 +804,29 @@ final class StreamDecoder {
     }
 }
 
-// ─────────────────────── Wi-Fi 视频分段接收层 ───────────────────────
-// 电脑把 OBS 原编码切成短 MP4 段；手机下载最新完整片段，用 AVAssetReader 解码，
-// 再把 IOSurface 编号交给相机替换插件。网络传输不会再次压缩画面。
-final class HLSFrameSource: NSObject, ObservableObject {
+// ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
+// AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 IOSurface 编号交给相机插件。
+// 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
+final class HLSFrameSource: ObservableObject {
     @Published private(set) var frameCount: Int64 = 0
     @Published private(set) var fps: Double = 0
     @Published private(set) var status = "待机"
 
     private static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
-    private static let logPath = "/var/mobile/Media/DCIM/.network.log"
-    private let queue = DispatchQueue(label: "auxcam.network.frames", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
+    private var player: AVPlayer?
+    private var output: AVPlayerItemVideoOutput?
     private var timer: DispatchSourceTimer?
-    private var session: URLSession?
     private var retainedFrame: CVPixelBuffer?
     private var surfaceFD: Int32 = -1
-    private var manifestURL: URL?
-    private var activeSegment: String?
-    private var lastSegment = ""
-    private var decodedFrames: Int64 = 0
-    private var lastManifestAt = Date.distantPast
-    private var lastErrorAt = Date.distantPast
+    private var deliveredFrames: Int64 = 0
+    private var reportFrames: Int64 = 0
+    private var lastReport = Date()
+    private var statusObservation: NSKeyValueObservation?
+    private var notificationTokens: [NSObjectProtocol] = []
 
     deinit {
         timer?.cancel()
-        session?.invalidateAndCancel()
         if surfaceFD >= 0 { close(surfaceFD) }
     }
 
@@ -863,18 +834,47 @@ final class HLSFrameSource: NSObject, ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             self.stopOnQueue()
-            self.log("start url=\(url.absoluteString)")
             self.setStatus("正在连接电脑")
-            self.manifestURL = url
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            configuration.timeoutIntervalForRequest = 5
-            self.session = URLSession(configuration: configuration)
+
+            let item = AVPlayerItem(url: url)
+            // 短缓冲优先降低延迟；网络抖动时由播放器自动恢复。
+            item.preferredForwardBufferDuration = 0.25
+            let attributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+            item.add(output)
+
+            let player = AVPlayer(playerItem: item)
+            player.isMuted = true
+            player.automaticallyWaitsToMinimizeStalling = false
+            self.player = player
+            self.output = output
+            self.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+                let value: String
+                switch item.status {
+                case .readyToPlay: value = "已连接，等待画面"
+                case .failed: value = "拉流失败：\(item.error?.localizedDescription ?? "未知错误")"
+                default: value = "正在连接电脑"
+                }
+                self?.setStatus(value)
+            }
+            self.notificationTokens.append(NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
+                    guard let self else { return }
+                    self.setStatus("网络卡顿，正在恢复")
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) {
+                        self.player?.play()
+                    }
+                })
+
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now(), repeating: .milliseconds(250), leeway: .milliseconds(40))
-            timer.setEventHandler { [weak self] in self?.pollLatestSegment() }
+            timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(33), leeway: .milliseconds(2))
+            timer.setEventHandler { [weak self] in self?.copyLatestFrame() }
             self.timer = timer
             timer.resume()
+            player.play()
         }
     }
 
@@ -886,24 +886,22 @@ final class HLSFrameSource: NSObject, ObservableObject {
         DispatchQueue.main.async { self.status = value }
     }
 
-    private func log(_ message: String) {
-        let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-        StreamDecoder.dlog("Network \(message)")
-        let fd = open(Self.logPath, O_CREAT | O_WRONLY | O_APPEND, mode_t(0o666))
-        guard fd >= 0 else { return }
-        _ = line.withCString { Darwin.write(fd, $0, strlen($0)) }
-        close(fd)
-    }
-
     private func stopOnQueue() {
+        timer?.setEventHandler {}
         timer?.cancel()
         timer = nil
-        session?.invalidateAndCancel()
-        session = nil
-        manifestURL = nil
-        activeSegment = nil
-        lastSegment = ""
+        statusObservation?.invalidate()
+        statusObservation = nil
+        notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        notificationTokens.removeAll()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        output = nil
         retainedFrame = nil
+        deliveredFrames = 0
+        reportFrames = 0
+        lastReport = Date()
         DispatchQueue.main.async {
             self.frameCount = 0
             self.fps = 0
@@ -911,165 +909,43 @@ final class HLSFrameSource: NSObject, ObservableObject {
         }
     }
 
-    private func pollLatestSegment() {
-        guard let manifestURL, let session,
-              activeSegment == nil,
-              Date().timeIntervalSince(lastManifestAt) >= 0.2 else { return }
-        lastManifestAt = Date()
-        var request = URLRequest(url: manifestURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 5)
-        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        session.dataTask(with: request) { [weak self] data, response, error in
-            guard let self else { return }
-            self.queue.async {
-                if let error {
-                    self.reportError("manifest: \(error.localizedDescription)")
-                    return
-                }
-                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data,
-                      let manifest = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let name = manifest["name"] as? String,
-                      let path = manifest["url"] as? String else {
-                    self.reportError("电脑没有返回有效的视频信息")
-                    return
-                }
-                guard !name.isEmpty else {
-                    self.setStatus("电脑还没有收到 OBS 画面")
-                    return
-                }
-                guard name != self.lastSegment else { return }
-                guard let segmentURL = URL(string: path, relativeTo: manifestURL)?.absoluteURL else {
-                    self.reportError("电脑返回了无效的视频地址")
-                    return
-                }
-                self.activeSegment = name
-                self.setStatus("正在接收电脑画面")
-                self.log("segment begin name=\(name) bytes=\(manifest["size"] ?? "?")")
-                var segmentRequest = URLRequest(url: segmentURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
-                segmentRequest.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-                session.dataTask(with: segmentRequest) { [weak self] segmentData, segmentResponse, segmentError in
-                    guard let self else { return }
-                    self.queue.async {
-                        defer { self.activeSegment = nil }
-                        if let segmentError {
-                            self.reportError("下载视频失败：\(segmentError.localizedDescription)")
-                            return
-                        }
-                        guard let http = segmentResponse as? HTTPURLResponse, http.statusCode == 200,
-                              let segmentData, !segmentData.isEmpty else {
-                            self.reportError("电脑没有返回完整视频片段")
-                            return
-                        }
-                        self.decodeSegment(segmentData, name: name)
-                    }
-                }.resume()
-            }
-        }.resume()
-    }
+    private func copyLatestFrame() {
+        guard let output else { return }
+        let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
+        guard output.hasNewPixelBuffer(forItemTime: itemTime),
+              let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil),
+              let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else { return }
 
-    private func decodeSegment(_ data: Data, name: String) {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("auxcam-\(UUID().uuidString).mp4")
-        defer { try? FileManager.default.removeItem(at: url) }
-        do {
-            try data.write(to: url, options: .atomic)
-            let asset = AVURLAsset(url: url)
-            guard let track = asset.tracks(withMediaType: .video).first else {
-                reportError("视频片段里没有画面")
-                return
-            }
-            let reader = try AVAssetReader(asset: asset)
-            let settings: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
-            output.alwaysCopiesSampleData = false
-            guard reader.canAdd(output) else {
-                reportError("手机不能解码这个视频格式")
-                return
-            }
-            reader.add(output)
-            guard reader.startReading() else {
-                reportError("手机解码启动失败：\(reader.error?.localizedDescription ?? "未知错误")")
-                return
-            }
-
-            var firstPTS: Double?
-            var playbackStart = CACurrentMediaTime()
-            var segmentFrames = 0
-            var lastPTS = 0.0
-            while let sample = output.copyNextSampleBuffer() {
-                guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
-                let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-                if firstPTS == nil {
-                    firstPTS = pts.isFinite ? pts : 0
-                    playbackStart = CACurrentMediaTime()
-                }
-                let relativePTS = max(0, (pts.isFinite ? pts : (firstPTS ?? 0)) - (firstPTS ?? 0))
-                let wait = playbackStart + relativePTS - CACurrentMediaTime()
-                if wait > 0 { Thread.sleep(forTimeInterval: min(wait, 0.25)) }
-                guard publish(pixelBuffer) else { continue }
-                segmentFrames += 1
-                lastPTS = relativePTS
-            }
-            if reader.status == .failed {
-                reportError("手机解码失败：\(reader.error?.localizedDescription ?? "未知错误")")
-                return
-            }
-            guard segmentFrames > 0 else {
-                reportError("视频下载成功，但手机没有解出画面")
-                return
-            }
-            lastSegment = name
-            let duration = max(lastPTS, track.nominalFrameRate > 0 ? 1.0 / Double(track.nominalFrameRate) : 0.033)
-            let rate = Double(segmentFrames) / duration
-            decodedFrames += Int64(segmentFrames)
-            let total = decodedFrames
-            DispatchQueue.main.async {
-                self.frameCount = total
-                self.fps = rate
-                self.status = "电脑画面已接入"
-            }
-            log("segment decoded name=\(name) frames=\(segmentFrames) fps=\(String(format: "%.1f", rate)) size=\(track.naturalSize.width)x\(track.naturalSize.height)")
-        } catch {
-            reportError("读取视频失败：\(error.localizedDescription)")
-        }
-    }
-
-    private func publish(_ pixelBuffer: CVPixelBuffer) -> Bool {
-        guard let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() else {
-            reportError("手机解出的画面不能共享给相机")
-            return false
-        }
         retainedFrame = pixelBuffer
         if surfaceFD < 0 {
             surfaceFD = open(Self.surfacePath, O_CREAT | O_WRONLY, mode_t(0o666))
-            if surfaceFD >= 0 {
-                _ = ftruncate(surfaceFD, 0)
-                log("surface file opened")
-            } else {
-                log("surface open failed errno=\(errno)")
-            }
+            if surfaceFD >= 0 { _ = ftruncate(surfaceFD, 0) }
         }
         guard surfaceFD >= 0 else {
             setStatus("无法发布相机画面")
-            return false
+            return
         }
         let contents = String(format: "id=%010u\n", IOSurfaceGetID(surface))
         let written = contents.withCString { pwrite(surfaceFD, $0, 14, 0) }
         guard written == 14 else {
             setStatus("发布相机画面失败")
-            return false
+            return
         }
-        return true
-    }
 
-    private func reportError(_ message: String) {
+        deliveredFrames += 1
         let now = Date()
-        guard now.timeIntervalSince(lastErrorAt) >= 3 else { return }
-        lastErrorAt = now
-        log("error \(message)")
-        setStatus(message)
+        if now.timeIntervalSince(lastReport) >= 1 {
+            let elapsed = now.timeIntervalSince(lastReport)
+            let rate = Double(deliveredFrames - reportFrames) / elapsed
+            let currentFrameCount = deliveredFrames
+            reportFrames = deliveredFrames
+            lastReport = now
+            DispatchQueue.main.async {
+                self.frameCount = currentFrameCount
+                self.fps = rate
+                self.status = rate > 0 ? "电脑画面已接入" : "等待电脑画面"
+            }
+        }
     }
 }
 
@@ -1494,15 +1370,10 @@ struct ContentView: View {
             Color.black
             if fakeCameraOn {
                 VStack(spacing: 10) {
-                    Image(systemName: usingStreamSource ? (usingHLSSource ? "wifi" : "cable.connector") : "play.rectangle.fill")
+                    Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
                         .font(.system(size: 38))
-                    Text(usingHLSSource ? hlsSource.status : (usingStreamSource ? "电脑实时流已启用" : "素材视频已启用"))
+                    Text(usingStreamSource ? "电脑实时流已启用" : "素材视频已启用")
                         .font(.headline)
-                    if usingHLSSource && hlsSource.fps > 0 {
-                        Text("已解出 \(hlsSource.frameCount) 帧 · \(Int(hlsSource.fps)) 帧/秒")
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
                     Text("切换到相机或直播 App 查看输出")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
@@ -1569,7 +1440,7 @@ struct ContentView: View {
             HStack {
                 Text("电脑直播地址").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                TextField("http://电脑IP:8899/push/latest.json", text: streamURLBinding)
+                TextField("http://电脑IP:8899/obs/live.m3u8", text: streamURLBinding)
                     .font(.caption2)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
@@ -1697,16 +1568,9 @@ struct ContentView: View {
     private func boot() {
         // 老版本保存的是电脑 IP；首次升级时把它带到新的完整直播地址设置里。
         if UserDefaults.standard.object(forKey: "streamURL") == nil {
-            streamURL = "http://\(pcIP):8899/push/latest.json"
-        } else if streamURL.hasSuffix("/obs/live.m3u8") {
-            // 把旧版 HLS 地址自动迁移到新的视频分段接口，保留原来的电脑 IP。
-            streamURL = String(streamURL.dropLast("/obs/live.m3u8".count)) + "/push/latest.json"
+            streamURL = "http://\(pcIP):8899/obs/live.m3u8"
         }
-        if let savedMode = Link.savedNetworkMode() {
-            netMode = savedMode
-        }
-        StreamDecoder.dlog("boot netMode=\(netMode) streamCfg=\(Link.streamEnabled()) url=\(builtURL)")
-        usingStreamSource = Link.streamEnabled() || netMode
+        usingStreamSource = Link.streamEnabled()
         fakeCameraOn = usingStreamSource
         // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1821,7 +1685,6 @@ struct ContentView: View {
     private func startLive() {
         state = .starting
         stuckCount = 0
-        vcamControl(true)
         Link.send(["cmd": "start", "mode": netMode ? "stream" : "file", "url": builtURL])
     }
 
@@ -1863,24 +1726,22 @@ struct ContentView: View {
 
     private func tapDirect() {
         netMode = false
-        Link.saveNetworkMode(false)
         hasPickedVideo = false
         hint = "USB直连：电脑画面走数据线"
         if state == .live || state == .starting { startLive() } else {
             Link.send(["cmd": "mode", "mode": "file", "url": builtURL])
         }
-        vcamControl(true)
+        if fakeCameraOn { vcamControl(true) }
     }
 
     private func tapNetwork() {
         netMode = true
-        Link.saveNetworkMode(true)
         hasPickedVideo = false
         hint = "局域网：电脑需开启 OBS 或其他直播软件，地址为 \(builtURL)"
         if state == .live || state == .starting { startLive() } else {
             Link.send(["cmd": "mode", "mode": "stream", "url": builtURL])
         }
-        vcamControl(true)
+        if fakeCameraOn { vcamControl(true) }
     }
 
     private func tapMirror() {
@@ -1919,15 +1780,13 @@ struct ContentView: View {
         try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
-    // USB 直连用 VCU1；局域网下载电脑生成的短 MP4 片段并解码；相册仍走文件模式。
+    // USB 直连用 VCU1 解码帧；局域网用 AVPlayer 拉 HLS 并发布 IOSurface；相册仍走文件模式。
     private func vcamControl(_ on: Bool) {
         let path = "/var/mobile/Media/DCIM/vcam.mp4"
         let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
         let useUSBStream = on && !netMode && !hasPickedVideo
         let useHLS = on && netMode
         let useStream = useUSBStream || useHLS
-        Link.saveNetworkMode(netMode)
-        StreamDecoder.dlog("vcamControl on=\(on) netMode=\(netMode) useUSB=\(useUSBStream) useHLS=\(useHLS) url=\(builtURL)")
         if useHLS {
             let scheme = URL(string: builtURL)?.scheme?.lowercased()
             guard scheme == "http" || scheme == "https" else {
@@ -1961,7 +1820,6 @@ struct ContentView: View {
                 try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
                 try setStreamMode(true)
                 if useHLS, let url = URL(string: builtURL) {
-                    StreamDecoder.dlog("network stream start requested \(url.absoluteString)")
                     hlsSource.start(url: url)
                 } else {
                     hlsSource.stop()
