@@ -325,9 +325,8 @@ final class StreamDecoder {
         testGoldenPath()
     }
 
-    // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
-    // 这条路径不改 sample、不使用实时 session，也不把测试帧发布给相机插件。
-    // 收到首个 VCU1 配置后自动在 utility 队列运行一次，避免影响主线程和实时解码队列。
+    // 用手机上的标准 MP4 测 AVAssetReader 能否直接解出 IOSurface，作为 USB 硬解路径的对照。
+    // 收到首个 VCU1 配置后只运行一次，诊断结果写进 .dec.log。
     func testGoldenPath() {
         let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/avplayer-test.mp4")
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -379,9 +378,7 @@ final class StreamDecoder {
     private func runGoldenPath(url: URL) {
         StreamDecoder.dlog("golden begin path=\(url.path)")
         var reader: AVAssetReader?
-        var decoderSession: VTDecompressionSession?
         defer {
-            if let decoderSession { VTDecompressionSessionInvalidate(decoderSession) }
             reader?.cancelReading()
         }
 
@@ -393,8 +390,11 @@ final class StreamDecoder {
             }
             let r = try AVAssetReader(asset: asset)
             reader = r
-            // nil 表示读取 MP4 中原始压缩样本；不让 AVAssetReader 先解码/转码。
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            let pixelAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: pixelAttributes)
             output.alwaysCopiesSampleData = false
             guard r.canAdd(output) else {
                 StreamDecoder.dlog("golden failed: reader cannot add track output")
@@ -405,45 +405,13 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: startReading status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            guard let sample = output.copyNextSampleBuffer() else {
-                StreamDecoder.dlog("golden failed: no first sample readerStatus=\(String(describing: r.status)) error=\(String(describing: r.error))")
+            guard let sample = output.copyNextSampleBuffer(),
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                StreamDecoder.dlog("golden failed: no decoded frame status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            guard let format = CMSampleBufferGetFormatDescription(sample) else {
-                StreamDecoder.dlog("golden failed: sample has no video format description")
-                return
-            }
-
-            StreamDecoder.dlog("golden format \(Self.formatSummary(format))")
-            StreamDecoder.dlog("golden sample \(Self.sampleSummary(sample))")
-            goldenDiffLock.lock()
-            goldenFormatFields = Self.formatFields(format)
-            goldenSampleFields = Self.sampleFields(sample)
-            goldenDiffLock.unlock()
-            let probe = GoldenProbe()
-            var callback = VTDecompressionOutputCallbackRecord(
-                decompressionOutputCallback: StreamDecoder.goldenCallback,
-                decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
-            let imageAttributes: [String: Any] = [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            let createStatus = VTDecompressionSessionCreate(
-                allocator: kCFAllocatorDefault, formatDescription: format,
-                decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
-                outputCallback: &callback, decompressionSessionOut: &decoderSession)
-            guard createStatus == noErr, let session = decoderSession else {
-                StreamDecoder.dlog("golden create failed status=\(createStatus) session=\(decoderSession != nil)")
-                return
-            }
-            VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-
-            var info = VTDecodeInfoFlags()
-            StreamDecoder.dlog("golden DecodeFrame begin sample=\(Self.sampleSummary(sample))")
-            let decodeStatus = VTDecompressionSessionDecodeFrame(
-                session, sampleBuffer: sample, flags: [], frameRefcon: nil, infoFlagsOut: &info)
-            StreamDecoder.dlog("golden DecodeFrame returned status=\(decodeStatus) info=\(info.rawValue)")
-            let waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(session)
-            StreamDecoder.dlog("golden result create=\(createStatus) decode=\(decodeStatus) wait=\(waitStatus) \(probe.summary())")
+            StreamDecoder.dlog("golden decoded width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer)) format=0x\(String(CVPixelBufferGetPixelFormatType(pixelBuffer), radix: 16))")
+            publish(status: noErr, imageBuffer: pixelBuffer, sourceFrameID: 0)
         } catch {
             StreamDecoder.dlog("golden failed: \(error.localizedDescription)")
         }
