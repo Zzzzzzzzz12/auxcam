@@ -892,7 +892,7 @@ final class HLSFrameSource: ObservableObject {
             self.notificationTokens.append(NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemNewAccessLogEntry, object: item, queue: nil) { [weak self] _ in
                     guard let event = item.accessLog()?.events.last else { return }
-                    self?.log("access segments=\(event.numberOfSegmentsDownloaded) bytes=\(event.numberOfBytesTransferred) bitrate=\(Int(event.observedBitrate)) stalls=\(event.numberOfStalls)")
+                    self?.log("access bytes=\(event.numberOfBytesTransferred) bitrate=\(event.observedBitrate) stalls=\(event.numberOfStalls)")
                 })
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
@@ -1012,7 +1012,7 @@ final class HLSFrameSource: ObservableObject {
         let item = player?.currentItem
         let error = item?.error?.localizedDescription ?? "none"
         let access = item?.accessLog()?.events.last
-        log("no frame reason=\(reason) itemStatus=\(item?.status.rawValue ?? -1) playerStatus=\(player?.status.rawValue ?? -1) timeControl=\(player?.timeControlStatus.rawValue ?? -1) rate=\(player?.rate ?? -1) itemTime=\(itemTime.seconds) segments=\(access?.numberOfSegmentsDownloaded ?? -1) bytes=\(access?.numberOfBytesTransferred ?? -1) error=\(error)")
+        log("no frame reason=\(reason) itemStatus=\(item?.status.rawValue ?? -1) playerStatus=\(player?.status.rawValue ?? -1) timeControl=\(player?.timeControlStatus.rawValue ?? -1) rate=\(player?.rate ?? -1) itemTime=\(itemTime.seconds) bytes=\(access?.numberOfBytesTransferred ?? -1) error=\(error)")
         if item?.status == .failed {
             setStatus("拉流失败：\(error)")
         } else if item?.status == .readyToPlay {
