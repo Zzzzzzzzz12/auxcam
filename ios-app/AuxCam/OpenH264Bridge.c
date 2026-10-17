@@ -1,12 +1,75 @@
 #include "OpenH264Bridge.h"
 #include "codec_api.h"
+#include <IOSurface/IOSurface.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 typedef struct {
     ISVCDecoder *api;
 } AuxH264Decoder;
+
+static bool setSurfaceNumber(CFMutableDictionaryRef dictionary, CFStringRef key, int64_t value) {
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &value);
+    if (number == NULL) return false;
+    CFDictionarySetValue(dictionary, key, number);
+    CFRelease(number);
+    return true;
+}
+
+static IOSurfaceRef createNV12Surface(int width, int height) {
+    size_t yStride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)width);
+    size_t ySize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, yStride * (size_t)height);
+    size_t uvStride = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)width);
+    size_t uvSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, uvStride * (size_t)(height / 2));
+    if (yStride == 0 || ySize == 0 || uvStride == 0 || uvSize == 0) return NULL;
+
+    CFMutableDictionaryRef yPlane = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef uvPlane = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef properties = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (yPlane == NULL || uvPlane == NULL || properties == NULL) {
+        if (yPlane != NULL) CFRelease(yPlane);
+        if (uvPlane != NULL) CFRelease(uvPlane);
+        if (properties != NULL) CFRelease(properties);
+        return NULL;
+    }
+
+    bool ok = setSurfaceNumber(yPlane, kIOSurfacePlaneWidth, width) &&
+        setSurfaceNumber(yPlane, kIOSurfacePlaneHeight, height) &&
+        setSurfaceNumber(yPlane, kIOSurfacePlaneBytesPerRow, (int64_t)yStride) &&
+        setSurfaceNumber(yPlane, kIOSurfacePlaneOffset, 0) &&
+        setSurfaceNumber(yPlane, kIOSurfacePlaneSize, (int64_t)ySize) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneWidth, width / 2) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneHeight, height / 2) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneBytesPerRow, (int64_t)uvStride) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneOffset, (int64_t)ySize) &&
+        setSurfaceNumber(uvPlane, kIOSurfacePlaneSize, (int64_t)uvSize) &&
+        setSurfaceNumber(properties, kIOSurfaceWidth, width) &&
+        setSurfaceNumber(properties, kIOSurfaceHeight, height) &&
+        setSurfaceNumber(properties, kIOSurfacePixelFormat,
+                         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) &&
+        setSurfaceNumber(properties, kIOSurfaceAllocSize, (int64_t)(ySize + uvSize));
+
+    CFMutableArrayRef planes = CFArrayCreateMutable(
+        kCFAllocatorDefault, 2, &kCFTypeArrayCallBacks);
+    if (planes == NULL) ok = false;
+    if (ok) {
+        CFArrayAppendValue(planes, yPlane);
+        CFArrayAppendValue(planes, uvPlane);
+        CFDictionarySetValue(properties, kIOSurfacePlaneInfo, planes);
+    }
+
+    IOSurfaceRef surface = ok ? IOSurfaceCreate(properties) : NULL;
+    if (planes != NULL) CFRelease(planes);
+    CFRelease(properties);
+    CFRelease(uvPlane);
+    CFRelease(yPlane);
+    return surface;
+}
 
 static int32_t makeDecoder(AuxH264Decoder *decoder) {
     if (WelsCreateDecoder(&decoder->api) != 0 || decoder->api == NULL) return -1;
@@ -67,52 +130,16 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
         yStride < width || uvStride < width / 2 || ySrc == NULL || uSrc == NULL || vSrc == NULL) return -3;
 
-    CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFMutableDictionaryRef surfaceProps = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    if (attrs == NULL || surfaceProps == NULL) {
-        if (attrs != NULL) CFRelease(attrs);
-        if (surfaceProps != NULL) CFRelease(surfaceProps);
-        return -4;
-    }
-    CFDictionarySetValue(attrs, kCVPixelBufferIOSurfacePropertiesKey, surfaceProps);
+    IOSurfaceRef surface = createNV12Surface(width, height);
+    if (surface == NULL) return -4001;
     CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn createStatus = CVPixelBufferCreate(
-        kCFAllocatorDefault, (size_t)width, (size_t)height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pixelBuffer);
+    CVReturn createStatus = CVPixelBufferCreateWithIOSurface(
+        kCFAllocatorDefault, surface, NULL, &pixelBuffer);
+    IOSurfaceRelease(surface);
     if (createStatus != kCVReturnSuccess) {
-        static int diagnosticFlags = -1;
-        if (diagnosticFlags < 0) {
-            diagnosticFlags = 0;
-            CVPixelBufferRef probe = NULL;
-            if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height,
-                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                    NULL, &probe) == kCVReturnSuccess && probe != NULL) {
-                diagnosticFlags |= 1;
-            }
-            if (probe != NULL) CVPixelBufferRelease(probe);
-            probe = NULL;
-            if (CVPixelBufferCreate(kCFAllocatorDefault, 64, 64,
-                                    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                                    attrs, &probe) == kCVReturnSuccess && probe != NULL) {
-                diagnosticFlags |= 2;
-            }
-            if (probe != NULL) CVPixelBufferRelease(probe);
-            probe = NULL;
-            if (CVPixelBufferCreate(kCFAllocatorDefault, 64, 64,
-                                    kCVPixelFormatType_32BGRA, attrs,
-                                    &probe) == kCVReturnSuccess && probe != NULL) {
-                diagnosticFlags |= 4;
-            }
-            if (probe != NULL) CVPixelBufferRelease(probe);
-        }
-        CFRelease(surfaceProps);
-        CFRelease(attrs);
-        return -3000 - diagnosticFlags;
+        if (pixelBuffer != NULL) CVPixelBufferRelease(pixelBuffer);
+        return -5000 - (int32_t)createStatus;
     }
-    CFRelease(surfaceProps);
-    CFRelease(attrs);
     if (pixelBuffer == NULL) return -2000;
 
     CVReturn lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
