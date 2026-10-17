@@ -862,7 +862,7 @@ final class HLSFrameSource: ObservableObject {
             let item = AVPlayerItem(url: url)
             // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
             let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
@@ -959,25 +959,16 @@ final class HLSFrameSource: ObservableObject {
 
     private func copyLatestFrame() {
         recoverIfPlaybackStopped()
-        guard let output else { return }
-        var itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
-        var hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
-        // HLS has its own timeline; fall back to the item's current time if host-time mapping is not ready.
-        if !hasFrame, let current = player?.currentItem?.currentTime(), current.isValid {
-            itemTime = current
-            hasFrame = output.hasNewPixelBuffer(forItemTime: current)
-        }
+        guard let output, let current = player?.currentItem?.currentTime(), current.isValid else { return }
+        // HLS has its own live timeline; use AVPlayer's current time instead of mapping the system host clock.
+        let itemTime = current
+        let hasFrame = output.hasNewPixelBuffer(forItemTime: itemTime)
         guard hasFrame else {
             reportNoFrame("no new pixel buffer", itemTime: itemTime)
             return
         }
         var displayTime = CMTime.invalid
-        var pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime)
-        if pixelBuffer == nil, let current = player?.currentItem?.currentTime(), current.isValid {
-            // itemTime(forHostTime:) can drift from the live HLS timeline; retry against AVPlayer's own clock.
-            itemTime = current
-            pixelBuffer = output.copyPixelBuffer(forItemTime: current, itemTimeForDisplay: &displayTime)
-        }
+        let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime)
         guard let pixelBuffer else {
             reportNoFrame("pixel buffer copy returned nil", itemTime: itemTime)
             return
