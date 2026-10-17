@@ -378,8 +378,13 @@ final class StreamDecoder {
     private func runGoldenPath(url: URL) {
         StreamDecoder.dlog("golden begin path=\(url.path)")
         var reader: AVAssetReader?
+        var decoderSession: VTDecompressionSession?
+        let probe = GoldenProbe()
         defer {
             reader?.cancelReading()
+            if let decoderSession {
+                VTDecompressionSessionInvalidate(decoderSession)
+            }
         }
 
         do {
@@ -390,11 +395,9 @@ final class StreamDecoder {
             }
             let r = try AVAssetReader(asset: asset)
             reader = r
-            let pixelAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA),
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: pixelAttributes)
+            // 不让 AVAssetReader 先解码。取出容器中标准的压缩 CMSampleBuffer，
+            // 直接交给 VT，与下面 USB 手工组装的 sample 做对照。
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
             output.alwaysCopiesSampleData = false
             guard r.canAdd(output) else {
                 StreamDecoder.dlog("golden failed: reader cannot add track output")
@@ -406,12 +409,30 @@ final class StreamDecoder {
                 return
             }
             guard let sample = output.copyNextSampleBuffer(),
-                  let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                  let format = CMSampleBufferGetFormatDescription(sample) else {
                 StreamDecoder.dlog("golden failed: no decoded frame status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            StreamDecoder.dlog("golden decoded width=\(CVPixelBufferGetWidth(pixelBuffer)) height=\(CVPixelBufferGetHeight(pixelBuffer)) format=0x\(String(CVPixelBufferGetPixelFormatType(pixelBuffer), radix: 16))")
-            publish(status: noErr, imageBuffer: pixelBuffer, sourceFrameID: 0)
+            var callback = VTDecompressionOutputCallbackRecord(
+                decompressionOutputCallback: StreamDecoder.goldenCallback,
+                decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
+            let outputAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            let createStatus = VTDecompressionSessionCreate(
+                allocator: kCFAllocatorDefault, formatDescription: format,
+                decoderSpecification: nil, imageBufferAttributes: outputAttributes as CFDictionary,
+                outputCallback: &callback, decompressionSessionOut: &decoderSession)
+            guard createStatus == noErr, let decoderSession else {
+                StreamDecoder.dlog("golden failed: VT session create=\(createStatus)")
+                return
+            }
+            var decodeInfo = VTDecodeInfoFlags()
+            let decodeStatus = VTDecompressionSessionDecodeFrame(
+                decoderSession, sampleBuffer: sample, flags: [], frameRefcon: nil,
+                infoFlagsOut: &decodeInfo)
+            StreamDecoder.dlog("golden compressed sample decode vt=\(decodeStatus) info=\(decodeInfo.rawValue) \(probe.summary())")
         } catch {
             StreamDecoder.dlog("golden failed: \(error.localizedDescription)")
         }
