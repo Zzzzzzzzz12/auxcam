@@ -541,7 +541,7 @@ final class StreamDecoder {
         if status != noErr { waitingForKeyframe = true }
         guard status == noErr, let imageBuffer else {
             outputLock.unlock()
-            if count <= 3 || count % 90 == 0 {
+            if status != noErr || count <= 3 || count % 90 == 0 {
                 StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=\(status)")
             }
             return
@@ -609,9 +609,10 @@ final class StreamDecoder {
                 var cb = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-                // 明确要求 IOSurface backing；不限制像素格式，让 VideoToolbox
-                // 选择设备原生的解码输出格式。
+                // 明确使用相机链路最常见的 NV12 格式，并要求 IOSurface backing，
+                // 让解码出的同一块画面可以直接交给相机替换插件。
                 let imageAttributes: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
                     kCVPixelBufferIOSurfacePropertiesKey as String: [:]
                 ]
                 let vtSt = VTDecompressionSessionCreate(
@@ -702,7 +703,9 @@ final class StreamDecoder {
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 30),
             presentationTimeStamp: CMTime(value: tsIdx, timescale: 30),
-            decodeTimeStamp: CMTime.invalid)
+            // OBS 的实时发送端按显示顺序传帧，DTS 与 PTS 相同；提供有效的
+            // 解码时间，避免系统解码器把无效 DTS 当成坏 H.264 sample。
+            decodeTimeStamp: CMTime(value: tsIdx, timescale: 30))
         var sampleSize = total
         let sbSt = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: fmt,
