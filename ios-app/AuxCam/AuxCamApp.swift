@@ -867,6 +867,7 @@ final class HLSFrameSource: ObservableObject {
             ]
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
             item.add(output)
+            output.requestNotificationOfMediaDataChange(withAdvanceInterval: 0.03)
 
             let player = AVPlayer(playerItem: item)
             player.isMuted = true
@@ -970,7 +971,14 @@ final class HLSFrameSource: ObservableObject {
             reportNoFrame("no new pixel buffer", itemTime: itemTime)
             return
         }
-        guard let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
+        var displayTime = CMTime.invalid
+        var pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime)
+        if pixelBuffer == nil, let current = player?.currentItem?.currentTime(), current.isValid {
+            // itemTime(forHostTime:) can drift from the live HLS timeline; retry against AVPlayer's own clock.
+            itemTime = current
+            pixelBuffer = output.copyPixelBuffer(forItemTime: current, itemTimeForDisplay: &displayTime)
+        }
+        guard let pixelBuffer else {
             reportNoFrame("pixel buffer copy returned nil", itemTime: itemTime)
             return
         }
