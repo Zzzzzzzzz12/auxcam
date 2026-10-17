@@ -858,7 +858,7 @@ final class HLSFrameSource: NSObject, ObservableObject {
             self.log("start url=\(url.absoluteString)")
             self.setStatus("正在连接电脑")
 
-            let item = AVPlayerItem(url: url)
+            let item = AVPlayerItem(url: URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4"))
             // 交给 AVPlayer 根据网络情况管理缓冲，过短的缓冲会让长 GOP 的 HLS 卡在段尾。
             // Let AVFoundation select a native pixel format for live HLS output.
             let output = AVPlayerItemVideoOutput(outputSettings: nil)
