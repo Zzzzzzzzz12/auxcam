@@ -83,7 +83,8 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attrs, &pixelBuffer);
     CFRelease(surfaceProps);
     CFRelease(attrs);
-    if (createStatus != kCVReturnSuccess || pixelBuffer == NULL) return -5;
+    if (createStatus != kCVReturnSuccess) return -1000 + (int32_t)createStatus;
+    if (pixelBuffer == NULL) return -2000;
 
     CVReturn lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
     if (lockStatus != kCVReturnSuccess) {
