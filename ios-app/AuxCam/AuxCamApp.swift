@@ -408,9 +408,15 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: startReading status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            guard let sample = output.copyNextSampleBuffer(),
+            var compressedSample: CMSampleBuffer?
+            let readDeadline = Date().addingTimeInterval(5)
+            while compressedSample == nil && r.status == .reading && Date() < readDeadline {
+                compressedSample = output.copyNextSampleBuffer()
+                if compressedSample == nil { Thread.sleep(forTimeInterval: 0.01) }
+            }
+            guard let sample = compressedSample,
                   let format = CMSampleBufferGetFormatDescription(sample) else {
-                StreamDecoder.dlog("golden failed: no decoded frame status=\(String(describing: r.status)) error=\(String(describing: r.error))")
+                StreamDecoder.dlog("golden failed: no compressed sample status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
             var callback = VTDecompressionOutputCallbackRecord(
