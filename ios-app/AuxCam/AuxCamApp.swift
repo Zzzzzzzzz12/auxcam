@@ -3,6 +3,7 @@
 //   自动唤醒相机进程 → 自动注入 → 自动进直连 → 断流自动重连 → 卡顿自动换路 → 四态自动显示
 import SwiftUI
 import AVFoundation
+import AVKit
 import PhotosUI
 import CoreTransferable
 import Foundation
@@ -1208,6 +1209,7 @@ private final class StreamPictureInPicture: NSObject, AVPictureInPictureControll
                                         presentationTimeStamp: pts,
                                         decodeTimeStamp: .invalid)
         var sampleBuffer: CMSampleBuffer?
+        guard let formatDescription else { return }
         let status = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
                                                                imageBuffer: image,
                                                                formatDescription: formatDescription,
