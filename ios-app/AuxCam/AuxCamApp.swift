@@ -252,8 +252,7 @@ struct CamPreview: UIViewRepresentable {
 final class StreamDecoder {
     static let surfacePath = "/var/mobile/Media/DCIM/.frame.surface"
     static let logPath = "/var/mobile/Media/DCIM/.dec.log"
-    private var session: VTDecompressionSession?
-    private var fmt: CMVideoFormatDescription?
+    private var softwareDecoder: UnsafeMutableRawPointer?
     private var sps = Data()
     private var pps = Data()
     private var frameIndex: Int64 = 0
@@ -277,9 +276,9 @@ final class StreamDecoder {
     private static let runID = String(UUID().uuidString.prefix(8))
 
     deinit {
+        if let softwareDecoder { auxh264_destroy(softwareDecoder) }
         if surfaceFD >= 0 { close(surfaceFD) }
     }
-
     static func dlog(_ s: String) {
         let line = String(format: "%.6f [%@] %@\n", Date().timeIntervalSince1970, runID, s)
         if let h = FileHandle(forWritingAtPath: logPath) {
@@ -307,7 +306,6 @@ final class StreamDecoder {
             self.setWaitingForKeyframe(true)
             self.build()
         }
-        testGoldenPath()
     }
 
     // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
@@ -566,6 +564,8 @@ final class StreamDecoder {
         retainedFrame = imageBuffer
         outputLock.unlock()
 
+        StreamPictureInPicture.shared.enqueue(imageBuffer)
+
         guard let surface = CVPixelBufferGetIOSurface(imageBuffer)?.takeUnretainedValue() else {
             StreamDecoder.dlog("decoded frame has no IOSurface")
             return
@@ -592,187 +592,68 @@ final class StreamDecoder {
 
     private func build() {
         guard sps.count > 3, pps.count > 3 else {
-            StreamDecoder.dlog("build: sps/pps too small")
+            StreamDecoder.dlog("software decoder waiting for SPS/PPS")
             return
         }
-        if let s = session {
-            VTDecompressionSessionInvalidate(s)
-            session = nil
-            fmt = nil
-        }
-        // 全程锁在 withUnsafeBytes 闭包内（Data 指针不能逃逸，逃逸就悬垂 → -12712）
-        sps.withUnsafeBytes { sp in
-            pps.withUnsafeBytes { pp in
-                guard let spb = sp.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                      let ppb = pp.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                    StreamDecoder.dlog("build: no base address")
-                    return
-                }
-                let ps: [UnsafePointer<UInt8>] = [spb, ppb]
-                var sizes = [sps.count, pps.count]
-                var f: CMVideoFormatDescription?
-                let fmtSt = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault, parameterSetCount: 2,
-                    parameterSetPointers: ps, parameterSetSizes: &sizes,
-                    nalUnitHeaderLength: 4, formatDescriptionOut: &f)
-                StreamDecoder.buildCount += 1
-                StreamDecoder.dlog("build #\(StreamDecoder.buildCount) fmtSt=\(fmtSt) sps=\(sps.count) pps=\(pps.count)")
-                guard let f else {
-                    StreamDecoder.dlog("build: no format description")
-                    return
-                }
-                fmt = f
-                StreamDecoder.dlog("manual format \(Self.formatSummary(f))")
-                var cb = VTDecompressionOutputCallbackRecord(
-                    decompressionOutputCallback: StreamDecoder.frameCallback,
-                    decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-                // 明确要求 IOSurface backing；不限制像素格式，让 VideoToolbox
-                // 选择设备原生的解码输出格式。
-                let imageAttributes: [String: Any] = [
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-                ]
-                let vtSt = VTDecompressionSessionCreate(
-                    allocator: kCFAllocatorDefault, formatDescription: f,
-                    decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
-                    outputCallback: &cb, decompressionSessionOut: &session)
-                if vtSt == noErr, let session {
-                    sessionGeneration += 1
-                    VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-                }
-                StreamDecoder.dlog("build: VT session st=\(vtSt) ok=\(session != nil) generation=\(sessionGeneration)")
-            }
-        }
+        if let softwareDecoder { auxh264_destroy(softwareDecoder) }
+        softwareDecoder = auxh264_create()
+        StreamDecoder.buildCount += 1
+        StreamDecoder.dlog("software decoder init ok=\(softwareDecoder != nil) generation=\(StreamDecoder.buildCount)")
     }
-
     private func decode(_ raw: Data, keyframe: Bool) {
-        // 直接扫描 Data 的底层指针，只保留 NALU 范围，避免先复制整帧到 [UInt8]
-        // 再为每个 NALU 各复制一次。
-        let nalRanges = Self.splitAnnexBRanges(raw)
         StreamDecoder.feedCount += 1
-        guard let session, let fmt else {
+        guard let softwareDecoder else {
             if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) waiting for config; input=\(raw.count)")
+                StreamDecoder.dlog("software decode waiting for config input=\(raw.count)")
             }
             return
         }
-
-        // SPS/PPS 已经放在 CMVideoFormatDescription 里。sample 只提交 VCL
-        // NALU（一个或多个 slice），不能再把 SPS/PPS 当作画面 sample 重复提交。
-        let slices = nalRanges.filter { range in
-            guard range.lowerBound < raw.count else { return false }
-            let type = raw[range.lowerBound] & 0x1F
-            return type == 1 || type == 5
+        let nalRanges = Self.splitAnnexBRanges(raw)
+        let types = nalRanges.compactMap { range -> UInt8? in
+            guard range.lowerBound < raw.count else { return nil }
+            return raw[range.lowerBound] & 0x1F
         }
-        guard !slices.isEmpty else {
-            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) skip non-VCL NALs=\(nalRanges.count)")
-            }
-            return
-        }
-        let hasIDR = slices.contains { (raw[$0.lowerBound] & 0x1F) == 5 }
+        let hasIDR = types.contains(5)
+        guard types.contains(where: { $0 == 1 || $0 == 5 }) else { return }
         if keyframe != hasIDR {
             StreamDecoder.dlog("keyframe flag mismatch flag=\(keyframe) IDR=\(hasIDR)")
         }
         if isWaitingForKeyframe() && !hasIDR { return }
-        if hasIDR { setWaitingForKeyframe(false) }
 
-        var au = Data()
-        for range in slices {
-            var l = UInt32(range.count).bigEndian
-            withUnsafeBytes(of: &l) { au.append(contentsOf: $0) }
-            au.append(contentsOf: raw[range])
-        }
-        let total = au.count
-        guard total > 0 else { return }
-        // 自己 malloc 内存（memoryBlock:nil 时 CMBlockBuffer 不会自动分配 → -12707）
-        guard let mem = malloc(total) else { return }
-        let mp = mem.assumingMemoryBound(to: UInt8.self)
-        let copied = au.withUnsafeBytes { b -> Bool in
-            guard let base = b.bindMemory(to: UInt8.self).baseAddress else { return false }
-            mp.update(from: base, count: total)
-            return true
-        }
-        guard copied else { free(mem); return }
-        var block: CMBlockBuffer?
-        var src = CMBlockBufferCustomBlockSource(
-            version: 0,
-            AllocateBlock: nil,
-            // FreeBlock 参数顺序是 (refCon, memoryBlock, size)。释放第二个参数，
-            // 否则每帧的 malloc 缓冲都会泄漏，长时间运行会拖慢甚至杀掉 App。
-            FreeBlock: { _, memoryBlock, _ in free(memoryBlock) },
-            refCon: nil)
-        let bSt = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: mem, blockLength: total,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: &src,
-            offsetToData: 0, dataLength: total,
-            flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block)
-        guard let block else {
-            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) block fail \(bSt)")
+        var accessUnit = Data()
+        if hasIDR {
+            if !types.contains(7), !sps.isEmpty {
+                accessUnit.append(contentsOf: [0, 0, 0, 1]); accessUnit.append(sps)
             }
-            free(mem)
+            if !types.contains(8), !pps.isEmpty {
+                accessUnit.append(contentsOf: [0, 0, 0, 1]); accessUnit.append(pps)
+            }
+        }
+        accessUnit.append(raw)
+        guard accessUnit.count <= Int(Int32.max) else { return }
+
+        var image: CVPixelBuffer?
+        let result = accessUnit.withUnsafeBytes { bytes -> Int32 in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+            return auxh264_decode(softwareDecoder, base, Int32(bytes.count), &image)
+        }
+        decodeCallCount += 1
+        if result < 0 {
+            setWaitingForKeyframe(true)
+            if decodeCallCount <= 5 || decodeCallCount % 90 == 0 {
+                StreamDecoder.dlog("software decode failed result=\(result) bytes=\(accessUnit.count) idr=\(hasIDR)")
+            }
             return
         }
-        var sb: CMSampleBuffer?
-        // 给解码器单独的显示时间；DTS 和帧时长交给解码器推断。
-        // 这种样本格式与 FFmpeg / Moonlight 的 VideoToolbox 输入方式一致：
-        // 一个样本包含完整 access unit，不单独声明样本字节数。
-        var tsIdx = Int64(frameIndex)
-        let pts = CMTime(value: tsIdx, timescale: 30)
-        var timing = CMSampleTimingInfo(
-            duration: .invalid,
-            presentationTimeStamp: pts,
-            decodeTimeStamp: .invalid)
-        let sbSt = CMSampleBufferCreate(
-            allocator: kCFAllocatorDefault, dataBuffer: block, dataReady: true,
-            makeDataReadyCallback: nil, refcon: nil,
-            formatDescription: fmt, sampleCount: 1,
-            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sb)
-        frameIndex += 1
-        if let sb {
-            CMSetAttachment(sb, key: kCMSampleAttachmentKey_NotSync,
-                            value: hasIDR ? kCFBooleanFalse : kCFBooleanTrue,
-                            attachmentMode: kCMAttachmentMode_ShouldPropagate)
-            decodeCallCount += 1
-            let callIndex = decodeCallCount
-            let shouldTraceCall = callIndex <= 3 || callIndex % 90 == 0
-            if shouldTraceCall {
-                StreamDecoder.dlog("manual sample #\(callIndex) \(Self.sampleSummary(sb))")
-                StreamDecoder.dlog("manual DecodeFrame begin #\(callIndex) sessionGeneration=\(sessionGeneration)")
-            }
-            // flags=[] 保持同步解码，确保 block/sample 在 VT 使用期间有效。
-            outputLock.lock()
-            lastCallbackStatus = noErr
-            activeDecodeCall = callIndex
-            outputLock.unlock()
-            var decodeInfo = VTDecodeInfoFlags()
-            let decodeStatus = VTDecompressionSessionDecodeFrame(
-                session, sampleBuffer: sb, flags: [],
-                frameRefcon: UnsafeMutableRawPointer(bitPattern: Int(callIndex)),
-                infoFlagsOut: &decodeInfo)
-            let outputStatus = callbackStatus()
-            outputLock.lock()
-            activeDecodeCall = 0
-            outputLock.unlock()
-            if shouldTraceCall {
-                StreamDecoder.dlog("manual DecodeFrame returned #\(callIndex) vt=\(decodeStatus) callback=\(outputStatus) info=\(decodeInfo.rawValue)")
-            }
-            if decodeStatus != noErr || outputStatus != noErr {
-                setWaitingForKeyframe(true)
-                // VT 报坏帧后丢弃增量帧，重建会话；收到下一个 IDR 再恢复。
-                build()
-            }
-            if shouldTraceCall {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sample=\(sbSt) vt=\(decodeStatus) callback=\(outputStatus) bytes=\(total) idr=\(hasIDR)")
-            }
-        } else {
-            if StreamDecoder.feedCount <= 5 || StreamDecoder.feedCount % 30 == 0 {
-                StreamDecoder.dlog("decode #\(StreamDecoder.feedCount) sample fail \(sbSt)")
+        if hasIDR { setWaitingForKeyframe(false) }
+        if let image {
+            frameIndex += 1
+            publish(status: noErr, imageBuffer: image, sourceFrameID: frameIndex)
+            if frameIndex <= 3 || frameIndex % 90 == 0 {
+                StreamDecoder.dlog("software frame #\(frameIndex) \(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image)) input=\(accessUnit.count)")
             }
         }
     }
-
     private static func splitAnnexBRanges(_ data: Data) -> [Range<Int>] {
         data.withUnsafeBytes { rawBuffer in
             guard let bytes = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return [] }
@@ -1236,6 +1117,158 @@ struct PB: View {
     }
 }
 
+private final class StreamPictureInPicture: NSObject, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
+    static let shared = StreamPictureInPicture()
+    private let lock = NSLock()
+    private var displayLayer: AVSampleBufferDisplayLayer?
+    private var controller: AVPictureInPictureController?
+    private var pendingImage: CVImageBuffer?
+    private var enqueueScheduled = false
+    private var paused = false
+    private var frameNumber: Int64 = 0
+    private var formatDescription: CMVideoFormatDescription?
+
+    func attach(_ layer: AVSampleBufferDisplayLayer) {
+        DispatchQueue.main.async {
+            guard self.displayLayer !== layer else { return }
+            self.displayLayer = layer
+            layer.videoGravity = .resizeAspect
+            var timebase: CMTimebase?
+            if CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
+                                               sourceClock: CMClockGetHostTimeClock(),
+                                               timebaseOut: &timebase) == noErr,
+               let timebase {
+                CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+                CMTimebaseSetRate(timebase, rate: 1.0)
+                layer.controlTimebase = timebase
+            }
+            guard AVPictureInPictureController.isPictureInPictureSupported() else {
+                StreamDecoder.dlog("PiP not supported on this device")
+                return
+            }
+            let source = AVPictureInPictureController.ContentSource(
+                sampleBufferDisplayLayer: layer, playbackDelegate: self)
+            let pip = AVPictureInPictureController(contentSource: source)
+            pip.delegate = self
+            pip.canStartPictureInPictureAutomaticallyFromInline = true
+            self.controller = pip
+            StreamDecoder.dlog("PiP ready")
+        }
+    }
+
+    func start() {
+        DispatchQueue.main.async {
+            guard let controller = self.controller else {
+                StreamDecoder.dlog("PiP start ignored: preview not ready")
+                return
+            }
+            if controller.isPictureInPicturePossible {
+                controller.startPictureInPicture()
+            } else {
+                StreamDecoder.dlog("PiP start ignored: not possible yet")
+            }
+        }
+    }
+
+    func enqueue(_ image: CVImageBuffer) {
+        lock.lock()
+        guard !paused else { lock.unlock(); return }
+        pendingImage = image
+        let shouldSchedule = !enqueueScheduled
+        if shouldSchedule { enqueueScheduled = true }
+        lock.unlock()
+        if shouldSchedule { DispatchQueue.main.async { self.displayPendingFrame() } }
+    }
+
+    private func displayPendingFrame() {
+        lock.lock()
+        let image = pendingImage
+        pendingImage = nil
+        enqueueScheduled = false
+        let paused = self.paused
+        lock.unlock()
+        guard !paused, let image, let layer = displayLayer, layer.isReadyForMoreMediaData else { return }
+
+        if let currentFormat = formatDescription {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(currentFormat)
+            if dimensions.width != Int32(CVPixelBufferGetWidth(image)) || dimensions.height != Int32(CVPixelBufferGetHeight(image)) {
+                formatDescription = nil
+            }
+        }
+        if formatDescription == nil {
+            var newFormat: CMVideoFormatDescription?
+            guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                               imageBuffer: image,
+                                                               formatDescriptionOut: &newFormat) == noErr,
+                  let newFormat else { return }
+            formatDescription = newFormat
+        }
+        let pts = CMClockGetTime(CMClockGetHostTimeClock())
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
+                                        presentationTimeStamp: pts,
+                                        decodeTimeStamp: .invalid)
+        var sampleBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
+                                                               imageBuffer: image,
+                                                               formatDescription: formatDescription,
+                                                               sampleTiming: &timing,
+                                                               sampleBufferOut: &sampleBuffer)
+        guard status == noErr, let sampleBuffer else { return }
+        layer.enqueue(sampleBuffer)
+        frameNumber += 1
+        if frameNumber == 1 { StreamDecoder.dlog("PiP first frame queued") }
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {
+        lock.lock(); paused = !playing; lock.unlock()
+        pictureInPictureController.invalidatePlaybackState()
+    }
+
+    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        CMTimeRange(start: .zero, duration: .positiveInfinity)
+    }
+
+    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return paused
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion: @escaping () -> Void) {
+        completion()
+    }
+
+    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
+        true
+    }
+
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        StreamDecoder.dlog("PiP failed: \(error.localizedDescription)")
+    }
+
+    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        StreamDecoder.dlog("PiP started")
+    }
+}
+
+private final class StreamPiPView: UIView {
+    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+    var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+}
+
+private struct StreamPiPPreview: UIViewRepresentable {
+    func makeUIView(context: Context) -> StreamPiPView {
+        let view = StreamPiPView()
+        view.backgroundColor = .black
+        StreamPictureInPicture.shared.attach(view.displayLayer)
+        return view
+    }
+
+    func updateUIView(_ view: StreamPiPView, context: Context) {
+        StreamPictureInPicture.shared.attach(view.displayLayer)
+    }
+}
 struct ContentView: View {
     @StateObject private var cam = Cam()
     @StateObject private var vcu = VCU1Receiver()
@@ -1246,6 +1279,7 @@ struct ContentView: View {
     @State private var pickerRequest = false
     @State private var hint = ""
     @State private var fakeCameraOn = false
+    @State private var keepAlivePlayer: AVAudioPlayer?
     @State private var usingStreamSource = false
     @State private var usingHLSSource = false
     @State private var hasPickedVideo = false
@@ -1370,16 +1404,31 @@ struct ContentView: View {
         ZStack {
             Color.black
             if fakeCameraOn {
+                StreamPiPPreview()
                 VStack(spacing: 10) {
-                    Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
-                        .font(.system(size: 38))
-                    Text(usingStreamSource ? "电脑实时流已启用" : "素材视频已启用")
-                        .font(.headline)
-                    Text("切换到相机或直播 App 查看输出")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.7))
+                    HStack {
+                        Spacer()
+                        Button { StreamPictureInPicture.shared.start() } label: {
+                            Label("悬浮", systemImage: "pip")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 10).padding(.vertical, 7)
+                                .background(.black.opacity(0.55))
+                                .clipShape(Capsule())
+                        }
+                    }
+                    Spacer()
+                    VStack(spacing: 5) {
+                        Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
+                            .font(.title3)
+                        Text(usingStreamSource ? "电脑实时流" : "素材视频")
+                            .font(.caption.bold())
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(.black.opacity(0.55))
+                    .clipShape(Capsule())
                 }
                 .foregroundStyle(.white)
+                .padding(9)
             } else if cam.denied {
                 VStack(spacing: 8) {
                     Image(systemName: "video.slash").font(.largeTitle)
@@ -1576,7 +1625,7 @@ struct ContentView: View {
         // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
         DispatchQueue.global(qos: .userInitiated).async {
             self.cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
-            self.keepAliveAudio()   // 静音保活：退后台也继续收画面
+            DispatchQueue.main.async { self.keepAliveAudio() }   // 保留静音播放器，退后台也继续收画面
         }
         vcu.start()   // 开门 28765，等万相电脑端连
         if fakeCameraOn { vcamControl(true) }
@@ -1618,6 +1667,7 @@ struct ContentView: View {
         let player = try? AVAudioPlayer(contentsOf: url)
         player?.numberOfLoops = -1
         player?.volume = 0.01
+        keepAlivePlayer = player
         player?.play()
     }
 

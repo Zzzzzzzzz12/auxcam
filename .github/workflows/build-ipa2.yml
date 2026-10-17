@@ -5,21 +5,34 @@ jobs:
     runs-on: macos-14
     steps:
     - uses: actions/checkout@v4
-    - name: build
+    - name: Build OpenH264 for iPhone
       run: |
+        git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git "$RUNNER_TEMP/openh264"
+        make -C "$RUNNER_TEMP/openh264" OS=ios ARCH=arm64 SDK_MIN=16.0 libraries
+    - name: Build AuxCam
+      run: |
+        set -o pipefail
         cd ios-app
         rm -rf out
         mkdir -p out/Payload/AuxCam.app
         SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-        echo "SDK=$SDK"
         cp Info.template.plist out/Payload/AuxCam.app/Info.plist
+        cp OpenH264-LICENSE.txt out/Payload/AuxCam.app/OpenH264-LICENSE.txt
         printf 'APPL????' > out/Payload/AuxCam.app/PkgInfo
         cp Icon-180.png out/Payload/AuxCam.app/Icon-180.png
         cp Icon-120.png out/Payload/AuxCam.app/Icon-120.png
         cp Icon-1024.png out/Payload/AuxCam.app/Icon-1024.png
+        xcrun --sdk iphoneos clang -O2 -target arm64-apple-ios16.0 -isysroot "$SDK" \
+          -I "$RUNNER_TEMP/openh264/codec/api/wels" \
+          -c AuxCam/OpenH264Bridge.c -o out/OpenH264Bridge.o
         xcrun -sdk iphoneos swiftc -parse-as-library -O -target arm64-apple-ios17.0 -sdk "$SDK" \
-          -o out/Payload/AuxCam.app/AuxCam AuxCam/AuxCamApp.swift \
-          -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI -framework CoreMedia -framework AVFoundation -framework VideoToolbox -framework IOSurface -framework VideoToolbox -framework IOSurface 2>&1 | tail -25
+          -import-objc-header AuxCam/AuxCam-Bridging-Header.h \
+          -o out/Payload/AuxCam.app/AuxCam AuxCam/AuxCamApp.swift out/OpenH264Bridge.o \
+          "$RUNNER_TEMP/openh264/libopenh264.a" \
+          -framework SwiftUI -framework UIKit -framework AVKit -framework PhotosUI \
+          -framework CoreMedia -framework CoreVideo -framework AVFoundation \
+          -framework VideoToolbox -framework IOSurface -framework VideoToolbox \
+          -framework IOSurface -lc++ 2>&1 | tail -25
         chmod 755 out/Payload/AuxCam.app/AuxCam
         ls -la out/Payload/AuxCam.app
         cd out && ditto -c -k --keepParent Payload AuxCam.ipa
