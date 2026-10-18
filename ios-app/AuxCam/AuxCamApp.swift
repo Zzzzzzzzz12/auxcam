@@ -395,13 +395,47 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: startReading status=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            guard let sample = output.copyNextSampleBuffer() else {
+            guard let rawSample = output.copyNextSampleBuffer() else {
                 StreamDecoder.dlog("golden failed: no first sample readerStatus=\(String(describing: r.status)) error=\(String(describing: r.error))")
                 return
             }
-            guard let format = CMSampleBufferGetFormatDescription(sample) else {
-                StreamDecoder.dlog("golden failed: sample has no video format description")
+            StreamDecoder.dlog("golden raw sample \(Self.sampleSummary(rawSample))")
+            guard let firstFormat = trackFormats.first else {
+                StreamDecoder.dlog("golden failed: track has no video format description")
                 return
+            }
+            let format = firstFormat as! CMVideoFormatDescription
+            var sample = rawSample
+            if CMSampleBufferGetFormatDescription(rawSample) == nil {
+                guard CMSampleBufferGetNumSamples(rawSample) == 1,
+                      let block = CMSampleBufferGetDataBuffer(rawSample) else {
+                    StreamDecoder.dlog("golden failed: raw sample cannot be rebuilt")
+                    return
+                }
+                var timing = CMSampleTimingInfo()
+                let timingStatus = CMSampleBufferGetSampleTimingInfo(rawSample, at: 0, timingInfoOut: &timing)
+                guard timingStatus == noErr else {
+                    StreamDecoder.dlog("golden failed: raw timing status=\(timingStatus)")
+                    return
+                }
+                var sampleSize = CMBlockBufferGetDataLength(block)
+                var rebuilt: CMSampleBuffer?
+                let rebuildStatus = CMSampleBufferCreateReady(
+                    allocator: kCFAllocatorDefault,
+                    dataBuffer: block,
+                    formatDescription: format,
+                    sampleCount: 1,
+                    sampleTimingEntryCount: 1,
+                    sampleTimingArray: &timing,
+                    sampleSizeEntryCount: 1,
+                    sampleSizeArray: &sampleSize,
+                    sampleBufferOut: &rebuilt)
+                guard rebuildStatus == noErr, let rebuilt else {
+                    StreamDecoder.dlog("golden failed: rebuild status=\(rebuildStatus)")
+                    return
+                }
+                sample = rebuilt
+                StreamDecoder.dlog("golden sample rebuilt from native block")
             }
 
             StreamDecoder.dlog("golden format \(Self.formatSummary(format))")
@@ -417,7 +451,9 @@ final class StreamDecoder {
             let decoderSpecification: [String: Any] = [
                 kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: kCFBooleanTrue as Any
             ]
-            let imageAttributes: [String: Any] = [:]
+            let imageAttributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+            ]
             let createStatus = VTDecompressionSessionCreate(
                 allocator: kCFAllocatorDefault, formatDescription: format,
                 decoderSpecification: decoderSpecification as CFDictionary, imageBufferAttributes: imageAttributes as CFDictionary,
