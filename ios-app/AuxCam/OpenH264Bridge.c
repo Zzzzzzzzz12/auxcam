@@ -1,61 +1,24 @@
 #include "OpenH264Bridge.h"
-#include "AuxCamSharedFrame.h"
+#include <CoreFoundation/CoreFoundation.h>
 #include "codec_api.h"
 #include <fcntl.h>
+#include <IOSurface/IOSurface.h>
+#include <stdio.h>
+#include <sys/stat.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct {
     ISVCDecoder *api;
 } AuxH264Decoder;
 
-static const char *kSharedFrameName = "/auxcam_frame_v2";
+static const char *kSurfacePath = "/var/mobile/Media/DCIM/.frame.surface";
 static pthread_mutex_t gPublishMutex = PTHREAD_MUTEX_INITIALIZER;
-static int gSharedFrameFD = -1;
-static void *gSharedFrameMap = MAP_FAILED;
-static size_t gSharedFrameMapBytes = 0;
-
-static size_t sharedFrameFileBytes(void) {
-    return sizeof(AuxSharedFrameHeader) +
-        (size_t)AUX_SHARED_FRAME_SLOT_COUNT * AUX_SHARED_FRAME_SLOT_CAPACITY;
-}
-
-static int32_t ensureSharedFrameMap(void) {
-    if (gSharedFrameMap != MAP_FAILED) return 0;
-    const size_t bytes = sharedFrameFileBytes();
-    int fd = shm_open(kSharedFrameName, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) return -10;
-    (void)fchmod(fd, 0666);
-    struct stat st;
-    if (fstat(fd, &st) != 0 || (size_t)st.st_size < bytes) {
-        if (ftruncate(fd, (off_t)bytes) != 0) {
-            close(fd);
-            return -11;
-        }
-    }
-    void *map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        close(fd);
-        return -12;
-    }
-    AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)map;
-    if (__atomic_load_n(&header->magic, __ATOMIC_ACQUIRE) != AUX_SHARED_FRAME_MAGIC ||
-        header->version != AUX_SHARED_FRAME_VERSION) {
-        memset(header, 0, sizeof(*header));
-        header->version = AUX_SHARED_FRAME_VERSION;
-        __atomic_store_n(&header->magic, AUX_SHARED_FRAME_MAGIC, __ATOMIC_RELEASE);
-    }
-    gSharedFrameFD = fd;
-    gSharedFrameMap = map;
-    gSharedFrameMapBytes = bytes;
-    return 0;
-}
+static int gSurfaceFD = -1;
 
 static int32_t makeDecoder(AuxH264Decoder *decoder) {
     if (WelsCreateDecoder(&decoder->api) != 0 || decoder->api == NULL) return -1;
@@ -116,10 +79,22 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
         yStride < width || uvStride < width / 2 || ySrc == NULL || uSrc == NULL || vSrc == NULL) return -3;
 
+    CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFMutableDictionaryRef surfaceAttributes = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (attributes == NULL || surfaceAttributes == NULL) {
+        if (attributes != NULL) CFRelease(attributes);
+        if (surfaceAttributes != NULL) CFRelease(surfaceAttributes);
+        return -8;
+    }
+    CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, surfaceAttributes);
+    CFRelease(surfaceAttributes);
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn createStatus = CVPixelBufferCreate(
         kCFAllocatorDefault, (size_t)width, (size_t)height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pixelBuffer);
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attributes, &pixelBuffer);
+    CFRelease(attributes);
     if (createStatus != kCVReturnSuccess || pixelBuffer == NULL) {
         if (pixelBuffer != NULL) CVPixelBufferRelease(pixelBuffer);
         return -2000 - (int32_t)createStatus;
@@ -156,68 +131,23 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
 }
 
 int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
-    if (frame == NULL || !CVPixelBufferIsPlanar(frame) || CVPixelBufferGetPlaneCount(frame) < 2) return -1;
-    const size_t width = CVPixelBufferGetWidth(frame);
-    const size_t height = CVPixelBufferGetHeight(frame);
-    if (width == 0 || height == 0 || (width & 1) || (height & 1) ||
-        width > 4096 || height > 2160 || width * height * 3 / 2 > AUX_SHARED_FRAME_SLOT_CAPACITY) return -2;
-    if (CVPixelBufferLockBaseAddress(frame, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -3;
-    const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(frame, 0);
-    const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(frame, 1);
-    const size_t srcYStride = CVPixelBufferGetBytesPerRowOfPlane(frame, 0);
-    const size_t srcUVStride = CVPixelBufferGetBytesPerRowOfPlane(frame, 1);
-    if (srcY == NULL || srcUV == NULL || srcYStride < width || srcUVStride < width) {
-        CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
-        return -4;
-    }
+    if (frame == NULL) return -1;
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(frame);
+    if (surface == NULL) return -2;
+    IOSurfaceID surfaceID = IOSurfaceGetID(surface);
+    if (surfaceID == 0) return -3;
+
+    char contents[16];
+    int length = snprintf(contents, sizeof(contents), "id=%010u\n", surfaceID);
+    if (length != 14) return -4;
 
     pthread_mutex_lock(&gPublishMutex);
-    int32_t mapResult = ensureSharedFrameMap();
-    if (mapResult != 0) {
-        pthread_mutex_unlock(&gPublishMutex);
-        CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
-        return mapResult;
+    if (gSurfaceFD < 0) {
+        gSurfaceFD = open(kSurfacePath, O_CREAT | O_WRONLY, 0666);
+        if (gSurfaceFD >= 0) (void)fchmod(gSurfaceFD, 0666);
     }
-    AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)gSharedFrameMap;
-    uint32_t active = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
-    if (active >= AUX_SHARED_FRAME_SLOT_COUNT) active = 0;
-    uint32_t target = AUX_SHARED_FRAME_SLOT_COUNT;
-    for (uint32_t i = 0; i < AUX_SHARED_FRAME_SLOT_COUNT; i++) {
-        if (i == active) continue;
-        AuxSharedFrameSlot *slot = &header->slots[i];
-        uint32_t stateValue = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
-        if (stateValue != AUX_SHARED_SLOT_FREE && stateValue != AUX_SHARED_SLOT_READY) continue;
-        if (__atomic_compare_exchange_n(&slot->state, &stateValue, AUX_SHARED_SLOT_WRITING,
-                                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            target = i;
-            break;
-        }
-    }
-    if (target >= AUX_SHARED_FRAME_SLOT_COUNT) {
-        pthread_mutex_unlock(&gPublishMutex);
-        CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
-        return -5;
-    }
-
-    AuxSharedFrameSlot *slot = &header->slots[target];
-    uint8_t *dst = (uint8_t *)gSharedFrameMap + sizeof(*header) +
-        (size_t)target * AUX_SHARED_FRAME_SLOT_CAPACITY;
-    for (size_t row = 0; row < height; row++) {
-        memcpy(dst + row * width, srcY + row * srcYStride, width);
-    }
-    uint8_t *dstUV = dst + width * height;
-    for (size_t row = 0; row < height / 2; row++) {
-        memcpy(dstUV + row * width, srcUV + row * srcUVStride, width);
-    }
-    slot->width = (uint32_t)width;
-    slot->height = (uint32_t)height;
-    slot->yStride = (uint32_t)width;
-    slot->uvStride = (uint32_t)width;
-    slot->frameBytes = (uint32_t)(width * height * 3 / 2);
-    __atomic_store_n(&slot->state, AUX_SHARED_SLOT_READY, __ATOMIC_RELEASE);
-    __atomic_store_n(&header->activeSlot, target, __ATOMIC_RELEASE);
-    __atomic_add_fetch(&header->sequence, 1, __ATOMIC_ACQ_REL);
+    ssize_t written = gSurfaceFD >= 0 ? pwrite(gSurfaceFD, contents, (size_t)length, 0) : -1;
+    int result = written == length ? 1 : -5;
     pthread_mutex_unlock(&gPublishMutex);
-    CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
-    return 1;
+    return result;
 }
