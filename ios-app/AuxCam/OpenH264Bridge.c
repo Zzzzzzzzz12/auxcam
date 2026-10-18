@@ -20,6 +20,68 @@ static const char *kSurfacePath = "/var/mobile/Media/DCIM/.frame.surface";
 static pthread_mutex_t gPublishMutex = PTHREAD_MUTEX_INITIALIZER;
 static int gSurfaceFD = -1;
 
+static void setSurfaceNumber(CFMutableDictionaryRef dictionary, CFStringRef key, int64_t value) {
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &value);
+    if (number != NULL) {
+        CFDictionarySetValue(dictionary, key, number);
+        CFRelease(number);
+    }
+}
+
+static CFMutableDictionaryRef makeSurfacePlane(size_t width, size_t height, size_t rowBytes,
+                                                size_t offset, size_t size, size_t bytesPerElement) {
+    CFMutableDictionaryRef plane = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (plane == NULL) return NULL;
+    setSurfaceNumber(plane, kIOSurfacePlaneWidth, (int64_t)width);
+    setSurfaceNumber(plane, kIOSurfacePlaneHeight, (int64_t)height);
+    setSurfaceNumber(plane, kIOSurfacePlaneBytesPerRow, (int64_t)rowBytes);
+    setSurfaceNumber(plane, kIOSurfacePlaneOffset, (int64_t)offset);
+    setSurfaceNumber(plane, kIOSurfacePlaneSize, (int64_t)size);
+    setSurfaceNumber(plane, kIOSurfacePlaneBytesPerElement, (int64_t)bytesPerElement);
+    return plane;
+}
+
+static IOSurfaceRef createNV12Surface(size_t width, size_t height) {
+    size_t yRow = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, width);
+    size_t uvRow = IOSurfaceAlignProperty(kIOSurfacePlaneBytesPerRow, width);
+    if (yRow < width || uvRow < width || yRow > SIZE_MAX / height || uvRow > SIZE_MAX / (height / 2)) return NULL;
+    size_t ySize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, yRow * height);
+    size_t uvSize = IOSurfaceAlignProperty(kIOSurfaceAllocSize, uvRow * (height / 2));
+    if (ySize == 0 || uvSize == 0 || ySize > SIZE_MAX - uvSize) return NULL;
+
+    CFMutableDictionaryRef yPlane = makeSurfacePlane(width, height, yRow, 0, ySize, 1);
+    CFMutableDictionaryRef uvPlane = makeSurfacePlane(width / 2, height / 2, uvRow, ySize, uvSize, 2);
+    if (yPlane == NULL || uvPlane == NULL) {
+        if (yPlane != NULL) CFRelease(yPlane);
+        if (uvPlane != NULL) CFRelease(uvPlane);
+        return NULL;
+    }
+    const void *planes[] = { yPlane, uvPlane };
+    CFArrayRef planeInfo = CFArrayCreate(kCFAllocatorDefault, planes, 2, &kCFTypeArrayCallBacks);
+    CFRelease(yPlane);
+    CFRelease(uvPlane);
+    if (planeInfo == NULL) return NULL;
+
+    CFMutableDictionaryRef properties = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 5, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (properties == NULL) {
+        CFRelease(planeInfo);
+        return NULL;
+    }
+    setSurfaceNumber(properties, kIOSurfaceWidth, (int64_t)width);
+    setSurfaceNumber(properties, kIOSurfaceHeight, (int64_t)height);
+    setSurfaceNumber(properties, kIOSurfacePixelFormat, (int64_t)kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+    setSurfaceNumber(properties, kIOSurfaceAllocSize, (int64_t)(ySize + uvSize));
+    CFDictionarySetValue(properties, kIOSurfacePlaneInfo, planeInfo);
+    CFDictionarySetValue(properties, kIOSurfaceIsGlobal, kCFBooleanTrue);
+    CFRelease(planeInfo);
+
+    IOSurfaceRef surface = IOSurfaceCreate(properties);
+    CFRelease(properties);
+    return surface;
+}
+
 static int32_t makeDecoder(AuxH264Decoder *decoder) {
     if (WelsCreateDecoder(&decoder->api) != 0 || decoder->api == NULL) return -1;
     SDecodingParam parameters;
@@ -79,10 +141,12 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
         yStride < width || uvStride < width / 2 || ySrc == NULL || uSrc == NULL || vSrc == NULL) return -3;
 
+    IOSurfaceRef surface = createNV12Surface((size_t)width, (size_t)height);
+    if (surface == NULL) return -20;
     CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn createStatus = CVPixelBufferCreate(
-        kCFAllocatorDefault, (size_t)width, (size_t)height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pixelBuffer);
+    CVReturn createStatus = CVPixelBufferCreateWithIOSurface(
+        kCFAllocatorDefault, surface, NULL, &pixelBuffer);
+    CFRelease(surface);
     if (createStatus != kCVReturnSuccess || pixelBuffer == NULL) {
         if (pixelBuffer != NULL) CVPixelBufferRelease(pixelBuffer);
         return -2000 - (int32_t)createStatus;
