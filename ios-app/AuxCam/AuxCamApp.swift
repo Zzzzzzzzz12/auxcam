@@ -11,6 +11,8 @@ import Darwin
 import VideoToolbox
 import UniformTypeIdentifiers
 import QuartzCore
+import CoreImage
+import ImageIO
 
 @main
 struct AuxCamApp: App {
@@ -270,6 +272,10 @@ final class StreamDecoder {
     // OpenH264 只在解码器初始化时补一次 SPS/PPS。
     // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
     private var openH264NeedsParameterSets = true
+    // MJPEG 路径：系统硬件 JPEG 解码 + Core Image GPU 转 NV12（全范围）
+    private let jpegContext = CIContext(options: [.useSoftwareRenderer: false])
+    private var jpegPixelBuffer: CVPixelBuffer?
+    private var jpegFrameCount: Int64 = 0
     private let goldenDiffLock = NSLock()
     private var goldenFormatFields: [String: String]?
     private var goldenSampleFields: [String: String]?
@@ -884,6 +890,51 @@ final class StreamDecoder {
             }
         }
     }
+    // MARK: - MJPEG 路径（系统硬件 JPEG 解码 + GPU 转 NV12，绕开所有 H.264 解码坑）
+    func feedJPEG(_ data: Data) {
+        queue.async { [weak self] in self?.decodeJPEG(data) }
+    }
+
+    private func decodeJPEG(_ data: Data) {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(
+                source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
+            if jpegFrameCount == 0 || jpegFrameCount % 90 == 0 {
+                StreamDecoder.dlog("JPEG 解码失败 bytes=\(data.count)")
+            }
+            return
+        }
+        let width = cgImage.width
+        let height = cgImage.height
+        if jpegPixelBuffer == nil ||
+            CVPixelBufferGetWidth(jpegPixelBuffer!) != width ||
+            CVPixelBufferGetHeight(jpegPixelBuffer!) != height {
+            var pb: CVPixelBuffer?
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                                attrs as CFDictionary, &pb)
+            jpegPixelBuffer = pb
+        }
+        guard let buffer = jpegPixelBuffer else { return }
+        let ciImage = CIImage(cgImage: cgImage)
+        jpegContext.render(ciImage, to: buffer,
+                           bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                           colorSpace: CGColorSpaceCreateDeviceRGB())
+        let published = auxcam_publish_shared_frame(buffer)
+        if published == 1 {
+            jpegFrameCount += 1
+            if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
+                StreamDecoder.dlog("MJPEG 帧 #\(jpegFrameCount) \(width)x\(height) bytes=\(data.count)")
+            }
+        } else if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
+            StreamDecoder.dlog("MJPEG 发布失败 rc=\(published)")
+        }
+    }
+
     private static func splitAnnexBRanges(_ data: Data) -> [Range<Int>] {
         data.withUnsafeBytes { rawBuffer in
             guard let bytes = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return [] }
@@ -1184,6 +1235,10 @@ final class VCU1Receiver: ObservableObject {
                 decoder.feed(payload, keyframe: (flags & 1) != 0)
                 countFrame(payload.count)
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
+            case 10:
+                // MJPEG 帧：系统硬件 JPEG 解码 → 共享画面（最稳路径）
+                decoder.feedJPEG(payload)
+                countFrame(payload.count)
             case 5: lastHb = Date()
             default: break
             }
