@@ -596,6 +596,11 @@ final class StreamDecoder {
             return raw[range.lowerBound] & 0x1F
         }
         let hasIDR = types.contains(5)
+        let inputCount = StreamDecoder.feedCount
+        if inputCount <= 3 || inputCount % 90 == 0 {
+            let typeList = types.prefix(8).map { String($0) }.joined(separator: ",")
+            StreamDecoder.dlog("decode input #\(inputCount) bytes=\(raw.count) nals=\(typeList) idr=\(hasIDR) keyframe=\(keyframe) waiting=\(isWaitingForKeyframe())")
+        }
         guard types.contains(where: { $0 == 1 || $0 == 5 }) else { return }
         if keyframe != hasIDR {
             StreamDecoder.dlog("keyframe flag mismatch flag=\(keyframe) IDR=\(hasIDR)")
@@ -620,6 +625,9 @@ final class StreamDecoder {
             return auxh264_decode(softwareDecoder, base, Int32(bytes.count), &unmanagedImage)
         }
         decodeCallCount += 1
+        if decodeCallCount <= 3 || decodeCallCount % 90 == 0 {
+            StreamDecoder.dlog("software decode result #\(decodeCallCount) result=\(result) output=\(unmanagedImage != nil) idr=\(hasIDR)")
+        }
         if result < 0 {
             setWaitingForKeyframe(true)
             if decodeCallCount <= 5 || decodeCallCount % 90 == 0 {
