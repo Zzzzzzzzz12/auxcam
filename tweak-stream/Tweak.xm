@@ -18,7 +18,7 @@
 #include <stdlib.h>
 
 static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
-static const char *kFrameShmName = "/auxcam_frame_v2";
+static const char *kFramePath = "/var/mobile/Media/DCIM/.frame.ring";
 static NSString *const kBeatPath = @"/var/mobile/Media/DCIM/.auxcam-stream-heartbeat";
 static NSString *const kLogPath  = @"/var/mobile/Media/DCIM/.auxcam-stream.log";
 
@@ -67,11 +67,11 @@ static CVPixelBufferRef CopyLastFrame(void) {
 
 static BOOL MapSharedFrame(void) {
     if (gFrameMap != MAP_FAILED) return YES;
-    int fd = shm_open(kFrameShmName, O_RDWR, 0);
+    int fd = open(kFramePath, O_RDWR);
     if (fd < 0) {
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"共享内存打开失败 errno=%d", errno);
+            SLog(@"共享帧文件打开失败 errno=%d", errno);
         return NO;
     }
     struct stat st;
