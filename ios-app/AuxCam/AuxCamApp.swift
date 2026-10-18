@@ -375,7 +375,8 @@ final class StreamDecoder {
                 return
             }
             let trackFormats = track.formatDescriptions
-            if let format = trackFormats.first {
+            if let firstFormat = trackFormats.first {
+                let format = firstFormat as! CMVideoFormatDescription
                 StreamDecoder.dlog("golden track format count=\(trackFormats.count) \(Self.formatSummary(format))")
             } else {
                 StreamDecoder.dlog("golden track format descriptions count=\(trackFormats.count)")
