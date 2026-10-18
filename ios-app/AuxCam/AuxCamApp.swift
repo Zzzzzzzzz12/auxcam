@@ -304,7 +304,6 @@ final class StreamDecoder {
             self.frameIndex = 0
             self.setWaitingForKeyframe(true)
             self.build()
-            self.testGoldenPath()
         }
     }
 
@@ -312,7 +311,7 @@ final class StreamDecoder {
     // 这条路径不改 sample、不使用实时 session，也不把测试帧发布给相机插件。
     // 收到首个 VCU1 配置后自动在 utility 队列运行一次，避免影响主线程和实时解码队列。
     func testGoldenPath() {
-        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam_golden.mp4")
+        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4")
         guard FileManager.default.fileExists(atPath: url.path) else {
             StreamDecoder.dlog("golden skipped: vcam.mp4 not found")
             return
@@ -637,6 +636,9 @@ final class StreamDecoder {
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
         softwareDecoder = nil
         StreamDecoder.buildCount += 1
+        let decoderSpecification: [String: Any] = [
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: kCFBooleanFalse
+        ]
 
         let formatStatus = sps.withUnsafeBytes { spsBytes -> OSStatus in
             pps.withUnsafeBytes { ppsBytes -> OSStatus in
@@ -666,7 +668,7 @@ final class StreamDecoder {
                 let createStatus = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault,
                     formatDescription: format,
-                    decoderSpecification: nil,
+                    decoderSpecification: decoderSpecification as CFDictionary,
                     imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &callback,
                     decompressionSessionOut: &session)
@@ -679,7 +681,7 @@ final class StreamDecoder {
                     key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
                     allocator: kCFAllocatorDefault,
                     valueOut: &hardwareValue)
-                StreamDecoder.dlog("VideoToolbox session ready hardwareRequested=default propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
+                StreamDecoder.dlog("VideoToolbox session ready hardwareRequested=false propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
                 return noErr
             }
         }
