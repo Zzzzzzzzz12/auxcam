@@ -304,6 +304,7 @@ final class StreamDecoder {
             self.frameIndex = 0
             self.setWaitingForKeyframe(true)
             self.build()
+            self.testGoldenPath()
         }
     }
 
@@ -311,7 +312,7 @@ final class StreamDecoder {
     // 这条路径不改 sample、不使用实时 session，也不把测试帧发布给相机插件。
     // 收到首个 VCU1 配置后自动在 utility 队列运行一次，避免影响主线程和实时解码队列。
     func testGoldenPath() {
-        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4")
+        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam_golden.mp4")
         guard FileManager.default.fileExists(atPath: url.path) else {
             StreamDecoder.dlog("golden skipped: vcam.mp4 not found")
             return
