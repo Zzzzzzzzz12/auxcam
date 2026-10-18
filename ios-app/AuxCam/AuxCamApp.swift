@@ -251,6 +251,8 @@ struct CamPreview: UIViewRepresentable {
 final class StreamDecoder {
     static let logPath = "/var/mobile/Media/DCIM/.dec.log"
     private var softwareDecoder: UnsafeMutableRawPointer?
+    private var videoToolboxSession: VTDecompressionSession?
+    private var videoFormatDescription: CMVideoFormatDescription?
     private var sps = Data()
     private var pps = Data()
     private var frameIndex: Int64 = 0
@@ -273,6 +275,7 @@ final class StreamDecoder {
     private static let runID = String(UUID().uuidString.prefix(8))
 
     deinit {
+        if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
     }
     static func dlog(_ s: String) {
@@ -574,22 +577,75 @@ final class StreamDecoder {
 
     private func build() {
         guard sps.count > 3, pps.count > 3 else {
-            StreamDecoder.dlog("software decoder waiting for SPS/PPS")
+            StreamDecoder.dlog("decoder waiting for SPS/PPS")
             return
         }
+        if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
+        videoToolboxSession = nil
+        videoFormatDescription = nil
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
-        softwareDecoder = auxh264_create()
+        softwareDecoder = nil
         StreamDecoder.buildCount += 1
-        StreamDecoder.dlog("software decoder init ok=\(softwareDecoder != nil) generation=\(StreamDecoder.buildCount)")
+
+        let formatStatus = sps.withUnsafeBytes { spsBytes -> OSStatus in
+            pps.withUnsafeBytes { ppsBytes -> OSStatus in
+                guard let spsPointer = spsBytes.bindMemory(to: UInt8.self).baseAddress,
+                      let ppsPointer = ppsBytes.bindMemory(to: UInt8.self).baseAddress else {
+                    return -1
+                }
+                let pointers = [spsPointer, ppsPointer]
+                var sizes = [sps.count, pps.count]
+                var format: CMVideoFormatDescription?
+                let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: kCFAllocatorDefault,
+                    parameterSetCount: 2,
+                    parameterSetPointers: pointers,
+                    parameterSetSizes: &sizes,
+                    nalUnitHeaderLength: 4,
+                    formatDescriptionOut: &format)
+                guard status == noErr, let format else { return status }
+                videoFormatDescription = format
+                var callback = VTDecompressionOutputCallbackRecord(
+                    decompressionOutputCallback: StreamDecoder.frameCallback,
+                    decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+                let decoderSpecification: [String: Any] = [
+                    kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: kCFBooleanTrue as Any
+                ]
+                let imageAttributes: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+                ]
+                var session: VTDecompressionSession?
+                let createStatus = VTDecompressionSessionCreate(
+                    allocator: kCFAllocatorDefault,
+                    formatDescription: format,
+                    decoderSpecification: decoderSpecification as CFDictionary,
+                    imageBufferAttributes: imageAttributes as CFDictionary,
+                    outputCallback: &callback,
+                    decompressionSessionOut: &session)
+                guard createStatus == noErr, let session else { return createStatus }
+                videoToolboxSession = session
+                VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+                var hardwareValue: CFTypeRef?
+                let hardwareStatus = VTSessionCopyProperty(
+                    session,
+                    key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                    allocator: kCFAllocatorDefault,
+                    valueOut: &hardwareValue)
+                StreamDecoder.dlog("VideoToolbox session ready hardwareRequired=true propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
+                return noErr
+            }
+        }
+
+        if videoToolboxSession == nil {
+            softwareDecoder = auxh264_create()
+            StreamDecoder.dlog("VideoToolbox unavailable status=\(formatStatus); OpenH264 fallback=\(softwareDecoder != nil)")
+        } else {
+            StreamDecoder.dlog("VideoToolbox hardware session ready generation=\(StreamDecoder.buildCount)")
+        }
     }
+
     private func decode(_ raw: Data, keyframe: Bool) {
         StreamDecoder.feedCount += 1
-        guard let softwareDecoder else {
-            if StreamDecoder.feedCount <= 3 || StreamDecoder.feedCount % 90 == 0 {
-                StreamDecoder.dlog("software decode waiting for config input=\(raw.count)")
-            }
-            return
-        }
         let nalRanges = Self.splitAnnexBRanges(raw)
         let types = nalRanges.compactMap { range -> UInt8? in
             guard range.lowerBound < raw.count else { return nil }
@@ -606,7 +662,123 @@ final class StreamDecoder {
             StreamDecoder.dlog("keyframe flag mismatch flag=\(keyframe) IDR=\(hasIDR)")
         }
         if isWaitingForKeyframe() && !hasIDR { return }
+        if hasIDR { setWaitingForKeyframe(false) }
 
+        if videoToolboxSession != nil {
+            let slices = nalRanges.filter { range in
+                guard range.lowerBound < raw.count else { return false }
+                let type = raw[range.lowerBound] & 0x1F
+                return type == 1 || type == 5
+            }
+            if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) { return }
+            StreamDecoder.dlog("VideoToolbox rejected frame; switching to OpenH264")
+            if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
+            videoToolboxSession = nil
+            videoFormatDescription = nil
+            if hasIDR { setWaitingForKeyframe(false) }
+            else { setWaitingForKeyframe(true); return }
+            softwareDecoder = auxh264_create()
+        }
+        decodeOpenH264(raw, types: types, hasIDR: hasIDR)
+    }
+
+    private func decodeVideoToolbox(_ raw: Data, slices: [Range<Int>], isKeyframe: Bool) -> Bool {
+        guard let session = videoToolboxSession, let format = videoFormatDescription, !slices.isEmpty else { return false }
+        var accessUnit = Data()
+        for range in slices {
+            guard range.count > 0, range.count <= Int(UInt32.max) else { return false }
+            var length = UInt32(range.count).bigEndian
+            withUnsafeBytes(of: &length) { accessUnit.append(contentsOf: $0) }
+            accessUnit.append(contentsOf: raw[range])
+        }
+        guard !accessUnit.isEmpty, let memory = malloc(accessUnit.count) else { return false }
+        let destination = memory.assumingMemoryBound(to: UInt8.self)
+        let copied = accessUnit.withUnsafeBytes { bytes -> Bool in
+            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return false }
+            destination.update(from: base, count: bytes.count)
+            return true
+        }
+        guard copied else { free(memory); return false }
+        var block: CMBlockBuffer?
+        var source = CMBlockBufferCustomBlockSource(
+            version: 0,
+            AllocateBlock: nil,
+            FreeBlock: { _, memoryBlock, _ in free(memoryBlock) },
+            refCon: nil)
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: memory,
+            blockLength: accessUnit.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: &source,
+            offsetToData: 0,
+            dataLength: accessUnit.count,
+            flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &block)
+        guard let block else { free(memory); StreamDecoder.dlog("VideoToolbox block buffer failed status=\(blockStatus)"); return false }
+
+        var sample: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: CMTime(value: frameIndex, timescale: 30),
+            decodeTimeStamp: .invalid)
+        frameIndex += 1
+        var sampleSize = accessUnit.count
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: block,
+            formatDescription: format,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sample)
+        guard let sample else { StreamDecoder.dlog("VideoToolbox sample buffer failed status=\(sampleStatus)"); return false }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0,
+           let item = CFArrayGetValueAtIndex(attachments, 0) {
+            let attachment = unsafeBitCast(item, to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                attachment,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                Unmanaged.passUnretained(isKeyframe ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
+            CFDictionarySetValue(
+                attachment,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+
+        outputLock.lock()
+        let callbackBefore = callbackCount
+        lastCallbackStatus = noErr
+        activeDecodeCall = decodeCallCount + 1
+        outputLock.unlock()
+        var info = VTDecodeInfoFlags()
+        let decodeStatus = VTDecompressionSessionDecodeFrame(
+            session,
+            sampleBuffer: sample,
+            flags: [],
+            frameRefcon: nil,
+            infoFlagsOut: &info)
+        outputLock.lock()
+        let callbackResult = lastCallbackStatus
+        let callbackReceived = callbackCount > callbackBefore
+        activeDecodeCall = 0
+        outputLock.unlock()
+        decodeCallCount += 1
+        if decodeCallCount <= 3 || decodeCallCount % 90 == 0 {
+            StreamDecoder.dlog("VideoToolbox frame #\(decodeCallCount) decode=\(decodeStatus) callback=\(callbackResult) gotFrame=\(callbackReceived) info=\(info.rawValue)")
+        }
+        return decodeStatus == noErr && callbackReceived && callbackResult == noErr
+    }
+
+    private func decodeOpenH264(_ raw: Data, types: [UInt8], hasIDR: Bool) {
+        if softwareDecoder == nil { softwareDecoder = auxh264_create() }
+        guard let softwareDecoder else {
+            StreamDecoder.dlog("OpenH264 fallback could not initialize")
+            return
+        }
         var accessUnit = Data()
         if hasIDR {
             if !types.contains(7), !sps.isEmpty {
@@ -618,7 +790,6 @@ final class StreamDecoder {
         }
         accessUnit.append(raw)
         guard accessUnit.count <= Int(Int32.max) else { return }
-
         var unmanagedImage: Unmanaged<CVPixelBuffer>?
         let result = accessUnit.withUnsafeBytes { bytes -> Int32 in
             guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return -1 }
@@ -626,12 +797,12 @@ final class StreamDecoder {
         }
         decodeCallCount += 1
         if decodeCallCount <= 3 || decodeCallCount % 90 == 0 {
-            StreamDecoder.dlog("software decode result #\(decodeCallCount) result=\(result) output=\(unmanagedImage != nil) idr=\(hasIDR)")
+            StreamDecoder.dlog("OpenH264 decode #\(decodeCallCount) result=\(result) output=\(unmanagedImage != nil) idr=\(hasIDR)")
         }
         if result < 0 {
             setWaitingForKeyframe(true)
             if decodeCallCount <= 5 || decodeCallCount % 90 == 0 {
-                StreamDecoder.dlog("software decode failed result=\(result) bytes=\(accessUnit.count) idr=\(hasIDR)")
+                StreamDecoder.dlog("OpenH264 failed result=\(result) bytes=\(accessUnit.count) idr=\(hasIDR)")
             }
             return
         }
@@ -640,7 +811,7 @@ final class StreamDecoder {
             frameIndex += 1
             publish(status: noErr, imageBuffer: image, sourceFrameID: frameIndex)
             if frameIndex <= 3 || frameIndex % 90 == 0 {
-                StreamDecoder.dlog("software frame #\(frameIndex) \(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image)) input=\(accessUnit.count)")
+                StreamDecoder.dlog("OpenH264 frame #\(frameIndex) \(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image)) input=\(accessUnit.count)")
             }
         }
     }
@@ -942,7 +1113,6 @@ final class VCU1Receiver: ObservableObject {
             case 2:
                 // 先把最新帧送进 VideoToolbox 并发布共享画面，兼容环形文件写入放后面。
                 decoder.feed(payload, keyframe: (flags & 1) != 0)
-                appendVideo(payload, keyframe: (flags & 1) != 0)
                 countFrame(payload.count)
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
             case 5: lastHb = Date()
