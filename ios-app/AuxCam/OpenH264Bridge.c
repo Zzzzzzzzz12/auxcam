@@ -2,7 +2,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include "codec_api.h"
 #include <fcntl.h>
-#include <IOSurface/IOSurface.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <limits.h>
