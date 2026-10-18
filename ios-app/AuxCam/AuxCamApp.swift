@@ -267,6 +267,9 @@ final class StreamDecoder {
     private var sessionGeneration: Int64 = 0
     private var goldenTestStarted = false
     private let goldenTestLock = NSLock()
+    // OpenH264 只在解码器初始化时补一次 SPS/PPS。
+    // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
+    private var openH264NeedsParameterSets = true
     private let goldenDiffLock = NSLock()
     private var goldenFormatFields: [String: String]?
     private var goldenSampleFields: [String: String]?
@@ -690,6 +693,7 @@ final class StreamDecoder {
 
         if videoToolboxSession == nil {
             softwareDecoder = auxh264_create()
+            openH264NeedsParameterSets = true
             StreamDecoder.dlog("VideoToolbox unavailable status=\(formatStatus); OpenH264 fallback=\(softwareDecoder != nil)")
         } else {
             StreamDecoder.dlog("VideoToolbox hardware session ready generation=\(StreamDecoder.buildCount)")
@@ -730,6 +734,7 @@ final class StreamDecoder {
             if hasIDR { setWaitingForKeyframe(false) }
             else { setWaitingForKeyframe(true); return }
             softwareDecoder = auxh264_create()
+            openH264NeedsParameterSets = true
         }
         decodeOpenH264(raw, types: types, hasIDR: hasIDR)
     }
@@ -832,19 +837,25 @@ final class StreamDecoder {
     }
 
     private func decodeOpenH264(_ raw: Data, types: [UInt8], hasIDR: Bool) {
-        if softwareDecoder == nil { softwareDecoder = auxh264_create() }
+        if softwareDecoder == nil {
+            softwareDecoder = auxh264_create()
+            openH264NeedsParameterSets = true
+        }
         guard let softwareDecoder else {
             StreamDecoder.dlog("OpenH264 fallback could not initialize")
             return
         }
         var accessUnit = Data()
-        if hasIDR {
+        // 只在解码器刚创建时补一次 SPS/PPS；重复补会让解码器判坏帧（实测）
+        if openH264NeedsParameterSets, hasIDR {
             if !types.contains(7), !sps.isEmpty {
                 accessUnit.append(contentsOf: [0, 0, 0, 1]); accessUnit.append(sps)
             }
             if !types.contains(8), !pps.isEmpty {
                 accessUnit.append(contentsOf: [0, 0, 0, 1]); accessUnit.append(pps)
             }
+            openH264NeedsParameterSets = false
+            StreamDecoder.dlog("OpenH264 注入参数集 sps=\(sps.count) pps=\(pps.count)")
         }
         accessUnit.append(raw)
         guard accessUnit.count <= Int(Int32.max) else { return }
