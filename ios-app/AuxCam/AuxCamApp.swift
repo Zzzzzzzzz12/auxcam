@@ -305,6 +305,7 @@ final class StreamDecoder {
             self.setWaitingForKeyframe(true)
             self.build()
         }
+        testGoldenPath()
     }
 
     // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
@@ -406,16 +407,26 @@ final class StreamDecoder {
             var callback = VTDecompressionOutputCallbackRecord(
                 decompressionOutputCallback: StreamDecoder.goldenCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
+            let decoderSpecification: [String: Any] = [
+                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: kCFBooleanTrue as Any
+            ]
             let imageAttributes: [String: Any] = [:]
             let createStatus = VTDecompressionSessionCreate(
                 allocator: kCFAllocatorDefault, formatDescription: format,
-                decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
+                decoderSpecification: decoderSpecification as CFDictionary, imageBufferAttributes: imageAttributes as CFDictionary,
                 outputCallback: &callback, decompressionSessionOut: &decoderSession)
             guard createStatus == noErr, let session = decoderSession else {
                 StreamDecoder.dlog("golden create failed status=\(createStatus) session=\(decoderSession != nil)")
                 return
             }
             VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+            var hardwareValue: CFTypeRef?
+            let hardwareStatus = VTSessionCopyProperty(
+                session,
+                key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                allocator: kCFAllocatorDefault,
+                valueOut: &hardwareValue)
+            StreamDecoder.dlog("golden session hardwareStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
 
             var info = VTDecodeInfoFlags()
             StreamDecoder.dlog("golden DecodeFrame begin sample=\(Self.sampleSummary(sample))")
@@ -683,7 +694,10 @@ final class StreamDecoder {
     }
 
     private func decodeVideoToolbox(_ raw: Data, slices: [Range<Int>], isKeyframe: Bool) -> Bool {
-        guard let session = videoToolboxSession, let format = videoFormatDescription, !slices.isEmpty else { return false }
+        guard let session = videoToolboxSession, let format = videoFormatDescription, !slices.isEmpty else {
+            StreamDecoder.dlog("VideoToolbox input unavailable session=\(videoToolboxSession != nil) format=\(videoFormatDescription != nil) slices=\(slices.count)")
+            return false
+        }
         var accessUnit = Data()
         for range in slices {
             guard range.count > 0, range.count <= Int(UInt32.max) else { return false }
@@ -747,6 +761,13 @@ final class StreamDecoder {
                 attachment,
                 Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+
+        if frameIndex == 0 {
+            StreamDecoder.dlog("VideoToolbox manual format \(Self.formatSummary(format))")
+            StreamDecoder.dlog("VideoToolbox manual sample \(Self.sampleSummary(sample))")
+            logGoldenDiff(kind: "format", candidate: Self.formatFields(format))
+            logGoldenDiff(kind: "sample", candidate: Self.sampleFields(sample))
         }
 
         outputLock.lock()
