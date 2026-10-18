@@ -374,8 +374,8 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: no video track")
                 return
             }
-            let trackFormats = track.formatDescriptions.compactMap { $0 as? CMFormatDescription }
-            if let format = trackFormats.first as? CMVideoFormatDescription {
+            let trackFormats = track.formatDescriptions
+            if let format = trackFormats.first {
                 StreamDecoder.dlog("golden track format count=\(trackFormats.count) \(Self.formatSummary(format))")
             } else {
                 StreamDecoder.dlog("golden track format descriptions count=\(trackFormats.count)")
