@@ -636,9 +636,6 @@ final class StreamDecoder {
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
         softwareDecoder = nil
         StreamDecoder.buildCount += 1
-        let decoderSpecification: [String: Any] = [
-            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as String: kCFBooleanFalse
-        ]
 
         let formatStatus = sps.withUnsafeBytes { spsBytes -> OSStatus in
             pps.withUnsafeBytes { ppsBytes -> OSStatus in
@@ -661,14 +658,19 @@ final class StreamDecoder {
                 var callback = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+                let dimensions = CMVideoFormatDescriptionGetDimensions(format)
                 let imageAttributes: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                    kCVPixelBufferWidthKey as String: NSNumber(value: Int(dimensions.width)),
+                    kCVPixelBufferHeightKey as String: NSNumber(value: Int(dimensions.height)),
+                    kCVPixelBufferOpenGLESCompatibilityKey as String: kCFBooleanTrue as Any,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
                 ]
                 var session: VTDecompressionSession?
                 let createStatus = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault,
                     formatDescription: format,
-                    decoderSpecification: decoderSpecification as CFDictionary,
+                    decoderSpecification: nil,
                     imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &callback,
                     decompressionSessionOut: &session)
@@ -681,7 +683,7 @@ final class StreamDecoder {
                     key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
                     allocator: kCFAllocatorDefault,
                     valueOut: &hardwareValue)
-                StreamDecoder.dlog("VideoToolbox session ready hardwareRequested=false propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
+                StreamDecoder.dlog("VideoToolbox session ready hardwareRequested=default propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
                 return noErr
             }
         }
