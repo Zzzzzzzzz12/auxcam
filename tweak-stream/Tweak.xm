@@ -1,6 +1,6 @@
-// AuxCamStream —— 用 App 解码后的共享内存帧替换相机输出。
-// App 负责收电脑视频和解码；插件只读取最新 NV12 帧并替换相机样本。
-// 配置: /var/mobile/Media/DCIM/stream.cfg  active=1 才干活；active=0 完全放行真相机。
+﻿// AuxCamStream 鈥斺€?鐢?App 瑙ｇ爜鍚庣殑鍏变韩鍐呭瓨甯ф浛鎹㈢浉鏈鸿緭鍑恒€?
+// App 璐熻矗鏀剁數鑴戣棰戝拰瑙ｇ爜锛涙彃浠跺彧璇诲彇鏈€鏂?NV12 甯у苟鏇挎崲鐩告満鏍锋湰銆?
+// 閰嶇疆: /var/mobile/Media/DCIM/stream.cfg  active=1 鎵嶅共娲伙紱active=0 瀹屽叏鏀捐鐪熺浉鏈恒€?
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -72,7 +72,7 @@ static BOOL MapSharedFrame(void) {
     if (fd < 0) {
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"共享帧文件打开失败 errno=%d", errno);
+            SLog(@"鍏变韩甯ф枃浠舵墦寮€澶辫触 errno=%d", errno);
         return NO;
     }
     struct stat st;
@@ -81,7 +81,7 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"共享内存检查失败 errno=%d", e);
+            SLog(@"鍏变韩鍐呭瓨妫€鏌ュけ璐?errno=%d", e);
         return NO;
     }
     if ((size_t)st.st_size < kFrameMapBytes) {
@@ -89,7 +89,7 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"共享内存尺寸不对 actual=%zu expected=%zu", actual, kFrameMapBytes);
+            SLog(@"鍏变韩鍐呭瓨灏哄涓嶅 actual=%zu expected=%zu", actual, kFrameMapBytes);
         return NO;
     }
     void *map = mmap(NULL, kFrameMapBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -98,7 +98,7 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"共享内存映射失败 errno=%d", e);
+            SLog(@"鍏变韩鍐呭瓨鏄犲皠澶辫触 errno=%d", e);
         return NO;
     }
     AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)map;
@@ -109,12 +109,12 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"共享内存版本不对 magic=%u version=%u", magic, version);
+            SLog(@"鍏变韩鍐呭瓨鐗堟湰涓嶅 magic=%u version=%u", magic, version);
         return NO;
     }
     gFrameFD = fd;
     gFrameMap = map;
-    SLog(@"共享画面文件已连接");
+    SLog(@"鍏变韩鐢婚潰鏂囦欢宸茶繛鎺?);
     return YES;
 }
 
@@ -140,16 +140,16 @@ static void LoadConf(void) {
     }
     int wasActive = __atomic_load_n(&gActive, __ATOMIC_ACQUIRE);
     if (!act && wasActive) {
-        SLog(@"切回正常相机（放行）");
+        SLog(@"鍒囧洖姝ｅ父鐩告満锛堟斁琛岋級");
         __atomic_store_n(&gActive, 0, __ATOMIC_RELEASE);
         ClearLastFrame();
     } else if (act && !wasActive) {
-        SLog(@"进入逐帧直灌模式");
+        SLog(@"杩涘叆閫愬抚鐩寸亴妯″紡");
         __atomic_store_n(&gActive, 1, __ATOMIC_RELEASE);
     }
 }
 
-// ---------- 像素搬运 ----------
+// ---------- 鍍忕礌鎼繍 ----------
 static NSString *PixelFormatName(OSType format) {
     char name[5] = {
         (char)((format >> 24) & 0xff),
@@ -210,7 +210,7 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
     static int pixelFormatLogged = 0;
     if (!__atomic_exchange_n(&pixelFormatLogged, 1, __ATOMIC_ACQ_REL)) {
-        SLog(@"相机画面格式 source=%@ %zux%zu destination=%@ %zux%zu",
+        SLog(@"鐩告満鐢婚潰鏍煎紡 source=%@ %zux%zu destination=%@ %zux%zu",
              PixelFormatName(sourceFormat), CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
              PixelFormatName(destinationFormat), CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst));
     }
@@ -257,7 +257,7 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return YES;
 }
 
-// ---------- 钩子 ----------
+// ---------- 閽╁瓙 ----------
 static IMP gOrigEmit = NULL;
 
 static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
@@ -276,7 +276,7 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (gOrigEmit) ((void (*)(id, SEL, CMSampleBufferRef))gOrigEmit)(self, _cmd, sb);
 }
 
-// ---------- 读 App 解码后的共享帧，并替换相机输出 ----------
+// ---------- 璇?App 瑙ｇ爜鍚庣殑鍏变韩甯э紝骞舵浛鎹㈢浉鏈鸿緭鍑?----------
 static void *ReaderThread(void *arg) {
     (void)arg;
     uint64_t lastSequence = 0;
@@ -319,7 +319,7 @@ static void *ReaderThread(void *arg) {
                             frameBytes <= AUX_SHARED_FRAME_SLOT_CAPACITY;
                         CVPixelBufferRef pb = NULL;
                         if (valid && CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pb) == kCVReturnSuccess && pb &&
+                                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, NULL, &pb) == kCVReturnSuccess && pb &&
                             CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
                             uint8_t *src = (uint8_t *)gFrameMap + sizeof(*header) +
                                 (size_t)index * AUX_SHARED_FRAME_SLOT_CAPACITY;
@@ -345,7 +345,7 @@ static void *ReaderThread(void *arg) {
                             gDecoded++;
                             lastFrameAt = MonotonicSeconds();
                             if (gDecoded <= 3 || (gDecoded % 90) == 0)
-                                SLog(@"共享帧已接收 #%d %zux%zu", gDecoded, width, height);
+                                SLog(@"鍏变韩甯у凡鎺ユ敹 #%d %zux%zu", gDecoded, width, height);
                         }
                         if (pb) CVPixelBufferRelease(pb);
                     }
@@ -355,7 +355,7 @@ static void *ReaderThread(void *arg) {
             if (lastFrameAt > 0 && MonotonicSeconds() - lastFrameAt > 1.5) {
                 ClearLastFrame();
                 lastFrameAt = 0;
-                SLog(@"共享画面中断，已放行真相机");
+                SLog(@"鍏变韩鐢婚潰涓柇锛屽凡鏀捐鐪熺浉鏈?);
             }
         }
         usleep(15 * 1000);
@@ -364,7 +364,7 @@ static void *ReaderThread(void *arg) {
 }
 
 __attribute__((constructor)) static void AuxCamStreamInit(void) {
-    SLog(@"共享内存替换插件已加载（进程 %@）", [[NSProcessInfo processInfo] processName]);
+    SLog(@"鍏变韩鍐呭瓨鏇挎崲鎻掍欢宸插姞杞斤紙杩涚▼ %@锛?, [[NSProcessInfo processInfo] processName]);
     LoadConf();
     pthread_t t;
     pthread_create(&t, NULL, ReaderThread, NULL);
@@ -376,11 +376,12 @@ __attribute__((constructor)) static void AuxCamStreamInit(void) {
     });
     Class c = objc_getClass("BWNodeOutput");
     if (!c) c = NSClassFromString(@"BWNodeOutput");
-    if (!c) { SLog(@"没找到 BWNodeOutput"); return; }
+    if (!c) { SLog(@"娌℃壘鍒?BWNodeOutput"); return; }
     SEL s = NSSelectorFromString(@"emitSampleBuffer:");
     Method m = class_getInstanceMethod(c, s);
-    if (!m) { SLog(@"没找到 emitSampleBuffer:"); return; }
+    if (!m) { SLog(@"娌℃壘鍒?emitSampleBuffer:"); return; }
     gOrigEmit = method_getImplementation(m);
     method_setImplementation(m, (IMP)AuxEmitSampleBuffer);
-    SLog(@"已挂钩 BWNodeOutput");
+    SLog(@"宸叉寕閽?BWNodeOutput");
 }
+
