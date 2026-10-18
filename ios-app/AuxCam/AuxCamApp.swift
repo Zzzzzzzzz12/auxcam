@@ -452,7 +452,7 @@ final class StreamDecoder {
             ]
             let createStatus = VTDecompressionSessionCreate(
                 allocator: kCFAllocatorDefault, formatDescription: format,
-                decoderSpecification: decoderSpecification as CFDictionary, imageBufferAttributes: imageAttributes as CFDictionary,
+                decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
                 outputCallback: &callback, decompressionSessionOut: &decoderSession)
             guard createStatus == noErr, let session = decoderSession else {
                 StreamDecoder.dlog("golden create failed status=\(createStatus) session=\(decoderSession != nil)")
