@@ -79,22 +79,10 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
         yStride < width || uvStride < width / 2 || ySrc == NULL || uSrc == NULL || vSrc == NULL) return -3;
 
-    CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFMutableDictionaryRef surfaceAttributes = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    if (attributes == NULL || surfaceAttributes == NULL) {
-        if (attributes != NULL) CFRelease(attributes);
-        if (surfaceAttributes != NULL) CFRelease(surfaceAttributes);
-        return -8;
-    }
-    CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, surfaceAttributes);
-    CFRelease(surfaceAttributes);
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn createStatus = CVPixelBufferCreate(
         kCFAllocatorDefault, (size_t)width, (size_t)height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attributes, &pixelBuffer);
-    CFRelease(attributes);
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pixelBuffer);
     if (createStatus != kCVReturnSuccess || pixelBuffer == NULL) {
         if (pixelBuffer != NULL) CVPixelBufferRelease(pixelBuffer);
         return -2000 - (int32_t)createStatus;
