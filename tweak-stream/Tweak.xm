@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
 static const char *kFramePath = "/var/mobile/Media/DCIM/.frame.ring";
@@ -149,56 +150,111 @@ static void LoadConf(void) {
 }
 
 // ---------- 像素搬运 ----------
-static void CopyPlane(UInt8 *d, size_t dRow, int dx, int dy, int dw, int dh,
-                      UInt8 *s, size_t sRow, int sw, int sh, int planeW, int planeH) {
-    for (int y = 0; y < dh; y++) {
-        int sy = (int)((float)y * sh / dh);
-        if (sy < 0) sy = 0; if (sy >= sh) sy = sh - 1;
-        UInt8 *dp = d + (size_t)(y + dy) * dRow + dx;
-        UInt8 *sp = s + (size_t)sy * sRow;
-        for (int x = 0; x < dw; x++) {
-            int sx = (int)((float)x * sw / dw);
-            if (sx < 0) sx = 0; if (sx >= sw) sx = sw - 1;
-            dp[x] = sp[sx];
-        }
-    }
+static NSString *PixelFormatName(OSType format) {
+    char name[5] = {
+        (char)((format >> 24) & 0xff),
+        (char)((format >> 16) & 0xff),
+        (char)((format >> 8) & 0xff),
+        (char)(format & 0xff),
+        0
+    };
+    return [NSString stringWithUTF8String:name] ?: @"????";
 }
 
-static void Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
-    if (!src || !dst) return;
-    OSType sf = CVPixelBufferGetPixelFormatType(src);
-    OSType df = CVPixelBufferGetPixelFormatType(dst);
-    BOOL sPlanar = (sf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || sf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
-    BOOL dPlanar = (df == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || df == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
-    if (!sPlanar || !dPlanar) return;
-    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return;
-    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) { CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly); return; }
-    int sw = (int)CVPixelBufferGetWidthOfPlane(src, 0), sh = (int)CVPixelBufferGetHeightOfPlane(src, 0);
-    int dw = (int)CVPixelBufferGetWidthOfPlane(dst, 0), dh = (int)CVPixelBufferGetHeightOfPlane(dst, 0);
-    UInt8 *sp = (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(src, 0);
-    UInt8 *dp = (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
-    size_t sRow = CVPixelBufferGetBytesPerRowOfPlane(src, 0), dRow = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
-    if (sp && dp && sw > 0 && sh > 0 && dw > 0 && dh > 0) CopyPlane(dp, dRow, 0, 0, dw, dh, sp, sRow, sw, sh, dw, dh);
-    int scw = (int)CVPixelBufferGetWidthOfPlane(src, 1), sch = (int)CVPixelBufferGetHeightOfPlane(src, 1);
-    int dcw = (int)CVPixelBufferGetWidthOfPlane(dst, 1), dch = (int)CVPixelBufferGetHeightOfPlane(dst, 1);
-    UInt8 *scp = (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(src, 1);
-    UInt8 *dcp = (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
-    size_t scRow = CVPixelBufferGetBytesPerRowOfPlane(src, 1), dcRow = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
-    if (scp && dcp && scw > 0 && sch > 0 && dcw > 0 && dch > 0) {
-        for (int y = 0; y < dch; y++) {
-            int sy = (int)((float)y * sch / dch);
-            if (sy >= sch) sy = sch - 1;
-            UInt8 *dpp = dcp + (size_t)y * dcRow;
-            UInt8 *spp = scp + (size_t)sy * scRow;
-            for (int x = 0; x < dcw * 2; x++) {
-                int sx = (int)((float)x * (scw * 2) / (dcw * 2));
-                if (sx >= scw * 2) sx = scw * 2 - 1;
-                dpp[x] = spp[sx];
-            }
+static UInt8 ConvertRange(UInt8 value, BOOL chroma, int mode) {
+    if (mode == 0) return value;
+    int span = chroma ? 224 : 219;
+    int result = mode > 0
+        ? (((int)value - 16) * 255 + span / 2) / span
+        : 16 + ((int)value * span + 127) / 255;
+    if (result < 0) result = 0;
+    if (result > 255) result = 255;
+    return (UInt8)result;
+}
+
+static BOOL CopyPlane(UInt8 *dst, size_t dstRow, int dstWidth, int dstHeight,
+                      UInt8 *src, size_t srcRow, int srcWidth, int srcHeight,
+                      int rangeMode, BOOL chroma) {
+    if (!dst || !src || dstWidth <= 0 || dstHeight <= 0 || srcWidth <= 0 || srcHeight <= 0 ||
+        dstRow < (size_t)dstWidth || srcRow < (size_t)srcWidth) return NO;
+    if (dstWidth == srcWidth && dstHeight == srcHeight && rangeMode == 0) {
+        for (int y = 0; y < dstHeight; y++)
+            memcpy(dst + (size_t)y * dstRow, src + (size_t)y * srcRow, (size_t)dstWidth);
+        return YES;
+    }
+    uint64_t xStep = ((uint64_t)srcWidth << 16) / (uint64_t)dstWidth;
+    uint64_t yStep = ((uint64_t)srcHeight << 16) / (uint64_t)dstHeight;
+    for (int y = 0; y < dstHeight; y++) {
+        int sy = (int)(((uint64_t)y * yStep) >> 16);
+        if (sy >= srcHeight) sy = srcHeight - 1;
+        UInt8 *d = dst + (size_t)y * dstRow;
+        UInt8 *s = src + (size_t)sy * srcRow;
+        for (int x = 0; x < dstWidth; x++) {
+            int sx = (int)(((uint64_t)x * xStep) >> 16);
+            if (sx >= srcWidth) sx = srcWidth - 1;
+            d[x] = ConvertRange(s[sx], chroma, rangeMode);
         }
     }
+    return YES;
+}
+
+static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return NO;
+    OSType sourceFormat = CVPixelBufferGetPixelFormatType(src);
+    OSType destinationFormat = CVPixelBufferGetPixelFormatType(dst);
+    BOOL sourceFull = sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    BOOL sourcePlanar = sourceFull || sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    BOOL destinationFull = destinationFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    BOOL destinationPlanar = destinationFull || destinationFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    if (!sourcePlanar || !destinationPlanar) return NO;
+
+    static int pixelFormatLogged = 0;
+    if (!__atomic_exchange_n(&pixelFormatLogged, 1, __ATOMIC_ACQ_REL)) {
+        SLog(@"相机画面格式 source=%@ %zux%zu destination=%@ %zux%zu",
+             PixelFormatName(sourceFormat), CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
+             PixelFormatName(destinationFormat), CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst));
+    }
+    if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return NO;
+    }
+
+    int rangeMode = sourceFull == destinationFull ? 0 : (sourceFull ? -1 : 1);
+    int sourceYWidth = (int)CVPixelBufferGetWidthOfPlane(src, 0);
+    int sourceYHeight = (int)CVPixelBufferGetHeightOfPlane(src, 0);
+    int destinationYWidth = (int)CVPixelBufferGetWidthOfPlane(dst, 0);
+    int destinationYHeight = (int)CVPixelBufferGetHeightOfPlane(dst, 0);
+    BOOL copiedY = CopyPlane((UInt8 *)CVPixelBufferGetBaseAddressOfPlane(dst, 0),
+                             CVPixelBufferGetBytesPerRowOfPlane(dst, 0), destinationYWidth, destinationYHeight,
+                             (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(src, 0),
+                             CVPixelBufferGetBytesPerRowOfPlane(src, 0), sourceYWidth, sourceYHeight,
+                             rangeMode, NO);
+
+    int sourceUVWidth = (int)CVPixelBufferGetWidthOfPlane(src, 1) * 2;
+    int sourceUVHeight = (int)CVPixelBufferGetHeightOfPlane(src, 1);
+    int destinationUVWidth = (int)CVPixelBufferGetWidthOfPlane(dst, 1) * 2;
+    int destinationUVHeight = (int)CVPixelBufferGetHeightOfPlane(dst, 1);
+    BOOL copiedUV = CopyPlane((UInt8 *)CVPixelBufferGetBaseAddressOfPlane(dst, 1),
+                              CVPixelBufferGetBytesPerRowOfPlane(dst, 1), destinationUVWidth, destinationUVHeight,
+                              (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(src, 1),
+                              CVPixelBufferGetBytesPerRowOfPlane(src, 1), sourceUVWidth, sourceUVHeight,
+                              rangeMode, YES);
+    if (!copiedY || !copiedUV) {
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return NO;
+    }
+
+    CVBufferSetAttachment(dst, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(dst, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(dst, kCVImageBufferYCbCrMatrixKey,
+                          kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
     CVPixelBufferUnlockBaseAddress(dst, 0);
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return YES;
 }
 
 // ---------- 钩子 ----------
@@ -209,10 +265,7 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
         gFrames++;
         CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(sb);
         CVPixelBufferRef src = CopyLastFrame();
-        if (dst && src) {
-            Blit(src, dst);
-            gCopied++;
-        }
+        if (dst && src && Blit(src, dst)) gCopied++;
         if (src) CVPixelBufferRelease(src);
         if ((gFrames % 150) == 0) {
             NSString *beat = [NSString stringWithFormat:@"camera=%d replaced=%d received=%d time=%@\n",
