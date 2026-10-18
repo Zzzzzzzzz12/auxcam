@@ -305,7 +305,6 @@ final class StreamDecoder {
             self.setWaitingForKeyframe(true)
             self.build()
         }
-        testGoldenPath()
     }
 
     // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
@@ -448,9 +447,6 @@ final class StreamDecoder {
             var callback = VTDecompressionOutputCallbackRecord(
                 decompressionOutputCallback: StreamDecoder.goldenCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
-            let decoderSpecification: [String: Any] = [
-                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: kCFBooleanTrue as Any
-            ]
             let imageAttributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
             ]
@@ -662,9 +658,6 @@ final class StreamDecoder {
                 var callback = VTDecompressionOutputCallbackRecord(
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-                let decoderSpecification: [String: Any] = [
-                    kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder as String: kCFBooleanTrue as Any
-                ]
                 let imageAttributes: [String: Any] = [
                     kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
                 ]
@@ -672,7 +665,7 @@ final class StreamDecoder {
                 let createStatus = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault,
                     formatDescription: format,
-                    decoderSpecification: decoderSpecification as CFDictionary,
+                    decoderSpecification: nil,
                     imageBufferAttributes: imageAttributes as CFDictionary,
                     outputCallback: &callback,
                     decompressionSessionOut: &session)
@@ -685,7 +678,7 @@ final class StreamDecoder {
                     key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
                     allocator: kCFAllocatorDefault,
                     valueOut: &hardwareValue)
-                StreamDecoder.dlog("VideoToolbox session ready hardwareRequired=true propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
+                StreamDecoder.dlog("VideoToolbox session ready hardwareRequested=default propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
                 return noErr
             }
         }
