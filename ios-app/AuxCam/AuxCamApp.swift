@@ -755,22 +755,21 @@ final class StreamDecoder {
         }
         guard copied else { free(memory); return false }
         var block: CMBlockBuffer?
-        var source = CMBlockBufferCustomBlockSource(
-            version: 0,
-            AllocateBlock: nil,
-            FreeBlock: { _, memoryBlock, _ in free(memoryBlock) },
-            refCon: nil)
         let blockStatus = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
             memoryBlock: memory,
             blockLength: accessUnit.count,
             blockAllocator: kCFAllocatorDefault,
-            customBlockSource: &source,
+            customBlockSource: nil,
             offsetToData: 0,
             dataLength: accessUnit.count,
-            flags: kCMBlockBufferAssureMemoryNowFlag,
+            flags: 0,
             blockBufferOut: &block)
-        guard let block else { free(memory); StreamDecoder.dlog("VideoToolbox block buffer failed status=\(blockStatus)"); return false }
+        guard blockStatus == noErr, let block else {
+            free(memory)
+            StreamDecoder.dlog("VideoToolbox block buffer failed status=\(blockStatus)")
+            return false
+        }
 
         var sample: CMSampleBuffer?
         let presentationTime = CMTime(value: frameIndex + 1, timescale: 30)
