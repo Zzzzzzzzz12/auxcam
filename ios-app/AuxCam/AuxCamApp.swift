@@ -374,6 +374,12 @@ final class StreamDecoder {
                 StreamDecoder.dlog("golden failed: no video track")
                 return
             }
+            let trackFormats = track.formatDescriptions.compactMap { $0 as? CMFormatDescription }
+            if let format = trackFormats.first as? CMVideoFormatDescription {
+                StreamDecoder.dlog("golden track format count=\(trackFormats.count) \(Self.formatSummary(format))")
+            } else {
+                StreamDecoder.dlog("golden track format descriptions count=\(trackFormats.count)")
+            }
             let r = try AVAssetReader(asset: asset)
             reader = r
             // nil 表示读取 MP4 中原始压缩样本；不让 AVAssetReader 先解码/转码。
@@ -763,7 +769,7 @@ final class StreamDecoder {
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
 
-        if frameIndex == 0 {
+        if frameIndex == 1 {
             StreamDecoder.dlog("VideoToolbox manual format \(Self.formatSummary(format))")
             StreamDecoder.dlog("VideoToolbox manual sample \(Self.sampleSummary(sample))")
             logGoldenDiff(kind: "format", candidate: Self.formatFields(format))
