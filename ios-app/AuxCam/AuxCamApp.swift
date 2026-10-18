@@ -739,10 +739,11 @@ final class StreamDecoder {
         guard let block else { free(memory); StreamDecoder.dlog("VideoToolbox block buffer failed status=\(blockStatus)"); return false }
 
         var sample: CMSampleBuffer?
+        let presentationTime = CMTime(value: frameIndex + 1, timescale: 30)
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMTime(value: frameIndex, timescale: 30),
-            decodeTimeStamp: .invalid)
+            presentationTimeStamp: presentationTime,
+            decodeTimeStamp: presentationTime)
         frameIndex += 1
         var sampleSize = accessUnit.count
         let sampleStatus = CMSampleBufferCreateReady(
@@ -764,10 +765,6 @@ final class StreamDecoder {
                 attachment,
                 Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
                 Unmanaged.passUnretained(isKeyframe ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
-            CFDictionarySetValue(
-                attachment,
-                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
 
         if frameIndex == 1 {
