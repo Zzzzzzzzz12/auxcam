@@ -274,6 +274,18 @@ final class StreamDecoder {
     // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
     private var openH264NeedsParameterSets = true
     private var vtAttrVariant = 0
+    // 抖动缓冲（AUXPACER）：解码出来的画面先排队，再按固定 30 帧的节奏交给相机插件。
+    // 电脑/USB 送画面时快时慢，直接交出去会让相机里的画面一顿一顿；排一两帧的队就能抹平。
+    static let pacerEnabled = true
+    private let pacerLock = NSLock()
+    private var pacerQueue: [CVImageBuffer] = []
+    private var pacerPrimed = false
+    private var pacerTimer: DispatchSourceTimer?
+    private var pacerTicks = 0
+    private var pacerUnderflow = 0
+    private var pacerOverflow = 0
+    private var pacerMaxDepth = 0
+    private let pacerTargetDepth = 2
     // MJPEG 路径：系统硬件 JPEG 解码 + Core Image GPU 转 NV12（全范围）
     // 注意：这里不再创建 GPU 的 CIContext —— 它在 App 一启动（成员初始化）时就去建 GPU 上下文，
     // 这台越狱机上建不起来会空指针段错误，App 必闪退。改成：ImageIO 解 JPEG → BGRA 中转 → 系统像素转换成 NV12。
@@ -311,6 +323,7 @@ final class StreamDecoder {
         if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
         if let jpegVTSession { VTDecompressionSessionInvalidate(jpegVTSession) }
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
+        pacerTimer?.cancel()
     }
     static func dlog(_ s: String) {
         let line = String(format: "%.6f [%@] %@\n", Date().timeIntervalSince1970, runID, s)
@@ -337,6 +350,7 @@ final class StreamDecoder {
             self.pps = pps
             self.frameIndex = 0
             self.setWaitingForKeyframe(true)
+            self.resetPacer()
             self.build()
         }
     }
@@ -628,6 +642,76 @@ final class StreamDecoder {
         return value
     }
 
+    private func resetPacer() {
+        pacerLock.lock()
+        pacerQueue.removeAll()
+        pacerPrimed = false
+        pacerLock.unlock()
+    }
+
+    private func pacerEnqueue(_ buffer: CVImageBuffer) {
+        pacerLock.lock()
+        pacerQueue.append(buffer)
+        if pacerQueue.count > pacerMaxDepth { pacerMaxDepth = pacerQueue.count }
+        let needTimer = pacerTimer == nil
+        pacerLock.unlock()
+        if needTimer { startPacer() }
+    }
+
+    private func startPacer() {
+        pacerLock.lock()
+        if pacerTimer != nil {
+            pacerLock.unlock()
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(
+            flags: .strict,
+            queue: DispatchQueue(label: "auxcam.pacer", qos: .userInteractive))
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(33_333_333), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.pacerTick()
+        }
+        pacerTimer = timer
+        pacerLock.unlock()
+        timer.resume()
+    }
+
+    // 每 1/30 秒走一次：队列里攒够 2 张才开始放，每次放 1 张；来得太快就丢最旧的，来得太慢就让相机重复上一张。
+    private func pacerTick() {
+        var frame: CVImageBuffer?
+        pacerLock.lock()
+        pacerTicks += 1
+        if pacerQueue.isEmpty {
+            pacerUnderflow += 1
+            pacerPrimed = false
+        } else {
+            if !pacerPrimed && pacerQueue.count >= pacerTargetDepth { pacerPrimed = true }
+            if pacerPrimed {
+                while pacerQueue.count > pacerTargetDepth + 1 {
+                    pacerQueue.removeFirst()
+                    pacerOverflow += 1
+                }
+                frame = pacerQueue.removeFirst()
+            }
+        }
+        let ticks = pacerTicks
+        let under = pacerUnderflow
+        let over = pacerOverflow
+        let maxDepth = pacerMaxDepth
+        let depth = pacerQueue.count
+        if ticks % 90 == 0 { pacerMaxDepth = depth }
+        pacerLock.unlock()
+        if let frame {
+            let result = auxcam_publish_shared_frame(frame)
+            if result != 1 && ticks % 90 == 0 {
+                StreamDecoder.dlog("shared frame publish failed result=\(result) errno=\(errno)")
+            }
+        }
+        if ticks % 90 == 0 {
+            StreamDecoder.dlog("抖动缓冲 ticks=\(ticks) 队列=\(depth) 最大=\(maxDepth) 空=\(under) 溢出=\(over)")
+        }
+    }
+
     private func publish(status: OSStatus, imageBuffer: CVImageBuffer?, sourceFrameID: Int64) {
         outputLock.lock()
         callbackCount += 1
@@ -646,6 +730,14 @@ final class StreamDecoder {
         outputLock.unlock()
 
         StreamPictureInPicture.shared.enqueue(imageBuffer)
+
+        if StreamDecoder.pacerEnabled {
+            pacerEnqueue(imageBuffer)
+            if count <= 3 || count % 90 == 0 {
+                StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=0 paced=queued")
+            }
+            return
+        }
 
         let publishResult = auxcam_publish_shared_frame(imageBuffer)
         if publishResult != 1 {
@@ -1410,6 +1502,12 @@ final class VCU1Receiver: ObservableObject {
     private var ringSize: Int64 = 0
     private var ringNeedsKeyframe = false
     private var jpegSeen = 0
+    // 到包间隔统计（AUXGAP）：看电脑/USB 送画面是否均匀
+    private var gapLastAt: Double = 0
+    private var gapMax: Double = 0
+    private var gapOver50 = 0
+    private var gapUnder15 = 0
+    private var gapCount = 0
 
     func start() {
         if shouldRun { return }
@@ -1521,6 +1619,22 @@ final class VCU1Receiver: ObservableObject {
                 slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
             case 2:
                 // 先把最新帧送进 VideoToolbox 并发布共享画面，兼容环形文件写入放后面。
+                let gapNow = CFAbsoluteTimeGetCurrent()
+                if gapLastAt > 0 {
+                    let gapMs = (gapNow - gapLastAt) * 1000
+                    gapCount += 1
+                    if gapMs > gapMax { gapMax = gapMs }
+                    if gapMs > 50 { gapOver50 += 1 }
+                    if gapMs < 15 { gapUnder15 += 1 }
+                    if gapCount >= 90 {
+                        slog("到包间隔 近90帧: 最大=\(Int(gapMax))ms 超过50ms=\(gapOver50)次 小于15ms=\(gapUnder15)次")
+                        gapMax = 0
+                        gapOver50 = 0
+                        gapUnder15 = 0
+                        gapCount = 0
+                    }
+                }
+                gapLastAt = gapNow
                 decoder.feed(payload, keyframe: (flags & 1) != 0)
                 countFrame(payload.count)
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
