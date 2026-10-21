@@ -6,6 +6,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #include "AuxCamSharedFrame.h"
+#include "AuxScale.h"
 #import <objc/runtime.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -161,41 +162,22 @@ static NSString *PixelFormatName(OSType format) {
     return [NSString stringWithUTF8String:name] ?: @"????";
 }
 
-static UInt8 ConvertRange(UInt8 value, BOOL chroma, int mode) {
-    if (mode == 0) return value;
-    int span = chroma ? 224 : 219;
-    int result = mode > 0
-        ? (((int)value - 16) * 255 + span / 2) / span
-        : 16 + ((int)value * span + 127) / 255;
-    if (result < 0) result = 0;
-    if (result > 255) result = 255;
-    return (UInt8)result;
-}
-
-static BOOL CopyPlane(UInt8 *dst, size_t dstRow, int dstWidth, int dstHeight,
-                      UInt8 *src, size_t srcRow, int srcWidth, int srcHeight,
-                      int rangeMode, BOOL chroma) {
-    if (!dst || !src || dstWidth <= 0 || dstHeight <= 0 || srcWidth <= 0 || srcHeight <= 0 ||
-        dstRow < (size_t)dstWidth || srcRow < (size_t)srcWidth) return NO;
-    if (dstWidth == srcWidth && dstHeight == srcHeight && rangeMode == 0) {
-        for (int y = 0; y < dstHeight; y++)
-            memcpy(dst + (size_t)y * dstRow, src + (size_t)y * srcRow, (size_t)dstWidth);
-        return YES;
+// Log every distinct camera output (format + size) once, including the ones we cannot replace,
+// so the log shows which outputs are skipped.
+static pthread_mutex_t gFormatLogLock = PTHREAD_MUTEX_INITIALIZER;
+static void LogFormatOnce(OSType srcFmt, size_t sw, size_t sh, OSType dstFmt, size_t dw, size_t dh, BOOL usable) {
+    static uint64_t seen[8];
+    static int seenCount = 0;
+    uint64_t key = ((uint64_t)dstFmt << 32) ^ ((uint64_t)dw << 16) ^ (uint64_t)dh;
+    BOOL isNew = YES;
+    pthread_mutex_lock(&gFormatLogLock);
+    for (int i = 0; i < seenCount; i++) { if (seen[i] == key) { isNew = NO; break; } }
+    if (isNew && seenCount < 8) seen[seenCount++] = key; else isNew = NO;
+    pthread_mutex_unlock(&gFormatLogLock);
+    if (isNew) {
+        SLog(@"camera output seen: source=%@ %zux%zu destination=%@ %zux%zu replaceable=%d",
+             PixelFormatName(srcFmt), sw, sh, PixelFormatName(dstFmt), dw, dh, (int)usable);
     }
-    uint64_t xStep = ((uint64_t)srcWidth << 16) / (uint64_t)dstWidth;
-    uint64_t yStep = ((uint64_t)srcHeight << 16) / (uint64_t)dstHeight;
-    for (int y = 0; y < dstHeight; y++) {
-        int sy = (int)(((uint64_t)y * yStep) >> 16);
-        if (sy >= srcHeight) sy = srcHeight - 1;
-        UInt8 *d = dst + (size_t)y * dstRow;
-        UInt8 *s = src + (size_t)sy * srcRow;
-        for (int x = 0; x < dstWidth; x++) {
-            int sx = (int)(((uint64_t)x * xStep) >> 16);
-            if (sx >= srcWidth) sx = srcWidth - 1;
-            d[x] = ConvertRange(s[sx], chroma, rangeMode);
-        }
-    }
-    return YES;
 }
 
 static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
@@ -206,14 +188,11 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
     BOOL sourcePlanar = sourceFull || sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     BOOL destinationFull = destinationFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
     BOOL destinationPlanar = destinationFull || destinationFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    LogFormatOnce(sourceFormat, CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
+                  destinationFormat, CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst),
+                  sourcePlanar && destinationPlanar);
     if (!sourcePlanar || !destinationPlanar) return NO;
 
-    static int pixelFormatLogged = 0;
-    if (!__atomic_exchange_n(&pixelFormatLogged, 1, __ATOMIC_ACQ_REL)) {
-        SLog(@"camera frame format source=%@ %zux%zu destination=%@ %zux%zu",
-             PixelFormatName(sourceFormat), CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
-             PixelFormatName(destinationFormat), CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst));
-    }
     if (CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return NO;
     if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) {
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
@@ -221,25 +200,24 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
 
     int rangeMode = sourceFull == destinationFull ? 0 : (sourceFull ? -1 : 1);
-    int sourceYWidth = (int)CVPixelBufferGetWidthOfPlane(src, 0);
-    int sourceYHeight = (int)CVPixelBufferGetHeightOfPlane(src, 0);
-    int destinationYWidth = (int)CVPixelBufferGetWidthOfPlane(dst, 0);
-    int destinationYHeight = (int)CVPixelBufferGetHeightOfPlane(dst, 0);
-    BOOL copiedY = CopyPlane((UInt8 *)CVPixelBufferGetBaseAddressOfPlane(dst, 0),
-                             CVPixelBufferGetBytesPerRowOfPlane(dst, 0), destinationYWidth, destinationYHeight,
-                             (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(src, 0),
-                             CVPixelBufferGetBytesPerRowOfPlane(src, 0), sourceYWidth, sourceYHeight,
-                             rangeMode, NO);
-
-    int sourceUVWidth = (int)CVPixelBufferGetWidthOfPlane(src, 1) * 2;
-    int sourceUVHeight = (int)CVPixelBufferGetHeightOfPlane(src, 1);
-    int destinationUVWidth = (int)CVPixelBufferGetWidthOfPlane(dst, 1) * 2;
-    int destinationUVHeight = (int)CVPixelBufferGetHeightOfPlane(dst, 1);
-    BOOL copiedUV = CopyPlane((UInt8 *)CVPixelBufferGetBaseAddressOfPlane(dst, 1),
-                              CVPixelBufferGetBytesPerRowOfPlane(dst, 1), destinationUVWidth, destinationUVHeight,
-                              (UInt8 *)CVPixelBufferGetBaseAddressOfPlane(src, 1),
-                              CVPixelBufferGetBytesPerRowOfPlane(src, 1), sourceUVWidth, sourceUVHeight,
-                              rangeMode, YES);
+    int sourceWidth = (int)CVPixelBufferGetWidthOfPlane(src, 0);
+    int sourceHeight = (int)CVPixelBufferGetHeightOfPlane(src, 0);
+    int destinationWidth = (int)CVPixelBufferGetWidthOfPlane(dst, 0);
+    int destinationHeight = (int)CVPixelBufferGetHeightOfPlane(dst, 0);
+    // Aspect ratios differ -> crop the centre of the source (cover) instead of stretching.
+    int cropX = 0, cropY = 0, cropW = sourceWidth, cropH = sourceHeight;
+    AuxComputeCover(sourceWidth, sourceHeight, destinationWidth, destinationHeight,
+                    &cropX, &cropY, &cropW, &cropH);
+    BOOL copiedY = AuxCopyLuma((uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0),
+                               CVPixelBufferGetBytesPerRowOfPlane(dst, 0), destinationWidth, destinationHeight,
+                               (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0),
+                               CVPixelBufferGetBytesPerRowOfPlane(src, 0),
+                               cropX, cropY, cropW, cropH, rangeMode) != 0;
+    BOOL copiedUV = AuxCopyChroma((uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1),
+                                  CVPixelBufferGetBytesPerRowOfPlane(dst, 1), destinationWidth, destinationHeight,
+                                  (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1),
+                                  CVPixelBufferGetBytesPerRowOfPlane(src, 1),
+                                  cropX, cropY, cropW, cropH, rangeMode) != 0;
     if (!copiedY || !copiedUV) {
         CVPixelBufferUnlockBaseAddress(dst, 0);
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
