@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 import QuartzCore
 import CoreImage
 import ImageIO
+import os
 
 @main
 struct AuxCamApp: App {
@@ -276,6 +277,10 @@ final class StreamDecoder {
     private let jpegContext = CIContext(options: [.useSoftwareRenderer: false])
     private var jpegPixelBuffer: CVPixelBuffer?
     private var jpegFrameCount: Int64 = 0
+    // 背压：解码来不及时只保留最新一帧，旧帧直接丢，防止帧排队把内存撑爆被系统杀掉。
+    private let jpegPendingLock = NSLock()
+    private var jpegPending: Data?
+    private var jpegDraining = false
     private let goldenDiffLock = NSLock()
     private var goldenFormatFields: [String: String]?
     private var goldenSampleFields: [String: String]?
@@ -892,7 +897,27 @@ final class StreamDecoder {
     }
     // MARK: - MJPEG 路径（系统硬件 JPEG 解码 + GPU 转 NV12，绕开所有 H.264 解码坑）
     func feedJPEG(_ data: Data) {
-        queue.async { [weak self] in self?.decodeJPEG(data) }
+        jpegPendingLock.lock()
+        jpegPending = data                 // 永远只留最新一帧
+        let alreadyDraining = jpegDraining
+        if !alreadyDraining { jpegDraining = true }
+        jpegPendingLock.unlock()
+        if alreadyDraining { return }      // 已经有人在解码，新帧放着，等它回头来取
+        queue.async { [weak self] in self?.drainJPEG() }
+    }
+
+    private func drainJPEG() {
+        while true {
+            jpegPendingLock.lock()
+            guard let next = jpegPending else {
+                jpegDraining = false
+                jpegPendingLock.unlock()
+                return
+            }
+            jpegPending = nil
+            jpegPendingLock.unlock()
+            autoreleasepool { decodeJPEG(next) }
+        }
     }
 
     private func decodeJPEG(_ data: Data) {
@@ -1550,6 +1575,7 @@ struct ContentView: View {
     @State private var hint = ""
     @State private var fakeCameraOn = false
     @State private var keepAlivePlayer: AVAudioPlayer?
+    @State private var tickCount = 0
     @State private var usingStreamSource = false
     @State private var usingHLSSource = false
     @State private var hasPickedVideo = false
@@ -1653,6 +1679,12 @@ struct ContentView: View {
             }
         }
         .onAppear { boot() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            StreamDecoder.dlog("生命周期: 进入后台")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            StreamDecoder.dlog("生命周期: 回到前台")
+        }
         .sheet(isPresented: $showDiag) { diagSheet }
     }
 
@@ -1911,8 +1943,14 @@ struct ContentView: View {
     // 后台保活：循环播静音，iOS 才不会挂起我们（退后台照样收电脑画面）
     private func keepAliveAudio() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default)
+        // mixWithOthers：不抢别的 App（比如相机）的声音通道，也不容易被它们打断
+        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
         try? session.setActive(true)
+        // 播放器已经建好：被打断了就重新播，不用重建
+        if let existing = keepAlivePlayer {
+            if !existing.isPlaying { existing.play() }
+            return
+        }
         let rate: Int32 = 8000
         let seconds = 1
         let dataLen = rate * Int32(seconds) * 2
@@ -1930,18 +1968,32 @@ struct ContentView: View {
         var blockAlign = UInt16(2); withUnsafeBytes(of: &blockAlign) { wav.append(contentsOf: $0) }
         var bits = UInt16(16); withUnsafeBytes(of: &bits) { wav.append(contentsOf: $0) }
         wav.append("data".data(using: .ascii)!)
-        withUnsafeBytes(of: &n) { wav.append(contentsOf: $0) }
+        var dataChunkLen = UInt32(dataLen)   // 原来这里误用了 n（=16），音频长度写错了
+        withUnsafeBytes(of: &dataChunkLen) { wav.append(contentsOf: $0) }
         wav.append(Data(count: Int(dataLen)))   // 全零 = 静音
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("silence.wav")
         try? wav.write(to: url)
         let player = try? AVAudioPlayer(contentsOf: url)
+        if player == nil { StreamDecoder.dlog("保活: 静音播放器创建失败") }
         player?.numberOfLoops = -1
         player?.volume = 0.01
         keepAlivePlayer = player
-        player?.play()
+        let ok = player?.play() ?? false
+        StreamDecoder.dlog("保活: 静音播放器启动 play=\(ok)")
     }
 
     private func tick() {
+        // 保活看门狗：静音播放器被系统打断（比如相机抢了声音通道）就立刻重新播
+        if keepAlivePlayer != nil, keepAlivePlayer?.isPlaying != true {
+            StreamDecoder.dlog("保活: 播放器被打断，重新播放")
+            keepAliveAudio()
+        }
+        // 每 5 秒记一行：App 还活着、剩余内存多少（下次出问题能看日志判断是不是被系统杀的）
+        tickCount += 1
+        if tickCount % 5 == 0 {
+            let availMB = Int(os_proc_available_memory() / 1_048_576)
+            StreamDecoder.dlog("心跳 t=\(tickCount) 剩余内存=\(availMB)MB 保活=\(keepAlivePlayer?.isPlaying == true)")
+        }
         st = Link.status()
         if Date().timeIntervalSince(cameraCommandAt) > 2 && !usingStreamSource {
             fakeCameraOn = playingFake
