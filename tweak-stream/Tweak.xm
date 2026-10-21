@@ -255,6 +255,27 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (gOrigEmit) ((void (*)(id, SEL, CMSampleBufferRef))gOrigEmit)(self, _cmd, sb);
 }
 
+// AUXPOOL: reuse pixel buffers instead of allocating 2-3 MB of fresh memory for every received frame
+static CVPixelBufferPoolRef gAuxPool = NULL;
+static size_t gAuxPoolW = 0, gAuxPoolH = 0;
+static CVReturn AuxCreateBuffer(size_t w, size_t h, CVPixelBufferRef *out) {
+    if (!gAuxPool || gAuxPoolW != w || gAuxPoolH != h) {
+        if (gAuxPool) { CVPixelBufferPoolRelease(gAuxPool); gAuxPool = NULL; }
+        NSDictionary *bufferAttrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            (id)kCVPixelBufferWidthKey: @(w),
+            (id)kCVPixelBufferHeightKey: @(h)
+        };
+        NSDictionary *poolAttrs = @{ (id)kCVPixelBufferPoolMinimumBufferCountKey: @4 };
+        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs,
+                                    (__bridge CFDictionaryRef)bufferAttrs, &gAuxPool) != kCVReturnSuccess) gAuxPool = NULL;
+        gAuxPoolW = w; gAuxPoolH = h;
+    }
+    if (gAuxPool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, gAuxPool, out) == kCVReturnSuccess && *out)
+        return kCVReturnSuccess;
+    return CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, NULL, out);
+}
+
 // ---------- read the App's shared frames and replace the camera output ----------
 static void *ReaderThread(void *arg) {
     (void)arg;
@@ -303,8 +324,7 @@ static void *ReaderThread(void *arg) {
                             frameBytes >= yStride * height + uvStride * (height / 2) &&
                             frameBytes <= AUX_SHARED_FRAME_SLOT_CAPACITY;
                         CVPixelBufferRef pb = NULL;
-                        if (valid && CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, NULL, &pb) == kCVReturnSuccess && pb &&
+                        if (valid && AuxCreateBuffer(width, height, &pb) == kCVReturnSuccess && pb &&
                             CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
                             uint8_t *src = (uint8_t *)gFrameMap + sizeof(*header) +
                                 (size_t)index * AUX_SHARED_FRAME_SLOT_CAPACITY;
@@ -351,7 +371,7 @@ static void *ReaderThread(void *arg) {
                 SLog(@"shared frame stalled, passing through the real camera");
             }
         }
-        usleep(4 * 1000);
+        usleep(1000);
     }
     return NULL;
 }
