@@ -5,6 +5,7 @@
 //   .auxcam-float.cmd    小窗写指令（cmd/id/ts），App 每秒读一次并执行
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 #define AUX_BALL 46.0
 #define AUX_CARD_W 214.0
@@ -142,17 +143,6 @@ static void OpenApp(void) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(move:)];
     [root addGestureRecognizer:pan];
 
-    [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
-        BOOL live = NO;
-        BOOL alive = ReadState(&live);
-        gWin.hidden = !alive;          // App 没开就整个藏起来
-        if (!alive) return;
-        [gStart setTitle:live ? @"停止" : @"开始" forState:UIControlStateNormal];
-        gStart.backgroundColor = live ? [UIColor colorWithRed:0.85 green:0.25 blue:0.22 alpha:1]
-                                      : [UIColor colorWithRed:0.20 green:0.72 blue:0.62 alpha:1];
-        gDot.backgroundColor = live ? [UIColor greenColor] : [UIColor grayColor];
-        gStatus.text = live ? @"推流中" : @"未开始";
-    }];
 }
 
 - (void)toggle {
@@ -196,11 +186,34 @@ static void OpenApp(void) {
 
 @end
 
+static void AuxLog(NSString *msg) {
+    static int n = 0;
+    if (n++ > 200) return;     // 日志最多 200 行，别写爆
+    NSString *line = [NSString stringWithFormat:@"%lld %@\n", (long long)[[NSDate date] timeIntervalSince1970], msg];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:@"/var/mobile/Media/DCIM/.auxcam-float.log"];
+    if (!h) {
+        [line writeToFile:@"/var/mobile/Media/DCIM/.auxcam-float.log" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    [h seekToEndOfFile];
+    [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [h closeFile];
+}
+
+static int gTries = 0;
+
 static void AuxCreateWindow(void) {
     if (gWin) return;
+    gTries++;
     UIWindowScene *scene = nil;
+    NSMutableString *desc = [NSMutableString string];
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:UIWindowScene.class]) { scene = (UIWindowScene *)s; break; }
+        [desc appendFormat:@"%@;", NSStringFromClass(s.class)];
+        if (!scene && [s isKindOfClass:UIWindowScene.class]) scene = (UIWindowScene *)s;
+    }
+    if (!scene && gTries < 10) {
+        if (gTries == 1) AuxLog([NSString stringWithFormat:@"no UIWindowScene yet, scenes=[%@], will retry", desc]);
+        return;     // 还没有 scene，下一秒再试（最多 10 次）
     }
     CGFloat sw = UIScreen.mainScreen.bounds.size.width;
     CGFloat sh = UIScreen.mainScreen.bounds.size.height;
@@ -210,12 +223,36 @@ static void AuxCreateWindow(void) {
     gWin.windowLevel = 10000000;
     gWin.backgroundColor = [UIColor clearColor];
     gWin.rootViewController = [AuxFloatVC new];
-    gWin.hidden = YES;     // 等 App 状态文件出现再显示
+    [gWin.rootViewController view];     // 强制加载界面（窗口隐藏时系统不会自己加载）
+    SEL sec = NSSelectorFromString(@"_setSecure:");
+    if ([gWin respondsToSelector:sec]) ((void (*)(id, SEL, BOOL))objc_msgSend)(gWin, sec, YES);
+    gWin.hidden = YES;
+    AuxLog([NSString stringWithFormat:@"window created scene=%d tries=%d scenes=[%@]", scene ? 1 : 0, gTries, desc]);
+}
+
+// 每秒一次：没窗口就建；有 App 状态就显示并刷新按钮
+static void AuxTick(void) {
+    AuxCreateWindow();
+    if (!gWin) return;
+    BOOL live = NO;
+    BOOL alive = ReadState(&live);
+    static int lastShown = -1;
+    if ((int)alive != lastShown) {
+        lastShown = alive;
+        AuxLog([NSString stringWithFormat:@"app alive=%d -> window %@", alive, alive ? @"show" : @"hide"]);
+    }
+    gWin.hidden = !alive;
+    if (!alive) return;
+    [gStart setTitle:live ? @"停止" : @"开始" forState:UIControlStateNormal];
+    gStart.backgroundColor = live ? [UIColor colorWithRed:0.85 green:0.25 blue:0.22 alpha:1]
+                                  : [UIColor colorWithRed:0.20 green:0.72 blue:0.62 alpha:1];
+    gDot.backgroundColor = live ? [UIColor greenColor] : [UIColor grayColor];
+    gStatus.text = live ? @"推流中" : @"未开始";
 }
 
 __attribute__((constructor)) static void AuxFloatInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        AuxCreateWindow();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AuxLog(@"AuxCamFloat loaded in SpringBoard");
+        [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) { AuxTick(); }];
     });
 }
