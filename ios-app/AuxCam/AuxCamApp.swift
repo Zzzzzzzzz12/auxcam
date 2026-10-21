@@ -282,6 +282,7 @@ final class StreamDecoder {
     // 只在像素转换失败时才用的兜底：纯 CPU 软件渲染，lazy 保证平时不创建
     private lazy var jpegSoftwareContext = CIContext(options: [.useSoftwareRenderer: true])
     private var jpegFrameCount: Int64 = 0
+    private var jpegEntered: Int64 = 0
     // 背压：解码来不及时只保留最新一帧，旧帧直接丢，防止帧排队把内存撑爆被系统杀掉。
     private let jpegPendingLock = NSLock()
     private var jpegPending: Data?
@@ -926,6 +927,10 @@ final class StreamDecoder {
     }
 
     private func decodeJPEG(_ data: Data) {
+        jpegEntered += 1
+        if jpegEntered <= 3 || jpegEntered % 150 == 0 {
+            StreamDecoder.dlog("decodeJPEG 进入 #\(jpegEntered) bytes=\(data.count) 已发布=\(jpegFrameCount)")
+        }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cgImage = CGImageSourceCreateImageAtIndex(
                 source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
@@ -957,7 +962,12 @@ final class StreamDecoder {
             jpegPixelBuffer = nv
             jpegBGRABuffer = bg
         }
-        guard let buffer = jpegPixelBuffer, let bgra = jpegBGRABuffer else { return }
+        guard let buffer = jpegPixelBuffer, let bgra = jpegBGRABuffer else {
+            if jpegEntered <= 3 || jpegEntered % 150 == 0 {
+                StreamDecoder.dlog("MJPEG 缓冲创建失败 \(width)x\(height)")
+            }
+            return
+        }
 
         // 第一步：JPEG 的像素画进 BGRA 缓冲（纯 CPU，不碰 GPU）
         CVPixelBufferLockBaseAddress(bgra, [])
@@ -1185,6 +1195,7 @@ final class VCU1Receiver: ObservableObject {
     private var ringHandle: FileHandle?
     private var ringSize: Int64 = 0
     private var ringNeedsKeyframe = false
+    private var jpegSeen = 0
 
     func start() {
         if shouldRun { return }
@@ -1301,6 +1312,8 @@ final class VCU1Receiver: ObservableObject {
                 if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
             case 10:
                 // MJPEG 帧：系统硬件 JPEG 解码 → 共享画面（最稳路径）
+                jpegSeen += 1
+                if jpegSeen <= 3 || jpegSeen % 150 == 0 { slog("type10 JPEG #\(jpegSeen) len=\(payload.count)") }
                 decoder.feedJPEG(payload)
                 countFrame(payload.count)
             case 5: lastHb = Date()
