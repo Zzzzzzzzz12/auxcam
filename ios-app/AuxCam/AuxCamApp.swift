@@ -1977,6 +1977,8 @@ struct ContentView: View {
     @State private var mirrorOn = false
     @State private var recordOn = false
     @State private var aiOn = true
+    @State private var floatLastCmdID = ""
+    private static let floatStartTS = Int(Date().timeIntervalSince1970)
     @State private var showDiag = false
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
     @AppStorage("streamURL") private var streamURL = ""
@@ -2039,7 +2041,6 @@ struct ContentView: View {
             }
             sigRow
             bigButton
-            tabBar
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
@@ -2083,11 +2084,9 @@ struct ContentView: View {
     // ── 区块 ──
     private var header: some View {
         HStack(spacing: 6) {
-            Image(systemName: "bag.fill").font(.footnote).foregroundStyle(.teal)
+            Image(systemName: "video.fill").font(.footnote).foregroundStyle(.teal)
             Text("AuxCam").font(.subheadline.bold())
-            Text("2026 最新").font(.caption2).foregroundStyle(.white)
-                .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(Capsule().fill(.teal))
+            Text("USB 直推").font(.caption2).foregroundStyle(.secondary)
             Spacer()
             Circle().fill(kernelOK ? .green : .orange).frame(width: 8, height: 8)
             Text(kernelOK ? "内核在线" : "内核唤醒中").font(.caption2).foregroundStyle(.secondary)
@@ -2171,39 +2170,15 @@ struct ContentView: View {
     }
 
     private var infoRow: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Image(systemName: netMode ? "wifi" : "cable.connector")
-                    .font(.caption2).foregroundStyle(.teal)
-                Text(netMode ? "局域网推流" : "USB 直连")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Spacer()
-                Text(netMode ? "Wi-Fi" : "端口 28765")
-                    .font(.caption2).foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            Circle().fill(vcu.alive ? Color.green : Color.orange).frame(width: 10, height: 10)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(vcu.alive ? "已连上电脑" : "等待电脑连接（请插好 USB）").font(.footnote).bold()
+                Text("源：" + vcu.status).font(.caption2).foregroundStyle(.secondary)
             }
-            HStack {
-                Text("电脑直播地址").font(.caption2).foregroundStyle(.secondary)
-                Spacer()
-                TextField("http://电脑IP:8899/obs/live.m3u8", text: streamURLBinding)
-                    .font(.caption2)
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 250)
-            }
-            HStack {
-                Image(systemName: usingHLSSource ? "wifi" : "cable.connector")
-                    .font(.caption2).foregroundStyle(usingHLSSource ? .green : (vcu.alive ? .green : .teal))
-                Text("源：" + (usingHLSSource ? hlsSource.status : vcu.status))
-                    .font(.caption2).foregroundStyle(.secondary)
-                if usingHLSSource && hlsSource.fps > 0 {
-                    Text(String(format: "%.0f 帧/秒", hlsSource.fps)).font(.caption2).bold().foregroundStyle(.green)
-                } else if !usingHLSSource && vcu.fps > 0 {
-                    Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.caption2).bold().foregroundStyle(.green)
-                }
-                Spacer()
-                Text(netMode ? "局域网" : "USB直连").font(.caption2).bold().foregroundStyle(.teal)
+            Spacer()
+            if vcu.fps > 0 {
+                Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.footnote).bold().foregroundStyle(.green)
             }
         }
         .padding(10)
@@ -2214,9 +2189,7 @@ struct ContentView: View {
     private var panel: some View {
         VStack(spacing: 10) {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                PB("相册", "photo.on.rectangle") { pickerRequest = true }
                 PB("直连", "cable.connector") { tapDirect() }
-                PB(netMode ? "局域网已选" : "Wi-Fi", "wifi") { tapNetwork() }
                 PB("内录", "record.circle", recordOn ? .red : Color(red: 0.20, green: 0.72, blue: 0.62)) { tapRecord() }
                 PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
                 PB(fakeCameraOn ? "切回真镜头" : ((!netMode && (vcu.alive || !hasPickedVideo)) ? "放电脑画面" : "放视频"),
@@ -2234,11 +2207,6 @@ struct ContentView: View {
             Label(sigText, systemImage: "waveform.path.ecg")
                 .font(.caption2).bold().foregroundStyle(sigColor)
             Spacer()
-            Toggle("AI实时", isOn: $aiOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-            Text("AI实时").font(.caption2).foregroundStyle(.secondary)
             Button { showDiag = true } label: {
                 Text("实时分析").font(.caption2).bold()
                     .padding(.horizontal, 10).padding(.vertical, 5)
@@ -2374,7 +2342,30 @@ struct ContentView: View {
         StreamDecoder.dlog("保活: 静音播放器启动 play=\(ok)")
     }
 
+    // AUXFLOAT：和系统级悬浮窗（SpringBoard 里的小圆球）互通：每秒写状态、读指令
+    private func floatSync() {
+        let live = (state == .live || state == .starting) ? 1 : 0
+        let now = Int(Date().timeIntervalSince1970)
+        let text = "visible=1\nlive=\(live)\nts=\(now)\n"
+        try? text.write(toFile: "/var/mobile/Media/DCIM/.auxcam-float.state", atomically: true, encoding: .utf8)
+        guard let t = try? String(contentsOfFile: "/var/mobile/Media/DCIM/.auxcam-float.cmd", encoding: .utf8) else { return }
+        let d = Link.parse(t)
+        guard let id = d["id"], id != floatLastCmdID else { return }
+        floatLastCmdID = id
+        // 只执行 App 启动之后发的指令，旧指令不理
+        let ts = Int(d["ts"] ?? "0") ?? 0
+        if ts < ContentView.floatStartTS - 1 { return }
+        switch d["cmd"] ?? "" {
+        case "toggle": toggleLive()
+        case "mirror": tapMirror()
+        case "rotate": Link.send(["cmd": "rotate"])
+        case "reset": tapReset()
+        default: break
+        }
+    }
+
     private func tick() {
+        floatSync()
         // 保活看门狗：静音播放器被系统打断（比如相机抢了声音通道）就立刻重新播
         if keepAlivePlayer != nil, keepAlivePlayer?.isPlaying != true {
             StreamDecoder.dlog("保活: 播放器被打断，重新播放")
