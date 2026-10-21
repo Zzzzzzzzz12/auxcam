@@ -290,7 +290,8 @@ static void *ReaderThread(void *arg) {
                         size_t width = slot->width, height = slot->height;
                         size_t yStride = slot->yStride, uvStride = slot->uvStride;
                         size_t frameBytes = slot->frameBytes;
-                        BOOL valid = current == index && width > 0 && height > 0 &&
+                        (void)current;   // slot is protected while READING, a newer activeSlot does not invalidate this copy
+                        BOOL valid = width > 0 && height > 0 &&
                             width <= 4096 && height <= 2160 && !(width & 1) && !(height & 1) &&
                             yStride >= width && uvStride >= width &&
                             frameBytes >= yStride * height + uvStride * (height / 2) &&
