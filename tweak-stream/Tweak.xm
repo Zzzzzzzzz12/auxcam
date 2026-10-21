@@ -6,6 +6,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #include "AuxCamSharedFrame.h"
+#include <pthread/qos.h>
 #include "AuxScale.h"
 #import <objc/runtime.h>
 #include <sys/stat.h>
@@ -257,8 +258,11 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
 // ---------- read the App's shared frames and replace the camera output ----------
 static void *ReaderThread(void *arg) {
     (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // AUXDIAG: do not get starved by the camera pipeline
     uint64_t lastSequence = 0;
     double lastFrameAt = 0;
+    uint64_t diagSkipped = 0, diagCasFail = 0, diagInvalid = 0;
+    double diagCopyMax = 0;
     while (1) {
         @autoreleasepool {
             if (!__atomic_load_n(&gActive, __ATOMIC_ACQUIRE)) {
@@ -284,6 +288,8 @@ static void *ReaderThread(void *arg) {
                 if (index < AUX_SHARED_FRAME_SLOT_COUNT) {
                     AuxSharedFrameSlot *slot = &header->slots[index];
                     uint32_t expected = AUX_SHARED_SLOT_READY;
+                    double diagT0 = MonotonicSeconds();
+                    if (lastSequence != 0 && sequence > lastSequence + 1) diagSkipped += sequence - lastSequence - 1;
                     if (__atomic_compare_exchange_n(&slot->state, &expected, AUX_SHARED_SLOT_READING,
                                                     false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                         uint32_t current = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
@@ -319,17 +325,22 @@ static void *ReaderThread(void *arg) {
                             valid = NO;
                         }
                         __atomic_store_n(&slot->state, AUX_SHARED_SLOT_READY, __ATOMIC_RELEASE);
+                        { double d = MonotonicSeconds() - diagT0; if (d > diagCopyMax) diagCopyMax = d; }
+                        if (!valid) diagInvalid++;
                         if (valid && pb && __atomic_load_n(&gActive, __ATOMIC_ACQUIRE)) {
                             SetLastFrame(pb);
                             gDecoded++;
                             lastFrameAt = MonotonicSeconds();
                             if (gDecoded <= 3 || (gDecoded % 90) == 0)
-                                SLog(@"shared frame received #%d %zux%zu", gDecoded, width, height);
+                                SLog(@"shared frame received #%d %zux%zu skipped=%llu casfail=%llu invalid=%llu copyMaxMs=%.1f",
+                                     gDecoded, width, height, (unsigned long long)diagSkipped,
+                                     (unsigned long long)diagCasFail, (unsigned long long)diagInvalid, diagCopyMax * 1000.0);
                         }
                         if (pb) CVPixelBufferRelease(pb);
                         lastSequence = sequence;   // consumed: remember it
                     }
                     // CAS failed (other camera process is reading this slot): do NOT mark as seen, retry next loop
+                    else { diagCasFail++; }
                 } else {
                     lastSequence = sequence;
                 }
