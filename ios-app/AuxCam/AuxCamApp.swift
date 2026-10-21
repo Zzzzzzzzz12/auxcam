@@ -274,8 +274,13 @@ final class StreamDecoder {
     // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
     private var openH264NeedsParameterSets = true
     // MJPEG 路径：系统硬件 JPEG 解码 + Core Image GPU 转 NV12（全范围）
-    private let jpegContext = CIContext(options: [.useSoftwareRenderer: false])
+    // 注意：这里不再创建 GPU 的 CIContext —— 它在 App 一启动（成员初始化）时就去建 GPU 上下文，
+    // 这台越狱机上建不起来会空指针段错误，App 必闪退。改成：ImageIO 解 JPEG → BGRA 中转 → 系统像素转换成 NV12。
     private var jpegPixelBuffer: CVPixelBuffer?
+    private var jpegBGRABuffer: CVPixelBuffer?
+    private var jpegTransfer: VTPixelTransferSession?
+    // 只在像素转换失败时才用的兜底：纯 CPU 软件渲染，lazy 保证平时不创建
+    private lazy var jpegSoftwareContext = CIContext(options: [.useSoftwareRenderer: true])
     private var jpegFrameCount: Int64 = 0
     // 背压：解码来不及时只保留最新一帧，旧帧直接丢，防止帧排队把内存撑爆被系统杀掉。
     private let jpegPendingLock = NSLock()
@@ -931,24 +936,58 @@ final class StreamDecoder {
         }
         let width = cgImage.width
         let height = cgImage.height
-        if jpegPixelBuffer == nil ||
+        if jpegPixelBuffer == nil || jpegBGRABuffer == nil ||
             CVPixelBufferGetWidth(jpegPixelBuffer!) != width ||
             CVPixelBufferGetHeight(jpegPixelBuffer!) != height {
-            var pb: CVPixelBuffer?
-            let attrs: [String: Any] = [
+            var nv: CVPixelBuffer?
+            var bg: CVPixelBuffer?
+            let nvAttrs: [String: Any] = [
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            let bgAttrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
             ]
             CVPixelBufferCreate(kCFAllocatorDefault, width, height,
                                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                attrs as CFDictionary, &pb)
-            jpegPixelBuffer = pb
+                                nvAttrs as CFDictionary, &nv)
+            CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                kCVPixelFormatType_32BGRA,
+                                bgAttrs as CFDictionary, &bg)
+            jpegPixelBuffer = nv
+            jpegBGRABuffer = bg
         }
-        guard let buffer = jpegPixelBuffer else { return }
-        let ciImage = CIImage(cgImage: cgImage)
-        jpegContext.render(ciImage, to: buffer,
-                           bounds: CGRect(x: 0, y: 0, width: width, height: height),
-                           colorSpace: CGColorSpaceCreateDeviceRGB())
+        guard let buffer = jpegPixelBuffer, let bgra = jpegBGRABuffer else { return }
+
+        // 第一步：JPEG 的像素画进 BGRA 缓冲（纯 CPU，不碰 GPU）
+        CVPixelBufferLockBaseAddress(bgra, [])
+        if let base = CVPixelBufferGetBaseAddress(bgra),
+           let ctx = CGContext(data: base, width: width, height: height, bitsPerComponent: 8,
+                               bytesPerRow: CVPixelBufferGetBytesPerRow(bgra),
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                   | CGBitmapInfo.byteOrder32Little.rawValue) {
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        CVPixelBufferUnlockBaseAddress(bgra, [])
+
+        // 第二步：BGRA → NV12 全范围（系统自带的像素转换服务）
+        if jpegTransfer == nil {
+            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault,
+                                         pixelTransferSessionOut: &jpegTransfer)
+        }
+        var convertStatus: OSStatus = -1
+        if let transfer = jpegTransfer {
+            convertStatus = VTPixelTransferSessionTransferImage(transfer, from: bgra, to: buffer)
+        }
+        if convertStatus != noErr {
+            if jpegFrameCount == 0 || jpegFrameCount % 90 == 0 {
+                StreamDecoder.dlog("像素转换失败 status=\(convertStatus)，改用软件转换")
+            }
+            jpegSoftwareContext.render(CIImage(cvPixelBuffer: bgra), to: buffer,
+                                       bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                                       colorSpace: CGColorSpaceCreateDeviceRGB())
+        }
         let published = auxcam_publish_shared_frame(buffer)
         if published == 1 {
             jpegFrameCount += 1
