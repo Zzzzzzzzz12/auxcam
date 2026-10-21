@@ -693,7 +693,7 @@ final class StreamDecoder {
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
                 let dimensions = CMVideoFormatDescriptionGetDimensions(format)
                 let imageAttributes: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
                     kCVPixelBufferWidthKey as String: NSNumber(value: Int(dimensions.width)),
                     kCVPixelBufferHeightKey as String: NSNumber(value: Int(dimensions.height)),
                     kCVPixelBufferOpenGLESCompatibilityKey as String: kCFBooleanTrue as Any,
