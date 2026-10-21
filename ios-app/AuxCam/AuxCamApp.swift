@@ -274,6 +274,7 @@ final class StreamDecoder {
     // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
     private var openH264NeedsParameterSets = true
     private var vtAttrVariant = 0
+    private var lastVTRetryAt: Double = 0   // AUXRETRY: 软解时每隔一会儿自动试着切回硬解
     // 抖动缓冲（AUXPACER）：解码出来的画面先排队，再按固定 30 帧的节奏交给相机插件。
     // 电脑/USB 送画面时快时慢，直接交出去会让相机里的画面一顿一顿；排一两帧的队就能抹平。
     static let pacerEnabled = true
@@ -852,6 +853,17 @@ final class StreamDecoder {
         }
         if isWaitingForKeyframe() && !hasIDR { return }
         if hasIDR { setWaitingForKeyframe(false) }
+
+        // 目前在软解、又遇到关键帧：每 10 秒试一次切回硬解，失败了就继续软解，不会丢这一帧。
+        if videoToolboxSession == nil && softwareDecoder != nil && hasIDR {
+            let retryNow = CFAbsoluteTimeGetCurrent()
+            if retryNow - lastVTRetryAt > 10 {
+                lastVTRetryAt = retryNow
+                vtAttrVariant = 0
+                StreamDecoder.dlog("硬解重试：尝试从软解切回 VideoToolbox")
+                build()
+            }
+        }
 
         if videoToolboxSession != nil {
             let slices = nalRanges.filter { range in
