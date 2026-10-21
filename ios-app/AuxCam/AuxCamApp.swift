@@ -283,6 +283,18 @@ final class StreamDecoder {
     private lazy var jpegSoftwareContext = CIContext(options: [.useSoftwareRenderer: true])
     private var jpegFrameCount: Int64 = 0
     private var jpegEntered: Int64 = 0
+    // 硬件 JPEG 解码（VideoToolbox）：JPEG 直接解成 NV12，省掉 CPU 上的解码、BGRA 中转和颜色转换。
+    // 失败会自动退回下面原来的 ImageIO 路径，所以最坏情况也只是和现在一样。
+    private var jpegVTSession: VTDecompressionSession?
+    private var jpegVTFormat: CMVideoFormatDescription?
+    private var jpegVTWidth = 0
+    private var jpegVTHeight = 0
+    private var jpegVTFailStreak = 0
+    private var jpegVTDisabled = false
+    private var jpegVTCount: Int64 = 0
+    private let jpegVTLock = NSLock()
+    private var jpegVTOutput: CVPixelBuffer?
+    private var jpegVTStatus: OSStatus = noErr
     // 背压：解码来不及时只保留最新一帧，旧帧直接丢，防止帧排队把内存撑爆被系统杀掉。
     private let jpegPendingLock = NSLock()
     private var jpegPending: Data?
@@ -296,6 +308,7 @@ final class StreamDecoder {
 
     deinit {
         if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
+        if let jpegVTSession { VTDecompressionSessionInvalidate(jpegVTSession) }
         if let softwareDecoder { auxh264_destroy(softwareDecoder) }
     }
     static func dlog(_ s: String) {
@@ -901,7 +914,171 @@ final class StreamDecoder {
             }
         }
     }
-    // MARK: - MJPEG 路径（系统硬件 JPEG 解码 + GPU 转 NV12，绕开所有 H.264 解码坑）
+    // MARK: - MJPEG 硬件解码（VideoToolbox）
+    static let jpegHWCallback: VTDecompressionOutputCallback = { outputRefCon, _, status, _, imageBuffer, _, _ in
+        guard let outputRefCon else { return }
+        let decoder = Unmanaged<StreamDecoder>.fromOpaque(outputRefCon).takeUnretainedValue()
+        decoder.jpegVTLock.lock()
+        decoder.jpegVTStatus = status
+        decoder.jpegVTOutput = (status == noErr) ? imageBuffer : nil
+        decoder.jpegVTLock.unlock()
+    }
+
+    private func ensureJPEGHWSession(width: Int, height: Int) -> VTDecompressionSession? {
+        if let session = jpegVTSession, jpegVTWidth == width, jpegVTHeight == height { return session }
+        if let session = jpegVTSession { VTDecompressionSessionInvalidate(session) }
+        jpegVTSession = nil
+        jpegVTFormat = nil
+        var format: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_JPEG,
+            width: Int32(width),
+            height: Int32(height),
+            extensions: nil,
+            formatDescriptionOut: &format)
+        guard formatStatus == noErr, let format else {
+            StreamDecoder.dlog("JPEG硬解: 格式描述创建失败 status=\(formatStatus)")
+            return nil
+        }
+        var callback = VTDecompressionOutputCallbackRecord(
+            decompressionOutputCallback: StreamDecoder.jpegHWCallback,
+            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
+        let imageAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+        ]
+        var session: VTDecompressionSession?
+        let createStatus = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: format,
+            decoderSpecification: nil,
+            imageBufferAttributes: imageAttributes as CFDictionary,
+            outputCallback: &callback,
+            decompressionSessionOut: &session)
+        guard createStatus == noErr, let session else {
+            StreamDecoder.dlog("JPEG硬解: 会话创建失败 status=\(createStatus)")
+            return nil
+        }
+        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        var hardwareValue: CFTypeRef?
+        let hardwareStatus = VTSessionCopyProperty(
+            session,
+            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+            allocator: kCFAllocatorDefault,
+            valueOut: &hardwareValue)
+        StreamDecoder.dlog("JPEG硬解: 会话就绪 \(width)x\(height) hardware=\(String(describing: hardwareValue)) propStatus=\(hardwareStatus)")
+        jpegVTSession = session
+        jpegVTFormat = format
+        jpegVTWidth = width
+        jpegVTHeight = height
+        return session
+    }
+
+    // 成功解码并发布到共享画面返回 true；任何一步失败返回 false（调用方会退回 CPU 路径）。
+    private func decodeJPEGHardware(_ data: Data, width: Int, height: Int) -> Bool {
+        guard let session = ensureJPEGHWSession(width: width, height: height),
+              let format = jpegVTFormat else {
+            noteJPEGHWFailure("会话不可用")
+            return false
+        }
+        guard let memory = malloc(data.count) else { return false }
+        let copied = data.withUnsafeBytes { bytes -> Bool in
+            guard let base = bytes.baseAddress else { return false }
+            memcpy(memory, base, bytes.count)
+            return true
+        }
+        guard copied else { free(memory); return false }
+        var block: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: memory,
+            blockLength: data.count,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: data.count,
+            flags: 0,
+            blockBufferOut: &block)
+        guard blockStatus == noErr, let block else {
+            free(memory)
+            noteJPEGHWFailure("block buffer status=\(blockStatus)")
+            return false
+        }
+        jpegVTCount += 1
+        var sample: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 30),
+            presentationTimeStamp: CMTime(value: jpegVTCount, timescale: 30),
+            decodeTimeStamp: .invalid)
+        var sampleSize = data.count
+        let sampleStatus = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: block,
+            formatDescription: format,
+            sampleCount: 1,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1,
+            sampleSizeArray: &sampleSize,
+            sampleBufferOut: &sample)
+        guard let sample else {
+            noteJPEGHWFailure("sample buffer status=\(sampleStatus)")
+            return false
+        }
+        jpegVTLock.lock()
+        jpegVTOutput = nil
+        jpegVTStatus = noErr
+        jpegVTLock.unlock()
+        var info = VTDecodeInfoFlags()
+        let decodeStatus = VTDecompressionSessionDecodeFrame(
+            session,
+            sampleBuffer: sample,
+            flags: [],
+            frameRefcon: nil,
+            infoFlagsOut: &info)
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
+        jpegVTLock.lock()
+        let output = jpegVTOutput
+        let callbackStatus = jpegVTStatus
+        jpegVTLock.unlock()
+        guard decodeStatus == noErr, callbackStatus == noErr, let output else {
+            noteJPEGHWFailure("decode=\(decodeStatus) callback=\(callbackStatus) gotFrame=\(output != nil)")
+            return false
+        }
+        // 共享画面和相机插件都按"NV12 全范围"处理，格式不对就别发布，退回 CPU 路径
+        let pixelFormat = CVPixelBufferGetPixelFormatType(output)
+        guard pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
+            noteJPEGHWFailure("输出格式不是 420f: \(pixelFormat)")
+            return false
+        }
+        jpegVTFailStreak = 0
+        let published = auxcam_publish_shared_frame(output)
+        if published == 1 {
+            jpegFrameCount += 1
+            if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
+                StreamDecoder.dlog("MJPEG 硬解帧 #\(jpegFrameCount) \(width)x\(height) bytes=\(data.count)")
+            }
+        } else if jpegFrameCount <= 3 || jpegEntered % 90 == 0 {
+            StreamDecoder.dlog("MJPEG 硬解发布失败 rc=\(published)")
+        }
+        return true
+    }
+
+    private func noteJPEGHWFailure(_ reason: String) {
+        jpegVTFailStreak += 1
+        StreamDecoder.dlog("JPEG硬解失败(连续\(jpegVTFailStreak)次): \(reason)")
+        if let session = jpegVTSession, jpegVTFailStreak >= 1 {
+            VTDecompressionSessionInvalidate(session)
+            jpegVTSession = nil
+            jpegVTFormat = nil
+        }
+        if jpegVTFailStreak >= 3 {
+            jpegVTDisabled = true
+            StreamDecoder.dlog("JPEG硬解: 连续失败，改用 CPU 路径（ImageIO）")
+        }
+    }
+
+    // MARK: - MJPEG 路径（CPU 回退：ImageIO 解码 + 系统像素转换）
     func feedJPEG(_ data: Data) {
         jpegPendingLock.lock()
         jpegPending = data                 // 永远只留最新一帧
@@ -930,6 +1107,16 @@ final class StreamDecoder {
         jpegEntered += 1
         if jpegEntered <= 3 || jpegEntered % 150 == 0 {
             StreamDecoder.dlog("decodeJPEG 进入 #\(jpegEntered) bytes=\(data.count) 已发布=\(jpegFrameCount)")
+        }
+        // 先试硬件解码：只读 JPEG 头部拿宽高，不解码像素
+        if !jpegVTDisabled,
+           let probe = CGImageSourceCreateWithData(data as CFData, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(probe, 0, nil) as? [CFString: Any],
+           let probeWidth = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+           let probeHeight = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+           probeWidth > 0, probeHeight > 0,
+           decodeJPEGHardware(data, width: probeWidth, height: probeHeight) {
+            return
         }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let cgImage = CGImageSourceCreateImageAtIndex(
