@@ -1,0 +1,9 @@
+Package: com.auxcam.float
+Name: AuxCam Float
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: AuxCam system-wide floating ball (SpringBoard)
+Maintainer: AuxCam
+Author: AuxCam
+Section: Tweaks
+Depends: mobilesubstrate
