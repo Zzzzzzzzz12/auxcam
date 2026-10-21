@@ -946,19 +946,19 @@ final class StreamDecoder {
             CVPixelBufferGetHeight(jpegPixelBuffer!) != height {
             var nv: CVPixelBuffer?
             var bg: CVPixelBuffer?
-            let nvAttrs: [String: Any] = [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-            ]
-            let bgAttrs: [String: Any] = [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-            ]
-            CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                nvAttrs as CFDictionary, &nv)
-            CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                kCVPixelFormatType_32BGRA,
-                                bgAttrs as CFDictionary, &bg)
+            // 属性传 nil：和 OpenH264Bridge.c 里已验证可用的建法一致（普通内存，不要 IOSurface）。
+            // 上一版带 IOSurface 属性，在这台越狱机上每帧都创建失败。
+            let nvStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                               kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                                               nil, &nv)
+            let bgStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                               kCVPixelFormatType_32BGRA,
+                                               nil, &bg)
+            if nvStatus != kCVReturnSuccess || bgStatus != kCVReturnSuccess {
+                if jpegEntered <= 3 || jpegEntered % 150 == 0 {
+                    StreamDecoder.dlog("缓冲创建状态 NV12=\(nvStatus) BGRA=\(bgStatus) \(width)x\(height)")
+                }
+            }
             jpegPixelBuffer = nv
             jpegBGRABuffer = bg
         }

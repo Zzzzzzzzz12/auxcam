@@ -1,6 +1,6 @@
-﻿// AuxCamStream 鈥斺€?鐢?App 瑙ｇ爜鍚庣殑鍏变韩鍐呭瓨甯ф浛鎹㈢浉鏈鸿緭鍑恒€?
-// App 璐熻矗鏀剁數鑴戣棰戝拰瑙ｇ爜锛涙彃浠跺彧璇诲彇鏈€鏂?NV12 甯у苟鏇挎崲鐩告満鏍锋湰銆?
-// 閰嶇疆: /var/mobile/Media/DCIM/stream.cfg  active=1 鎵嶅共娲伙紱active=0 瀹屽叏鏀捐鐪熺浉鏈恒€?
+// AuxCamStream - replaces the camera output with the shared NV12 frames decoded by the App.
+// The App receives and decodes the PC video; this plugin only reads the latest NV12 frame and swaps the camera sample.
+// Config: /var/mobile/Media/DCIM/stream.cfg  active=1 enables replacement; active=0 passes the real camera through.
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -72,7 +72,7 @@ static BOOL MapSharedFrame(void) {
     if (fd < 0) {
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"鍏变韩甯ф枃浠舵墦寮€澶辫触 errno=%d", errno);
+            SLog(@"shared frame file open failed errno=%d", errno);
         return NO;
     }
     struct stat st;
@@ -81,7 +81,7 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"鍏变韩鍐呭瓨妫€鏌ュけ璐?errno=%d", e);
+            SLog(@"shared memory check failed errno=%d", e);
         return NO;
     }
     if ((size_t)st.st_size < kFrameMapBytes) {
@@ -89,7 +89,7 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"鍏变韩鍐呭瓨灏哄涓嶅 actual=%zu expected=%zu", actual, kFrameMapBytes);
+            SLog(@"shared memory size mismatch actual=%zu expected=%zu", actual, kFrameMapBytes);
         return NO;
     }
     void *map = mmap(NULL, kFrameMapBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -98,7 +98,7 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"鍏变韩鍐呭瓨鏄犲皠澶辫触 errno=%d", e);
+            SLog(@"shared memory map failed errno=%d", e);
         return NO;
     }
     AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)map;
@@ -109,12 +109,12 @@ static BOOL MapSharedFrame(void) {
         close(fd);
         gMapFailures++;
         if (gMapFailures == 1 || (gMapFailures % 100) == 0)
-            SLog(@"鍏变韩鍐呭瓨鐗堟湰涓嶅 magic=%u version=%u", magic, version);
+            SLog(@"shared memory version mismatch magic=%u version=%u", magic, version);
         return NO;
     }
     gFrameFD = fd;
     gFrameMap = map;
-    SLog(@"鍏变韩鐢婚潰鏂囦欢宸茶繛鎺?);
+    SLog(@"shared frame file connected");
     return YES;
 }
 
@@ -140,16 +140,16 @@ static void LoadConf(void) {
     }
     int wasActive = __atomic_load_n(&gActive, __ATOMIC_ACQUIRE);
     if (!act && wasActive) {
-        SLog(@"鍒囧洖姝ｅ父鐩告満锛堟斁琛岋級");
+        SLog(@"switched back to the real camera (pass-through)");
         __atomic_store_n(&gActive, 0, __ATOMIC_RELEASE);
         ClearLastFrame();
     } else if (act && !wasActive) {
-        SLog(@"杩涘叆閫愬抚鐩寸亴妯″紡");
+        SLog(@"entered frame-injection mode");
         __atomic_store_n(&gActive, 1, __ATOMIC_RELEASE);
     }
 }
 
-// ---------- 鍍忕礌鎼繍 ----------
+// ---------- frame blit ----------
 static NSString *PixelFormatName(OSType format) {
     char name[5] = {
         (char)((format >> 24) & 0xff),
@@ -210,7 +210,7 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
     static int pixelFormatLogged = 0;
     if (!__atomic_exchange_n(&pixelFormatLogged, 1, __ATOMIC_ACQ_REL)) {
-        SLog(@"鐩告満鐢婚潰鏍煎紡 source=%@ %zux%zu destination=%@ %zux%zu",
+        SLog(@"camera frame format source=%@ %zux%zu destination=%@ %zux%zu",
              PixelFormatName(sourceFormat), CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src),
              PixelFormatName(destinationFormat), CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst));
     }
@@ -257,7 +257,7 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return YES;
 }
 
-// ---------- 閽╁瓙 ----------
+// ---------- hook ----------
 static IMP gOrigEmit = NULL;
 
 static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
@@ -276,7 +276,7 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (gOrigEmit) ((void (*)(id, SEL, CMSampleBufferRef))gOrigEmit)(self, _cmd, sb);
 }
 
-// ---------- 璇?App 瑙ｇ爜鍚庣殑鍏变韩甯э紝骞舵浛鎹㈢浉鏈鸿緭鍑?----------
+// ---------- read the App's shared frames and replace the camera output ----------
 static void *ReaderThread(void *arg) {
     (void)arg;
     uint64_t lastSequence = 0;
@@ -345,7 +345,7 @@ static void *ReaderThread(void *arg) {
                             gDecoded++;
                             lastFrameAt = MonotonicSeconds();
                             if (gDecoded <= 3 || (gDecoded % 90) == 0)
-                                SLog(@"鍏变韩甯у凡鎺ユ敹 #%d %zux%zu", gDecoded, width, height);
+                                SLog(@"shared frame received #%d %zux%zu", gDecoded, width, height);
                         }
                         if (pb) CVPixelBufferRelease(pb);
                     }
@@ -355,7 +355,7 @@ static void *ReaderThread(void *arg) {
             if (lastFrameAt > 0 && MonotonicSeconds() - lastFrameAt > 1.5) {
                 ClearLastFrame();
                 lastFrameAt = 0;
-                SLog(@"鍏变韩鐢婚潰涓柇锛屽凡鏀捐鐪熺浉鏈?);
+                SLog(@"shared frame stalled, passing through the real camera");
             }
         }
         usleep(15 * 1000);
@@ -364,7 +364,7 @@ static void *ReaderThread(void *arg) {
 }
 
 __attribute__((constructor)) static void AuxCamStreamInit(void) {
-    SLog(@"鍏变韩鍐呭瓨鏇挎崲鎻掍欢宸插姞杞斤紙杩涚▼ %@锛?, [[NSProcessInfo processInfo] processName]);
+    SLog(@"shared-memory replacement plugin loaded (process %@)", [[NSProcessInfo processInfo] processName]);
     LoadConf();
     pthread_t t;
     pthread_create(&t, NULL, ReaderThread, NULL);
@@ -376,12 +376,12 @@ __attribute__((constructor)) static void AuxCamStreamInit(void) {
     });
     Class c = objc_getClass("BWNodeOutput");
     if (!c) c = NSClassFromString(@"BWNodeOutput");
-    if (!c) { SLog(@"娌℃壘鍒?BWNodeOutput"); return; }
+    if (!c) { SLog(@"BWNodeOutput not found"); return; }
     SEL s = NSSelectorFromString(@"emitSampleBuffer:");
     Method m = class_getInstanceMethod(c, s);
-    if (!m) { SLog(@"娌℃壘鍒?emitSampleBuffer:"); return; }
+    if (!m) { SLog(@"emitSampleBuffer: not found"); return; }
     gOrigEmit = method_getImplementation(m);
     method_setImplementation(m, (IMP)AuxEmitSampleBuffer);
-    SLog(@"宸叉寕閽?BWNodeOutput");
+    SLog(@"hooked BWNodeOutput");
 }
 
