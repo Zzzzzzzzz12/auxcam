@@ -273,6 +273,7 @@ final class StreamDecoder {
     // OpenH264 只在解码器初始化时补一次 SPS/PPS。
     // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
     private var openH264NeedsParameterSets = true
+    private var vtAttrVariant = 0
     // MJPEG 路径：系统硬件 JPEG 解码 + Core Image GPU 转 NV12（全范围）
     // 注意：这里不再创建 GPU 的 CIContext —— 它在 App 一启动（成员初始化）时就去建 GPU 上下文，
     // 这台越狱机上建不起来会空指针段错误，App 必闪退。改成：ImageIO 解 JPEG → BGRA 中转 → 系统像素转换成 NV12。
@@ -692,19 +693,29 @@ final class StreamDecoder {
                     decompressionOutputCallback: StreamDecoder.frameCallback,
                     decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
                 let dimensions = CMVideoFormatDescriptionGetDimensions(format)
-                let imageAttributes: [String: Any] = [
+                // 输出缓冲属性有 3 种写法，按 vtAttrVariant 依次尝试（0 最完整，2 完全交给系统）。
+                // 实测第 0 种在这台机器上第一帧就报 -12911，所以失败时自动换下一种再试。
+                var imageAttributes: [String: Any]? = [
                     kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
                     kCVPixelBufferWidthKey as String: NSNumber(value: Int(dimensions.width)),
                     kCVPixelBufferHeightKey as String: NSNumber(value: Int(dimensions.height)),
                     kCVPixelBufferOpenGLESCompatibilityKey as String: kCFBooleanTrue as Any,
                     kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
                 ]
+                if vtAttrVariant == 1 {
+                    imageAttributes = [
+                        kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+                    ]
+                } else if vtAttrVariant >= 2 {
+                    imageAttributes = nil
+                }
+                StreamDecoder.dlog("VideoToolbox 输出属性方案 \(vtAttrVariant)")
                 var session: VTDecompressionSession?
                 let createStatus = VTDecompressionSessionCreate(
                     allocator: kCFAllocatorDefault,
                     formatDescription: format,
                     decoderSpecification: nil,
-                    imageBufferAttributes: imageAttributes as CFDictionary,
+                    imageBufferAttributes: imageAttributes.map { $0 as CFDictionary },
                     outputCallback: &callback,
                     decompressionSessionOut: &session)
                 guard createStatus == noErr, let session else { return createStatus }
@@ -757,6 +768,22 @@ final class StreamDecoder {
                 return type == 1 || type == 5
             }
             if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) { return }
+            if vtAttrVariant < 2 {
+                vtAttrVariant += 1
+                StreamDecoder.dlog("VideoToolbox rejected frame; retry with attribute variant \(vtAttrVariant)")
+                build()
+                if videoToolboxSession != nil {
+                    if hasIDR { setWaitingForKeyframe(false) }
+                    let retrySlices = nalRanges.filter { range in
+                        guard range.lowerBound < raw.count else { return false }
+                        let type = raw[range.lowerBound] & 0x1F
+                        return type == 1 || type == 5
+                    }
+                    if decodeVideoToolbox(raw, slices: retrySlices, isKeyframe: hasIDR) { return }
+                }
+                decode(raw, keyframe: keyframe)
+                return
+            }
             StreamDecoder.dlog("VideoToolbox rejected frame; switching to OpenH264")
             if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
             videoToolboxSession = nil
