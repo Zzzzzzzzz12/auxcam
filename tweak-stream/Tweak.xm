@@ -326,9 +326,12 @@ static void *ReaderThread(void *arg) {
                                 SLog(@"shared frame received #%d %zux%zu", gDecoded, width, height);
                         }
                         if (pb) CVPixelBufferRelease(pb);
+                        lastSequence = sequence;   // consumed: remember it
                     }
+                    // CAS failed (other camera process is reading this slot): do NOT mark as seen, retry next loop
+                } else {
+                    lastSequence = sequence;
                 }
-                lastSequence = sequence;
             }
             if (lastFrameAt > 0 && MonotonicSeconds() - lastFrameAt > 1.5) {
                 ClearLastFrame();
@@ -336,7 +339,7 @@ static void *ReaderThread(void *arg) {
                 SLog(@"shared frame stalled, passing through the real camera");
             }
         }
-        usleep(15 * 1000);
+        usleep(4 * 1000);
     }
     return NULL;
 }
