@@ -106,4 +106,91 @@ static inline int AuxCopyChroma(uint8_t *dst, size_t dstRow, int dw, int dh,
     return 1;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Smooth (bilinear) versions. Same arguments and same meaning as AuxCopyLuma / AuxCopyChroma,
+// but every output pixel blends the 4 nearest source pixels instead of picking one.
+// Sample positions are pixel centres; weights are 8-bit; identical size + same range = exact copy.
+// ---------------------------------------------------------------------------------------------
+static inline void AuxBuildAxis(int dstN, int srcN, int16_t *i0, int16_t *i1, uint8_t *w) {
+    for (int x = 0; x < dstN; x++) {
+        long long pos = (((long long)(2 * x + 1) * srcN * 65536LL) / (2LL * dstN)) - 32768LL;
+        if (pos < 0) pos = 0;
+        long long ix = pos >> 16;
+        if (ix > srcN - 1) ix = srcN - 1;
+        long long ix1 = ix + 1 < srcN ? ix + 1 : srcN - 1;
+        i0[x] = (int16_t)ix;
+        i1[x] = (int16_t)ix1;
+        w[x] = (uint8_t)((pos & 0xFFFF) >> 8);
+    }
+}
+
+static inline int AuxScaleLuma(uint8_t *dst, size_t dstRow, int dw, int dh,
+                               const uint8_t *src, size_t srcRow,
+                               int cx, int cy, int cw, int ch, int rangeMode) {
+    if (!dst || !src || dw <= 0 || dh <= 0 || cw <= 0 || ch <= 0 || dw > AUX_SCALE_MAX_WIDTH || cw > AUX_SCALE_MAX_WIDTH) return 0;
+    if (dstRow < (size_t)dw || srcRow < (size_t)(cx + cw)) return 0;
+    if (dw == cw && dh == ch) return AuxCopyLuma(dst, dstRow, dw, dh, src, srcRow, cx, cy, cw, ch, rangeMode);
+    uint8_t lut[256];
+    AuxBuildRangeLut(lut, 0, rangeMode);
+    int16_t xi0[AUX_SCALE_MAX_WIDTH], xi1[AUX_SCALE_MAX_WIDTH];
+    uint8_t xw[AUX_SCALE_MAX_WIDTH];
+    AuxBuildAxis(dw, cw, xi0, xi1, xw);
+    const uint8_t *s0 = src + (size_t)cy * srcRow + (size_t)cx;
+    for (int y = 0; y < dh; y++) {
+        long long pos = (((long long)(2 * y + 1) * ch * 65536LL) / (2LL * dh)) - 32768LL;
+        if (pos < 0) pos = 0;
+        int iy = (int)(pos >> 16);
+        if (iy > ch - 1) iy = ch - 1;
+        int iy1 = iy + 1 < ch ? iy + 1 : ch - 1;
+        unsigned wy = (unsigned)((pos & 0xFFFF) >> 8);
+        const uint8_t *r0 = s0 + (size_t)iy * srcRow;
+        const uint8_t *r1 = s0 + (size_t)iy1 * srcRow;
+        uint8_t *dp = dst + (size_t)y * dstRow;
+        for (int x = 0; x < dw; x++) {
+            unsigned wx = xw[x];
+            unsigned top = r0[xi0[x]] * (256 - wx) + r0[xi1[x]] * wx;
+            unsigned bot = r1[xi0[x]] * (256 - wx) + r1[xi1[x]] * wx;
+            dp[x] = lut[(top * (256 - wy) + bot * wy + 32768) >> 16];
+        }
+    }
+    return 1;
+}
+
+static inline int AuxScaleChroma(uint8_t *dst, size_t dstRow, int dw, int dh,
+                                 const uint8_t *src, size_t srcRow,
+                                 int cx, int cy, int cw, int ch, int rangeMode) {
+    int dpw = dw / 2, dph = dh / 2, spw = cw / 2, sph = ch / 2;
+    if (!dst || !src || dpw <= 0 || dph <= 0 || spw <= 0 || sph <= 0 || dpw > AUX_SCALE_MAX_WIDTH || spw > AUX_SCALE_MAX_WIDTH) return 0;
+    if (dstRow < (size_t)dpw * 2 || srcRow < (size_t)(cx / 2 + spw) * 2) return 0;
+    if (dpw == spw && dph == sph) return AuxCopyChroma(dst, dstRow, dw, dh, src, srcRow, cx, cy, cw, ch, rangeMode);
+    uint8_t lut[256];
+    AuxBuildRangeLut(lut, 1, rangeMode);
+    int16_t xi0[AUX_SCALE_MAX_WIDTH], xi1[AUX_SCALE_MAX_WIDTH];
+    uint8_t xw[AUX_SCALE_MAX_WIDTH];
+    AuxBuildAxis(dpw, spw, xi0, xi1, xw);
+    const uint8_t *s0 = src + (size_t)(cy / 2) * srcRow + (size_t)(cx / 2) * 2;
+    for (int y = 0; y < dph; y++) {
+        long long pos = (((long long)(2 * y + 1) * sph * 65536LL) / (2LL * dph)) - 32768LL;
+        if (pos < 0) pos = 0;
+        int iy = (int)(pos >> 16);
+        if (iy > sph - 1) iy = sph - 1;
+        int iy1 = iy + 1 < sph ? iy + 1 : sph - 1;
+        unsigned wy = (unsigned)((pos & 0xFFFF) >> 8);
+        const uint8_t *r0 = s0 + (size_t)iy * srcRow;
+        const uint8_t *r1 = s0 + (size_t)iy1 * srcRow;
+        uint8_t *dp = dst + (size_t)y * dstRow;
+        for (int x = 0; x < dpw; x++) {
+            unsigned wx = xw[x];
+            const uint8_t *a = r0 + (size_t)xi0[x] * 2, *b = r0 + (size_t)xi1[x] * 2;
+            const uint8_t *c = r1 + (size_t)xi0[x] * 2, *d = r1 + (size_t)xi1[x] * 2;
+            for (int k = 0; k < 2; k++) {   // k=0 Cb, k=1 Cr, both from the same four source pairs
+                unsigned top = a[k] * (256 - wx) + b[k] * wx;
+                unsigned bot = c[k] * (256 - wx) + d[k] * wx;
+                dp[2 * x + k] = lut[(top * (256 - wy) + bot * wy + 32768) >> 16];
+            }
+        }
+    }
+    return 1;
+}
+
 #endif

@@ -28,6 +28,7 @@ static NSString *const kLogPath  = @"/var/mobile/Media/DCIM/.auxcam-stream.log";
 static int gActive = 0;
 static pthread_mutex_t gFrameMutex = PTHREAD_MUTEX_INITIALIZER;
 static CVPixelBufferRef gLast = NULL;
+static uint64_t gLastGen = 0;   // AUXCACHE: increases with every new shared frame
 static int gFrames = 0, gCopied = 0, gDecoded = 0;
 static int gFrameFD = -1;
 static unsigned int gMapFailures = 0;
@@ -53,6 +54,7 @@ static void SetLastFrame(CVPixelBufferRef frame) {
     pthread_mutex_lock(&gFrameMutex);
     old = gLast;
     gLast = frame ? CVPixelBufferRetain(frame) : NULL;
+    gLastGen++;
     pthread_mutex_unlock(&gFrameMutex);
     if (old) CVPixelBufferRelease(old);
 }
@@ -61,9 +63,10 @@ static void ClearLastFrame(void) {
     SetLastFrame(NULL);
 }
 
-static CVPixelBufferRef CopyLastFrame(void) {
+static CVPixelBufferRef CopyLastFrame(uint64_t *gen) {
     pthread_mutex_lock(&gFrameMutex);
     CVPixelBufferRef frame = gLast ? CVPixelBufferRetain(gLast) : NULL;
+    if (gen) *gen = gLastGen;
     pthread_mutex_unlock(&gFrameMutex);
     return frame;
 }
@@ -181,7 +184,72 @@ static void LogFormatOnce(OSType srcFmt, size_t sw, size_t sh, OSType dstFmt, si
     }
 }
 
-static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
+// AUXCACHE: smooth scaling is done once per new frame and output size, then copied into every camera buffer.
+typedef struct {
+    int inited, used;
+    pthread_mutex_t lock;
+    size_t dw, dh;
+    int rangeMode;
+    uint64_t gen;
+    int valid;
+    uint8_t *y, *uv;
+} AuxCacheEntry;
+static AuxCacheEntry gAuxCache[4];
+static pthread_mutex_t gAuxCacheTable = PTHREAD_MUTEX_INITIALIZER;
+static unsigned gAuxCacheNext = 0;
+
+static AuxCacheEntry *AuxCacheFor(size_t dw, size_t dh, int rangeMode) {
+    AuxCacheEntry *found = NULL;
+    pthread_mutex_lock(&gAuxCacheTable);
+    for (int i = 0; i < 4; i++) {
+        if (gAuxCache[i].used && gAuxCache[i].dw == dw && gAuxCache[i].dh == dh && gAuxCache[i].rangeMode == rangeMode) {
+            found = &gAuxCache[i];
+            break;
+        }
+    }
+    if (!found) {
+        AuxCacheEntry *e = &gAuxCache[gAuxCacheNext++ % 4];
+        if (!e->inited) { pthread_mutex_init(&e->lock, NULL); e->inited = 1; }
+        pthread_mutex_lock(&e->lock);
+        free(e->y); free(e->uv);
+        e->y = (uint8_t *)malloc(dw * dh);
+        e->uv = (uint8_t *)malloc(dw * dh / 2);
+        e->dw = dw; e->dh = dh; e->rangeMode = rangeMode; e->gen = 0; e->valid = 0;
+        e->used = (e->y && e->uv) ? 1 : 0;
+        pthread_mutex_unlock(&e->lock);
+        found = e->used ? e : NULL;
+    }
+    pthread_mutex_unlock(&gAuxCacheTable);
+    return found;
+}
+
+// Scale the source into the camera buffer. Returns YES on success.
+static BOOL AuxScaleCached(uint8_t *dstY, size_t dstYRow, uint8_t *dstUV, size_t dstUVRow, int dw, int dh,
+                           const uint8_t *srcY, size_t srcYRow, const uint8_t *srcUV, size_t srcUVRow,
+                           int cx, int cy, int cw, int ch, int rangeMode, uint64_t gen) {
+    AuxCacheEntry *e = (gen != 0 && dw > 0 && dh > 0 && dw <= AUX_SCALE_MAX_WIDTH) ? AuxCacheFor((size_t)dw, (size_t)dh, rangeMode) : NULL;
+    if (!e) {   // no cache available: scale straight into the camera buffer
+        return AuxScaleLuma(dstY, dstYRow, dw, dh, srcY, srcYRow, cx, cy, cw, ch, rangeMode) != 0 &&
+               AuxScaleChroma(dstUV, dstUVRow, dw, dh, srcUV, srcUVRow, cx, cy, cw, ch, rangeMode) != 0;
+    }
+    BOOL ok = YES;
+    pthread_mutex_lock(&e->lock);
+    if (!e->valid || e->gen != gen) {
+        e->valid = AuxScaleLuma(e->y, (size_t)dw, dw, dh, srcY, srcYRow, cx, cy, cw, ch, rangeMode) != 0 &&
+                   AuxScaleChroma(e->uv, (size_t)dw, dw, dh, srcUV, srcUVRow, cx, cy, cw, ch, rangeMode) != 0;
+        e->gen = gen;
+    }
+    if (e->valid && dstYRow >= (size_t)dw && dstUVRow >= (size_t)dw) {
+        for (int r = 0; r < dh; r++) memcpy(dstY + (size_t)r * dstYRow, e->y + (size_t)r * dw, (size_t)dw);
+        for (int r = 0; r < dh / 2; r++) memcpy(dstUV + (size_t)r * dstUVRow, e->uv + (size_t)r * dw, (size_t)dw);
+    } else {
+        ok = NO;
+    }
+    pthread_mutex_unlock(&e->lock);
+    return ok;
+}
+
+static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t gen) {
     if (!src || !dst) return NO;
     OSType sourceFormat = CVPixelBufferGetPixelFormatType(src);
     OSType destinationFormat = CVPixelBufferGetPixelFormatType(dst);
@@ -209,16 +277,17 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst) {
     int cropX = 0, cropY = 0, cropW = sourceWidth, cropH = sourceHeight;
     AuxComputeCover(sourceWidth, sourceHeight, destinationWidth, destinationHeight,
                     &cropX, &cropY, &cropW, &cropH);
-    BOOL copiedY = AuxCopyLuma((uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0),
-                               CVPixelBufferGetBytesPerRowOfPlane(dst, 0), destinationWidth, destinationHeight,
-                               (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0),
-                               CVPixelBufferGetBytesPerRowOfPlane(src, 0),
-                               cropX, cropY, cropW, cropH, rangeMode) != 0;
-    BOOL copiedUV = AuxCopyChroma((uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1),
-                                  CVPixelBufferGetBytesPerRowOfPlane(dst, 1), destinationWidth, destinationHeight,
+    BOOL copiedY = AuxScaleCached((uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0),
+                                  CVPixelBufferGetBytesPerRowOfPlane(dst, 0),
+                                  (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1),
+                                  CVPixelBufferGetBytesPerRowOfPlane(dst, 1),
+                                  destinationWidth, destinationHeight,
+                                  (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 0),
+                                  CVPixelBufferGetBytesPerRowOfPlane(src, 0),
                                   (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, 1),
                                   CVPixelBufferGetBytesPerRowOfPlane(src, 1),
-                                  cropX, cropY, cropW, cropH, rangeMode) != 0;
+                                  cropX, cropY, cropW, cropH, rangeMode, gen);
+    BOOL copiedUV = copiedY;
     if (!copiedY || !copiedUV) {
         CVPixelBufferUnlockBaseAddress(dst, 0);
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
@@ -243,8 +312,9 @@ static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
     if (__atomic_load_n(&gActive, __ATOMIC_ACQUIRE) && sb) {
         gFrames++;
         CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(sb);
-        CVPixelBufferRef src = CopyLastFrame();
-        if (dst && src && Blit(src, dst)) gCopied++;
+        uint64_t srcGen = 0;
+        CVPixelBufferRef src = CopyLastFrame(&srcGen);
+        if (dst && src && Blit(src, dst, srcGen)) gCopied++;
         if (src) CVPixelBufferRelease(src);
         if ((gFrames % 150) == 0) {
             NSString *beat = [NSString stringWithFormat:@"camera=%d replaced=%d received=%d time=%@\n",
