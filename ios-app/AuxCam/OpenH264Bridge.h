@@ -8,4 +8,5 @@ void auxh264_destroy(void * _Nullable decoder);
 int32_t auxh264_decode(void * _Nullable decoder, const uint8_t * _Nullable bytes, int32_t length,
                        CVPixelBufferRef _Nullable * _Nonnull outputBuffer);
 int32_t auxcam_publish_shared_frame(CVPixelBufferRef _Nonnull frame);
+void auxcam_set_transform(int32_t mirror, int32_t rotate);
 #endif

@@ -1,5 +1,5 @@
 // AuxCamFloat —— 系统级悬浮小窗（注入 SpringBoard，所以在任何界面都能看到）
-// 平时是小圆球；点一下展开小卡片：开始/停止 + 镜像 + 旋转 + 恢复 + 打开 App。
+// 平时是小圆球；点一下展开小卡片：放视频 / 切回相机 / 镜像 / 旋转。
 // 窗口是全屏透明的（点到空白处直接穿透给下面的界面），圆球/卡片是窗口里面的小方块，
 // 拖动时只移动小方块，不动窗口本身，所以不会有残影。
 // 和 AuxCam App 的通信（都走 /var/mobile/Media/DCIM）：
@@ -12,7 +12,7 @@
 
 #define AUX_BALL 46.0
 #define AUX_CARD_W 214.0
-#define AUX_CARD_H 178.0
+#define AUX_CARD_H 140.0
 #define AUX_APP_ID @"com.auxcam.app"
 
 static NSString *const kStatePath = @"/var/mobile/Media/DCIM/.auxcam-float.state";
@@ -71,15 +71,6 @@ static int ReadState(BOOL *live, NSString **ack) {
     if (age > 60) return 0;
     if (age > 4) return 1;
     return 2;
-}
-
-static void OpenApp(void) {
-    Class cls = NSClassFromString(@"LSApplicationWorkspace");
-    id ws = [cls performSelector:NSSelectorFromString(@"defaultWorkspace")];
-    SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:");
-    BOOL can = ws && [ws respondsToSelector:sel];
-    AuxLog([NSString stringWithFormat:@"click -> open app, workspace=%d", can]);
-    if (can) [ws performSelector:sel withObject:AUX_APP_ID];
 }
 
 // 全屏透明窗口：只有点到圆球/卡片才响应，其余地方穿透
@@ -155,7 +146,7 @@ static void OpenApp(void) {
     [gCard addSubview:title];
 
     gStatus = [[UILabel alloc] initWithFrame:CGRectMake(72, 8, 100, 22)];
-    gStatus.text = @"未开始";
+    gStatus.text = @"真镜头";
     gStatus.textColor = [UIColor colorWithWhite:1 alpha:0.7];
     gStatus.font = [UIFont systemFontOfSize:12];
     [gCard addSubview:gStatus];
@@ -168,21 +159,18 @@ static void OpenApp(void) {
     [close addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [gCard addSubview:close];
 
-    NSArray *titles = @[@"开始", @"镜像", @"旋转", @"恢复"];
+    NSArray *titles = @[@"放视频", @"切回相机", @"镜像", @"旋转"];
     for (int i = 0; i < 4; i++) {
         CGFloat bx = 12 + (i % 2) * 94;
         CGFloat by = 38 + (i / 2) * 46;
         UIButton *b = [self makeButton:titles[i] frame:CGRectMake(bx, by, 88, 40) tag:i];
-        if (i == 1) b.backgroundColor = [UIColor colorWithRed:0.35 green:0.55 blue:0.75 alpha:1];
-        if (i == 2) b.backgroundColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.75 alpha:1];
-        if (i == 3) b.backgroundColor = [UIColor colorWithRed:0.90 green:0.55 blue:0.15 alpha:1];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        if (i == 1) b.backgroundColor = [UIColor colorWithRed:0.90 green:0.55 blue:0.15 alpha:1];
+        if (i == 2) b.backgroundColor = [UIColor colorWithRed:0.35 green:0.55 blue:0.75 alpha:1];
+        if (i == 3) b.backgroundColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.75 alpha:1];
         [gCard addSubview:b];
         if (i == 0) gStart = b;
     }
-
-    UIButton *open = [self makeButton:@"打开 AuxCam" frame:CGRectMake(12, 132, 190, 36) tag:4];
-    open.backgroundColor = [UIColor colorWithWhite:1 alpha:0.16];
-    [gCard addSubview:open];
 
     // 拖动：只移动小方块 gHolder
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(move:)];
@@ -206,11 +194,10 @@ static void OpenApp(void) {
 
 - (void)tap:(UIButton *)b {
     switch (b.tag) {
-        case 0: SendCmd(@"toggle"); break;
-        case 1: SendCmd(@"mirror"); break;
-        case 2: SendCmd(@"rotate"); break;
-        case 3: SendCmd(@"reset"); break;
-        case 4: OpenApp(); break;
+        case 0: SendCmd(@"fakeon"); break;
+        case 1: SendCmd(@"fakeoff"); break;
+        case 2: SendCmd(@"mirror"); break;
+        case 3: SendCmd(@"rotate"); break;
         default: break;
     }
 }
@@ -274,15 +261,14 @@ static void AuxTick(void) {
     }
     gWin.hidden = (st == 0);
     if (st == 0) return;
-    [gStart setTitle:live ? @"停止" : @"开始" forState:UIControlStateNormal];
-    gStart.backgroundColor = live ? [UIColor colorWithRed:0.85 green:0.25 blue:0.22 alpha:1]
+    gStart.backgroundColor = live ? [UIColor colorWithRed:0.55 green:0.35 blue:0.75 alpha:1]
                                   : [UIColor colorWithRed:0.20 green:0.72 blue:0.62 alpha:1];
     if (st == 1) {
         gDot.backgroundColor = [UIColor orangeColor];
-        gStatus.text = @"App休眠，点打开";
+        gStatus.text = @"App休眠中";
     } else {
         gDot.backgroundColor = live ? [UIColor greenColor] : [UIColor grayColor];
-        gStatus.text = live ? @"推流中" : @"未开始";
+        gStatus.text = live ? @"电脑画面" : @"真镜头";
     }
     static NSString *lastAck = nil;
     if (gLastCmdID && ack.length && [ack isEqualToString:gLastCmdID] && ![ack isEqualToString:lastAck]) {

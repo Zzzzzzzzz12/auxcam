@@ -1978,6 +1978,7 @@ struct ContentView: View {
     @State private var recordOn = false
     @State private var aiOn = true
     @State private var floatLastCmdID = ""
+    @State private var rotation = 0   // 0/90/180/270，顺时针
     private static let floatStartTS = Int(Date().timeIntervalSince1970)
     private static var floatTimer: DispatchSourceTimer?
     @State private var showDiag = false
@@ -2188,18 +2189,15 @@ struct ContentView: View {
     }
 
     private var panel: some View {
-        VStack(spacing: 10) {
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                PB("直连", "cable.connector") { tapDirect() }
-                PB("内录", "record.circle", recordOn ? .red : Color(red: 0.20, green: 0.72, blue: 0.62)) { tapRecord() }
-                PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
-                PB(fakeCameraOn ? "切回真镜头" : ((!netMode && (vcu.alive || !hasPickedVideo)) ? "放电脑画面" : "放视频"),
-                   fakeCameraOn ? "camera.fill" : "play.rectangle.fill",
-                   fakeCameraOn ? Color(red: 0.90, green: 0.55, blue: 0.15) : Color(red: 0.55, green: 0.35, blue: 0.75)) {
-                    vcamControl(!fakeCameraOn)
-                }
-                PB("恢复", "arrow.counterclockwise", Color(red: 0.90, green: 0.55, blue: 0.15)) { tapReset() }
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            PB("放视频", "play.rectangle.fill", fakeCameraOn ? Color(red: 0.55, green: 0.35, blue: 0.75) : Color(red: 0.20, green: 0.72, blue: 0.62)) {
+                vcamControl(true)
             }
+            PB("切回相机", "camera.fill", Color(red: 0.90, green: 0.55, blue: 0.15)) {
+                vcamControl(false)
+            }
+            PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
+            PB("旋转" + (rotation == 0 ? "" : " \(rotation)°"), "rotate.right", rotation == 0 ? Color(red: 0.35, green: 0.55, blue: 0.75) : .teal) { tapRotate() }
         }
     }
 
@@ -2353,7 +2351,7 @@ struct ContentView: View {
 
     // AUXFLOAT：和系统级悬浮窗（SpringBoard 里的小圆球）互通：每秒写状态、读指令
     private func floatSync() {
-        let live = (state == .live || state == .starting) ? 1 : 0
+        let live = fakeCameraOn ? 1 : 0
         let now = Int(Date().timeIntervalSince1970)
         let text = "visible=1\nlive=\(live)\nack=\(floatLastCmdID)\nts=\(now)\n"
         try? text.write(toFile: "/var/mobile/Media/DCIM/.auxcam-float.state", atomically: true, encoding: .utf8)
@@ -2366,10 +2364,10 @@ struct ContentView: View {
         if ts < ContentView.floatStartTS - 1 { return }
         StreamDecoder.dlog("悬浮窗指令: \(d["cmd"] ?? "?") id=\(id)")
         switch d["cmd"] ?? "" {
-        case "toggle": toggleLive()
+        case "fakeon": vcamControl(true)
+        case "fakeoff": vcamControl(false)
         case "mirror": tapMirror()
-        case "rotate": Link.send(["cmd": "rotate"])
-        case "reset": tapReset()
+        case "rotate": tapRotate()
         default: break
         }
     }
@@ -2511,8 +2509,16 @@ struct ContentView: View {
 
     private func tapMirror() {
         mirrorOn.toggle()
-        Link.send(["cmd": "mirror"])
+        auxcam_set_transform(mirrorOn ? 1 : 0, Int32(rotation))
+        StreamDecoder.dlog("镜像 \(mirrorOn ? "开" : "关") 旋转=\(rotation)")
         hint = mirrorOn ? "镜像已开" : "镜像已关"
+    }
+
+    private func tapRotate() {
+        rotation = (rotation + 90) % 360
+        auxcam_set_transform(mirrorOn ? 1 : 0, Int32(rotation))
+        StreamDecoder.dlog("旋转 \(rotation)° 镜像=\(mirrorOn)")
+        hint = "已旋转 \(rotation)°"
     }
 
     private func tapRecord() {
@@ -2528,6 +2534,8 @@ struct ContentView: View {
         wasLive = false
         mirrorOn = false
         recordOn = false
+        rotation = 0
+        auxcam_set_transform(0, 0)
         vcamControl(false)   // 真正切回真镜头
         Link.send(["cmd": "reset"])
     }

@@ -155,6 +155,38 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     return 1;
 }
 
+// AUXXFORM：镜像 / 旋转（发布到共享内存前对画面做变换）
+static volatile int gMirror = 0;
+static volatile int gRotate = 0;   // 0 / 90 / 180 / 270（顺时针）
+
+void auxcam_set_transform(int32_t mirror, int32_t rotate) {
+    int r = ((rotate % 360) + 360) % 360;
+    gRotate = (r == 90 || r == 180 || r == 270) ? r : 0;
+    gMirror = mirror ? 1 : 0;
+}
+
+#define AUX_XFORM_PLANE(NAME, T) \
+static void NAME(const uint8_t *src, size_t sStride, int sw, int sh, uint8_t *dst, size_t dStride, int rot, int mirror) { \
+    int W = (rot == 90 || rot == 270) ? sh : sw; \
+    int H = (rot == 90 || rot == 270) ? sw : sh; \
+    for (int dy = 0; dy < H; dy++) { \
+        T *drow = (T *)(dst + (size_t)dy * dStride); \
+        for (int dx = 0; dx < W; dx++) { \
+            int mx = mirror ? (W - 1 - dx) : dx; \
+            int sx, sy; \
+            switch (rot) { \
+                case 90:  sx = dy;          sy = sh - 1 - mx; break; \
+                case 180: sx = sw - 1 - mx; sy = sh - 1 - dy; break; \
+                case 270: sx = sw - 1 - dy; sy = mx;          break; \
+                default:  sx = mx;          sy = dy;          break; \
+            } \
+            drow[dx] = ((const T *)(src + (size_t)sy * sStride))[sx]; \
+        } \
+    } \
+}
+AUX_XFORM_PLANE(auxXformPlane8, uint8_t)
+AUX_XFORM_PLANE(auxXformPlane16, uint16_t)
+
 int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
     if (frame == NULL || !CVPixelBufferIsPlanar(frame) || CVPixelBufferGetPlaneCount(frame) < 2) return -1;
     const size_t width = CVPixelBufferGetWidth(frame);
@@ -202,6 +234,26 @@ int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
     AuxSharedFrameSlot *slot = &header->slots[target];
     uint8_t *dst = (uint8_t *)gSharedFrameMap + sizeof(*header) +
         (size_t)target * AUX_SHARED_FRAME_SLOT_CAPACITY;
+    const int xRot = gRotate;
+    const int xMirror = gMirror;
+    if (xRot != 0 || xMirror) {
+        const size_t outW = (xRot == 90 || xRot == 270) ? height : width;
+        const size_t outH = (xRot == 90 || xRot == 270) ? width : height;
+        auxXformPlane8(srcY, srcYStride, (int)width, (int)height, dst, outW, xRot, xMirror);
+        auxXformPlane16(srcUV, srcUVStride, (int)(width / 2), (int)(height / 2),
+                        dst + outW * outH, outW, xRot, xMirror);
+        slot->width = (uint32_t)outW;
+        slot->height = (uint32_t)outH;
+        slot->yStride = (uint32_t)outW;
+        slot->uvStride = (uint32_t)outW;
+        slot->frameBytes = (uint32_t)(outW * outH * 3 / 2);
+        __atomic_store_n(&slot->state, AUX_SHARED_SLOT_READY, __ATOMIC_RELEASE);
+        __atomic_store_n(&header->activeSlot, target, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&header->sequence, 1, __ATOMIC_ACQ_REL);
+        pthread_mutex_unlock(&gPublishMutex);
+        CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
+        return 1;
+    }
     for (size_t row = 0; row < height; row++) {
         memcpy(dst + row * width, srcY + row * srcYStride, width);
     }
