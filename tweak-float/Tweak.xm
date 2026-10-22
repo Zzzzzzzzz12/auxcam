@@ -1,8 +1,11 @@
 // AuxCamFloat —— 系统级悬浮小窗（注入 SpringBoard，所以在任何界面都能看到）
 // 平时是小圆球；点一下展开小卡片：开始/停止 + 镜像 + 旋转 + 恢复 + 打开 App。
+// 窗口是全屏透明的（点到空白处直接穿透给下面的界面），圆球/卡片是窗口里面的小方块，
+// 拖动时只移动小方块，不动窗口本身，所以不会有残影。
 // 和 AuxCam App 的通信（都走 /var/mobile/Media/DCIM）：
-//   .auxcam-float.state  App 每秒写一次（visible/live/ts）；超过 4 秒没更新 = App 没开 -> 小窗自动隐藏
-//   .auxcam-float.cmd    小窗写指令（cmd/id/ts），App 每秒读一次并执行
+//   .auxcam-float.state  App 每 0.5 秒写一次（live/ack/ts）
+//   .auxcam-float.cmd    小窗写指令（cmd/id/ts），App 读到后执行，并把 id 写回 state 的 ack
+// 状态文件 4 秒没更新 = App 休眠了（圆球小点变橙色）；60 秒没更新 = App 被关掉了（圆球消失）。
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -14,45 +17,81 @@
 
 static NSString *const kStatePath = @"/var/mobile/Media/DCIM/.auxcam-float.state";
 static NSString *const kCmdPath = @"/var/mobile/Media/DCIM/.auxcam-float.cmd";
+static NSString *const kLogPath = @"/var/mobile/Media/DCIM/.auxcam-float.log";
 
 static UIWindow *gWin = nil;
+static UIView *gHolder = nil;     // 会移动的小方块（圆球或卡片）
 static UIButton *gStart = nil;
 static UIView *gDot = nil;
 static UILabel *gStatus = nil;
 static UIView *gCard = nil;
 static UIButton *gBall = nil;
 static int gCmdSeq = 0;
+static NSString *gLastCmdID = nil;
+
+static void AuxLog(NSString *msg) {
+    static int n = 0;
+    if (n++ > 400) return;
+    NSString *line = [NSString stringWithFormat:@"%lld %@\n", (long long)[[NSDate date] timeIntervalSince1970], msg];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
+    if (!h) {
+        [line writeToFile:kLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    [h seekToEndOfFile];
+    [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [h closeFile];
+}
 
 static void SendCmd(NSString *cmd) {
     gCmdSeq++;
     long long now = (long long)[[NSDate date] timeIntervalSince1970];
-    NSString *t = [NSString stringWithFormat:@"cmd=%@\nid=%lld-%d\nts=%lld\n", cmd, now, gCmdSeq, now];
-    [t writeToFile:kCmdPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *cid = [NSString stringWithFormat:@"%lld-%d", now, gCmdSeq];
+    NSString *t = [NSString stringWithFormat:@"cmd=%@\nid=%@\nts=%lld\n", cmd, cid, now];
+    BOOL ok = [t writeToFile:kCmdPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    gLastCmdID = cid;
+    AuxLog([NSString stringWithFormat:@"click -> cmd=%@ id=%@ write=%d", cmd, cid, ok]);
 }
 
-// 读 App 写的状态：返回 App 是否还活着，live 是否在推
-static BOOL ReadState(BOOL *live) {
+// 读 App 写的状态。返回：0 = App 没开（60秒没更新），1 = 休眠（4秒没更新），2 = 正常
+static int ReadState(BOOL *live, NSString **ack) {
     NSString *t = [NSString stringWithContentsOfFile:kStatePath encoding:NSUTF8StringEncoding error:nil];
-    if (!t) return NO;
+    if (!t) return 0;
     long long ts = 0;
     BOOL l = NO;
+    NSString *a = @"";
     for (NSString *line in [t componentsSeparatedByString:@"\n"]) {
         if ([line hasPrefix:@"ts="]) ts = [[line substringFromIndex:3] longLongValue];
         if ([line hasPrefix:@"live="]) l = [[line substringFromIndex:5] intValue] == 1;
+        if ([line hasPrefix:@"ack="]) a = [line substringFromIndex:4];
     }
     if (live) *live = l;
-    long long now = (long long)[[NSDate date] timeIntervalSince1970];
-    return (now - ts) <= 4;
+    if (ack) *ack = a;
+    long long age = (long long)[[NSDate date] timeIntervalSince1970] - ts;
+    if (age > 60) return 0;
+    if (age > 4) return 1;
+    return 2;
 }
 
 static void OpenApp(void) {
     Class cls = NSClassFromString(@"LSApplicationWorkspace");
     id ws = [cls performSelector:NSSelectorFromString(@"defaultWorkspace")];
     SEL sel = NSSelectorFromString(@"openApplicationWithBundleID:");
-    if (ws && [ws respondsToSelector:sel]) {
-        [ws performSelector:sel withObject:AUX_APP_ID];
-    }
+    BOOL can = ws && [ws respondsToSelector:sel];
+    AuxLog([NSString stringWithFormat:@"click -> open app, workspace=%d", can]);
+    if (can) [ws performSelector:sel withObject:AUX_APP_ID];
 }
+
+// 全屏透明窗口：只有点到圆球/卡片才响应，其余地方穿透
+@interface AuxPassWindow : UIWindow
+@end
+@implementation AuxPassWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (v == self || v == self.rootViewController.view) return nil;
+    return v;
+}
+@end
 
 @interface AuxFloatVC : UIViewController
 @end
@@ -73,9 +112,14 @@ static void OpenApp(void) {
 }
 
 - (void)loadView {
-    UIView *root = [[UIView alloc] initWithFrame:CGRectMake(0, 0, AUX_BALL, AUX_BALL)];
+    CGRect screen = UIScreen.mainScreen.bounds;
+    UIView *root = [[UIView alloc] initWithFrame:screen];
     root.backgroundColor = [UIColor clearColor];
     self.view = root;
+
+    gHolder = [[UIView alloc] initWithFrame:CGRectMake(screen.size.width - AUX_BALL - 10, screen.size.height * 0.55, AUX_BALL, AUX_BALL)];
+    gHolder.backgroundColor = [UIColor clearColor];
+    [root addSubview:gHolder];
 
     gBall = [UIButton buttonWithType:UIButtonTypeSystem];
     gBall.frame = CGRectMake(0, 0, AUX_BALL, AUX_BALL);
@@ -87,13 +131,13 @@ static void OpenApp(void) {
     [gBall setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     gBall.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [gBall addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-    [root addSubview:gBall];
+    [gHolder addSubview:gBall];
 
     gDot = [[UIView alloc] initWithFrame:CGRectMake(AUX_BALL - 14, 4, 10, 10)];
     gDot.backgroundColor = [UIColor grayColor];
     gDot.layer.cornerRadius = 5;
     gDot.userInteractionEnabled = NO;
-    [root addSubview:gDot];
+    [gHolder addSubview:gDot];
 
     gCard = [[UIView alloc] initWithFrame:CGRectMake(0, 0, AUX_CARD_W, AUX_CARD_H)];
     gCard.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
@@ -102,7 +146,7 @@ static void OpenApp(void) {
     gCard.layer.borderWidth = 1;
     gCard.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.25].CGColor;
     gCard.hidden = YES;
-    [root addSubview:gCard];
+    [gHolder addSubview:gCard];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, 60, 22)];
     title.text = @"AuxCam";
@@ -140,9 +184,10 @@ static void OpenApp(void) {
     open.backgroundColor = [UIColor colorWithWhite:1 alpha:0.16];
     [gCard addSubview:open];
 
+    // 拖动：只移动小方块 gHolder
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(move:)];
-    [root addGestureRecognizer:pan];
-
+    pan.cancelsTouchesInView = NO;
+    [gHolder addGestureRecognizer:pan];
 }
 
 - (void)toggle {
@@ -150,14 +195,13 @@ static void OpenApp(void) {
     gCard.hidden = !expand;
     gBall.hidden = expand;
     gDot.hidden = expand;
-    CGRect f = gWin.frame;
-    CGFloat sw = UIScreen.mainScreen.bounds.size.width;
-    CGFloat sh = UIScreen.mainScreen.bounds.size.height;
+    CGRect screen = UIScreen.mainScreen.bounds;
+    CGRect f = gHolder.frame;
     f.size = expand ? CGSizeMake(AUX_CARD_W, AUX_CARD_H) : CGSizeMake(AUX_BALL, AUX_BALL);
-    if (f.origin.x + f.size.width > sw) f.origin.x = sw - f.size.width - 4;
-    if (f.origin.y + f.size.height > sh) f.origin.y = sh - f.size.height - 4;
-    gWin.frame = f;
-    self.view.frame = CGRectMake(0, 0, f.size.width, f.size.height);
+    if (f.origin.x + f.size.width > screen.size.width) f.origin.x = screen.size.width - f.size.width - 4;
+    if (f.origin.y + f.size.height > screen.size.height) f.origin.y = screen.size.height - f.size.height - 4;
+    gHolder.frame = f;
+    AuxLog([NSString stringWithFormat:@"click -> %@", expand ? @"expand" : @"collapse"]);
 }
 
 - (void)tap:(UIButton *)b {
@@ -172,33 +216,22 @@ static void OpenApp(void) {
 }
 
 - (void)move:(UIPanGestureRecognizer *)pan {
-    static CGPoint off = {0, 0};
+    static CGPoint startOrigin;
     if (pan.state == UIGestureRecognizerStateBegan) {
-        off = [pan locationInView:gWin];
+        startOrigin = gHolder.frame.origin;
     } else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint p = [pan locationInView:nil];
-        CGRect f = gWin.frame;
-        f.origin.x = p.x - off.x;
-        f.origin.y = p.y - off.y;
-        gWin.frame = f;
+        CGPoint t = [pan translationInView:self.view];
+        CGRect screen = UIScreen.mainScreen.bounds;
+        CGRect f = gHolder.frame;
+        f.origin.x = MAX(0, MIN(startOrigin.x + t.x, screen.size.width - f.size.width));
+        f.origin.y = MAX(20, MIN(startOrigin.y + t.y, screen.size.height - f.size.height));
+        gHolder.frame = f;
+    } else if (pan.state == UIGestureRecognizerStateEnded) {
+        AuxLog(@"drag end");
     }
 }
 
 @end
-
-static void AuxLog(NSString *msg) {
-    static int n = 0;
-    if (n++ > 200) return;     // 日志最多 200 行，别写爆
-    NSString *line = [NSString stringWithFormat:@"%lld %@\n", (long long)[[NSDate date] timeIntervalSince1970], msg];
-    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:@"/var/mobile/Media/DCIM/.auxcam-float.log"];
-    if (!h) {
-        [line writeToFile:@"/var/mobile/Media/DCIM/.auxcam-float.log" atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        return;
-    }
-    [h seekToEndOfFile];
-    [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-    [h closeFile];
-}
 
 static int gTries = 0;
 
@@ -213,46 +246,54 @@ static void AuxCreateWindow(void) {
     }
     if (!scene && gTries < 10) {
         if (gTries == 1) AuxLog([NSString stringWithFormat:@"no UIWindowScene yet, scenes=[%@], will retry", desc]);
-        return;     // 还没有 scene，下一秒再试（最多 10 次）
+        return;
     }
-    CGFloat sw = UIScreen.mainScreen.bounds.size.width;
-    CGFloat sh = UIScreen.mainScreen.bounds.size.height;
-    CGRect f = CGRectMake(sw - AUX_BALL - 10, sh * 0.55, AUX_BALL, AUX_BALL);
-    gWin = scene ? [[UIWindow alloc] initWithWindowScene:scene] : [[UIWindow alloc] initWithFrame:f];
-    gWin.frame = f;
+    CGRect screen = UIScreen.mainScreen.bounds;
+    gWin = scene ? [[AuxPassWindow alloc] initWithWindowScene:scene] : [[AuxPassWindow alloc] initWithFrame:screen];
+    gWin.frame = screen;
     gWin.windowLevel = 10000000;
     gWin.backgroundColor = [UIColor clearColor];
     gWin.rootViewController = [AuxFloatVC new];
-    [gWin.rootViewController view];     // 强制加载界面（窗口隐藏时系统不会自己加载）
+    [gWin.rootViewController view];
     SEL sec = NSSelectorFromString(@"_setSecure:");
     if ([gWin respondsToSelector:sec]) ((void (*)(id, SEL, BOOL))objc_msgSend)(gWin, sec, YES);
     gWin.hidden = YES;
     AuxLog([NSString stringWithFormat:@"window created scene=%d tries=%d scenes=[%@]", scene ? 1 : 0, gTries, desc]);
 }
 
-// 每秒一次：没窗口就建；有 App 状态就显示并刷新按钮
 static void AuxTick(void) {
     AuxCreateWindow();
     if (!gWin) return;
     BOOL live = NO;
-    BOOL alive = ReadState(&live);
-    static int lastShown = -1;
-    if ((int)alive != lastShown) {
-        lastShown = alive;
-        AuxLog([NSString stringWithFormat:@"app alive=%d -> window %@", alive, alive ? @"show" : @"hide"]);
+    NSString *ack = @"";
+    int st = ReadState(&live, &ack);
+    static int lastSt = -1;
+    if (st != lastSt) {
+        lastSt = st;
+        AuxLog([NSString stringWithFormat:@"app state=%d (0=closed 1=sleeping 2=ok) -> window %@", st, st ? @"show" : @"hide"]);
     }
-    gWin.hidden = !alive;
-    if (!alive) return;
+    gWin.hidden = (st == 0);
+    if (st == 0) return;
     [gStart setTitle:live ? @"停止" : @"开始" forState:UIControlStateNormal];
     gStart.backgroundColor = live ? [UIColor colorWithRed:0.85 green:0.25 blue:0.22 alpha:1]
                                   : [UIColor colorWithRed:0.20 green:0.72 blue:0.62 alpha:1];
-    gDot.backgroundColor = live ? [UIColor greenColor] : [UIColor grayColor];
-    gStatus.text = live ? @"推流中" : @"未开始";
+    if (st == 1) {
+        gDot.backgroundColor = [UIColor orangeColor];
+        gStatus.text = @"App休眠，点打开";
+    } else {
+        gDot.backgroundColor = live ? [UIColor greenColor] : [UIColor grayColor];
+        gStatus.text = live ? @"推流中" : @"未开始";
+    }
+    static NSString *lastAck = nil;
+    if (gLastCmdID && ack.length && [ack isEqualToString:gLastCmdID] && ![ack isEqualToString:lastAck]) {
+        lastAck = ack;
+        AuxLog([NSString stringWithFormat:@"App acked cmd id=%@", ack]);
+    }
 }
 
 __attribute__((constructor)) static void AuxFloatInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         AuxLog(@"AuxCamFloat loaded in SpringBoard");
-        [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) { AuxTick(); }];
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { AuxTick(); }];
     });
 }

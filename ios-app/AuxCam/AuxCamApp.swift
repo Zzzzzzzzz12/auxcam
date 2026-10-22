@@ -1836,7 +1836,7 @@ private final class StreamPictureInPicture: NSObject, AVPictureInPictureControll
                 sampleBufferDisplayLayer: layer, playbackDelegate: self)
             let pip = AVPictureInPictureController(contentSource: source)
             pip.delegate = self
-            pip.canStartPictureInPictureAutomaticallyFromInline = true
+            pip.canStartPictureInPictureAutomaticallyFromInline = false   // 不要一退后台就自动弹画中画
             self.controller = pip
             StreamDecoder.dlog("PiP ready")
         }
@@ -1979,6 +1979,7 @@ struct ContentView: View {
     @State private var aiOn = true
     @State private var floatLastCmdID = ""
     private static let floatStartTS = Int(Date().timeIntervalSince1970)
+    private static var floatTimer: DispatchSourceTimer?
     @State private var showDiag = false
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
     @AppStorage("streamURL") private var streamURL = ""
@@ -2298,6 +2299,14 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startLive() }
         }
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
+        // 悬浮窗通信单独用 GCD 定时器（界面滑动、后台时也照常跑）
+        if ContentView.floatTimer == nil {
+            let t = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+            t.schedule(deadline: .now() + 1, repeating: 0.5)
+            t.setEventHandler { floatSync() }
+            t.resume()
+            ContentView.floatTimer = t
+        }
     }
 
     // 后台保活：循环播静音，iOS 才不会挂起我们（退后台照样收电脑画面）
@@ -2346,7 +2355,7 @@ struct ContentView: View {
     private func floatSync() {
         let live = (state == .live || state == .starting) ? 1 : 0
         let now = Int(Date().timeIntervalSince1970)
-        let text = "visible=1\nlive=\(live)\nts=\(now)\n"
+        let text = "visible=1\nlive=\(live)\nack=\(floatLastCmdID)\nts=\(now)\n"
         try? text.write(toFile: "/var/mobile/Media/DCIM/.auxcam-float.state", atomically: true, encoding: .utf8)
         guard let t = try? String(contentsOfFile: "/var/mobile/Media/DCIM/.auxcam-float.cmd", encoding: .utf8) else { return }
         let d = Link.parse(t)
@@ -2355,6 +2364,7 @@ struct ContentView: View {
         // 只执行 App 启动之后发的指令，旧指令不理
         let ts = Int(d["ts"] ?? "0") ?? 0
         if ts < ContentView.floatStartTS - 1 { return }
+        StreamDecoder.dlog("悬浮窗指令: \(d["cmd"] ?? "?") id=\(id)")
         switch d["cmd"] ?? "" {
         case "toggle": toggleLive()
         case "mirror": tapMirror()
@@ -2365,7 +2375,6 @@ struct ContentView: View {
     }
 
     private func tick() {
-        floatSync()
         // 保活看门狗：静音播放器被系统打断（比如相机抢了声音通道）就立刻重新播
         if keepAlivePlayer != nil, keepAlivePlayer?.isPlaying != true {
             StreamDecoder.dlog("保活: 播放器被打断，重新播放")
