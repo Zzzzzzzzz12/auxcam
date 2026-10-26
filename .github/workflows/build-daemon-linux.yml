@@ -30,6 +30,7 @@ jobs:
         sed -i 's| -arch \$(ARCH)||g; s| -isysroot \$(SDKROOT)||g; s| -miphoneos-version-min=\$(SDK_MIN)||g; s| -fembed-bitcode||g' build/platform-ios.mk
         grep -E '^(CC|CXX|CFLAGS|LDFLAGS)' build/platform-ios.mk || true
         make OS=ios ARCH=arm64 SDK_MIN=15.0 USE_ASM=No -j4 libraries 2>&1 | tail -40
+        llvm-ranlib libopenh264.a || llvm-ar s libopenh264.a
         ls -l libopenh264.a
 
     - name: build auxcamd
