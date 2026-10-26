@@ -58,7 +58,7 @@ jobs:
         mkdir -p pkg/DEBIAN pkg/var/jb/usr/libexec pkg/var/jb/Library/LaunchDaemons
         cp auxcamd-bin pkg/var/jb/usr/libexec/auxcamd
         chmod 755 pkg/var/jb/usr/libexec/auxcamd
-        cp auxcamd/layout/DEBIAN/control pkg/DEBIAN/control
+        cp auxcamd/control pkg/DEBIAN/control
         cp auxcamd/layout/DEBIAN/postinst pkg/DEBIAN/postinst
         cp auxcamd/layout/DEBIAN/prerm pkg/DEBIAN/prerm
         chmod 755 pkg/DEBIAN/postinst pkg/DEBIAN/prerm
