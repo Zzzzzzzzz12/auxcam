@@ -6,7 +6,18 @@
 #   python3 sender_h264.py                      test pattern
 #   python3 sender_h264.py HOST PORT SOURCE     SOURCE = video file, or any ffmpeg input URL
 #                                               (e.g. udp://0.0.0.0:5000, srt://..., rtmp://...)
-import base64, os, random, re, shutil, socket, struct, subprocess, sys, tempfile, time
+#   python3 sender_h264.py 127.0.0.1 28765 cam:"OBS Virtual Camera"
+#                                               capture the OBS Virtual Camera directly (Mac: avfoundation, Windows: dshow)
+#   python3 sender_h264.py --list-cameras       list camera names this computer offers
+import base64, os, plistlib, random, re, shutil, socket, struct, subprocess, sys, tempfile, time
+
+if len(sys.argv) > 1 and sys.argv[1] == '--list-cameras':
+    _ff = os.environ.get('AUX_FFMPEG') or shutil.which('ffmpeg') or 'ffmpeg'
+    if sys.platform == 'darwin':
+        subprocess.run([_ff, '-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''])
+    else:
+        subprocess.run([_ff, '-hide_banner', '-f', 'dshow', '-list_devices', 'true', '-i', 'dummy'])
+    sys.exit(0)
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else '127.0.0.1'
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 28765
@@ -20,7 +31,7 @@ W, H, FPS = 1080, 1920, 30
 if W_ARG:
     W, H = [int(x) for x in W_ARG.split('x')]
 FF = os.environ.get('AUX_FFMPEG') or shutil.which('ffmpeg') or r'D:\Codex\ivcam\ffmpeg.exe'
-# AUX_ENC = x264 (software, best quality per bit, heavy CPU) | vt (Mac hardware encoder, light CPU) | auto (default)
+# AUX_ENC = x264 (software, heavy CPU) | vt (Mac) | nvenc / qsv / amf (Windows GPU) | auto (default)
 # AUX_HWDEC = 1 lets ffmpeg decode the SOURCE video with the Mac hardware as well (video files / big streams)
 ENC = os.environ.get('AUX_ENC', 'auto').lower()
 HWDEC = os.environ.get('AUX_HWDEC', '0') == '1'
@@ -32,9 +43,32 @@ def has_encoder(name):
     except Exception:
         return False
 
+def works(name):
+    """ffmpeg lists every encoder it was built with, even without the matching GPU. Really try one tiny encode."""
+    try:
+        r = subprocess.run([FF, '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=size=640x360:rate=30',
+                            '-frames:v', '3', '-pix_fmt', 'nv12', '-c:v', name, '-f', 'null', '-'],
+                           capture_output=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+# Windows hardware encoders: nvenc (NVIDIA) | qsv (Intel) | amf (AMD).  auto picks the first one ffmpeg lists.
+HW_NAMES = {'vt': 'h264_videotoolbox', 'nvenc': 'h264_nvenc', 'qsv': 'h264_qsv', 'amf': 'h264_amf'}
 if ENC == 'auto':
-    ENC = 'vt' if (sys.platform == 'darwin' and has_encoder('h264_videotoolbox')) else 'x264'
-print('encoder: %s%s' % ('VideoToolbox hardware' if ENC == 'vt' else 'x264 software', ' + hardware decode' if HWDEC else ''), flush=True)
+    if sys.platform == 'darwin' and has_encoder('h264_videotoolbox'):
+        ENC = 'vt'
+    elif sys.platform != 'darwin' and has_encoder('h264_nvenc') and works('h264_nvenc'):
+        ENC = 'nvenc'
+    elif sys.platform != 'darwin' and has_encoder('h264_qsv') and works('h264_qsv'):
+        ENC = 'qsv'
+    elif sys.platform != 'darwin' and has_encoder('h264_amf') and works('h264_amf'):
+        ENC = 'amf'
+    else:
+        ENC = 'x264'
+_LABEL = {'vt': 'VideoToolbox hardware', 'nvenc': 'NVIDIA NVENC hardware', 'qsv': 'Intel QSV hardware',
+          'amf': 'AMD AMF hardware', 'x264': 'x264 software'}
+print('encoder: %s%s' % (_LABEL.get(ENC, ENC), ' + hardware decode' if HWDEC else ''), flush=True)
 
 def packet(ftype, flags, payload, seq, ts):
     return b'VCU1' + struct.pack('>BBHIIQ', 1, ftype, flags, len(payload), seq & 0xFFFFFFFF, ts) + payload
@@ -44,9 +78,39 @@ def avcc_record(sps, pps):
     rec += struct.pack('>H', len(sps)) + sps + bytes([1]) + struct.pack('>H', len(pps)) + pps
     return bytes(rec)
 
+def pick_dshow_format(name):
+    """Ask the Windows camera which pixel formats it offers and pick one we can use directly.
+    The OBS Virtual Camera offers YUY2 (= ffmpeg 'yuyv422'); some versions also offer nv12."""
+    try:
+        r = subprocess.run([FF, '-hide_banner', '-f', 'dshow', '-list_options', 'true', '-i', 'video=' + name],
+                           capture_output=True, text=True, errors='ignore', timeout=20)
+        text = (r.stderr or '') + (r.stdout or '')
+    except Exception:
+        return ''
+    fmts = re.findall(r'pixel_format=(\w+)', text)
+    for want in ('yuyv422', 'nv12', 'uyvy422'):
+        if want in fmts:
+            return want
+    return ''
+
 def start_ffmpeg(port, sdp_path):
-    pre = ['-hwaccel', 'videotoolbox'] if HWDEC else []
-    if SRC:
+    pre = ['-hwaccel', 'videotoolbox' if sys.platform == 'darwin' else 'auto'] if HWDEC else []
+    if SRC.startswith('cam:'):
+        name = SRC[4:] or 'OBS Virtual Camera'
+        if sys.platform == 'darwin':
+            # Mac: the OBS Virtual Camera shows up as an ordinary camera. Name or index both work.
+            # avfoundation asks the device for yuv420p by default, but Mac cameras only offer nv12/uyvy422/yuyv422/...
+            # so ask for nv12 explicitly (override with AUX_CAMFMT=uyvy422 etc. if a device wants something else).
+            inputs = ['-f', 'avfoundation', '-pixel_format', os.environ.get('AUX_CAMFMT', 'nv12'),
+                      '-framerate', str(FPS), '-i', name + ':none']
+        else:
+            # dshow: let the device use its own default format; set AUX_CAMFMT=nv12 (or yuyv422) to force one.
+            fmt = os.environ.get('AUX_CAMFMT', '') or pick_dshow_format(name)
+            if fmt:
+                print('camera format: %s' % fmt, flush=True)
+            inputs = ['-f', 'dshow', '-rtbufsize', '64M'] + (['-pixel_format', fmt] if fmt else []) + \
+                     ['-framerate', str(FPS), '-i', 'video=' + name]
+    elif SRC:
         live = '://' in SRC
         inputs = pre + (['-fflags', '+nobuffer', '-flags', '+low_delay'] if live else ['-re', '-stream_loop', '-1']) + ['-i', SRC]
     else:
@@ -60,6 +124,18 @@ def start_ffmpeg(port, sdp_path):
                  '-c:v', 'h264_videotoolbox', '-profile:v', PROFILE if PROFILE in ('baseline', 'main', 'high') else 'high',
                  '-realtime', '1', '-allow_sw', '0', '-g', str(FPS), '-bf', '0',
                  '-b:v', '%dM' % MBPS, '-maxrate', '%dM' % (MBPS * 8 // 7)] + tags
+    elif ENC in ('nvenc', 'qsv', 'amf'):
+        prof = PROFILE if PROFILE in ('baseline', 'main', 'high') else 'high'
+        common = ['-vf', size_filter + ',format=nv12', '-profile:v', prof, '-g', str(FPS), '-bf', '0',
+                  '-b:v', '%dM' % MBPS, '-maxrate', '%dM' % (MBPS * 8 // 7), '-bufsize', '%dM' % max(2, MBPS * 2 // 5)]
+        if ENC == 'nvenc':
+            video = common[:0] + ['-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'll', '-rc', 'cbr', '-zerolatency', '1',
+                                  '-forced-idr', '1'] + common + tags
+        elif ENC == 'qsv':
+            video = ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-look_ahead', '0', '-forced_idr', '1'] + common + tags
+        else:
+            video = ['-c:v', 'h264_amf', '-usage', 'ultralowlatency', '-quality', 'speed', '-rc', 'cbr',
+                     '-header_insertion_mode', 'idr', '-gops_per_idr', '1'] + common + tags
     else:
         video = ['-vf', size_filter + ',format=yuvj420p',
                  '-c:v', 'libx264', '-preset', PRESET, '-tune', 'zerolatency',
@@ -72,10 +148,59 @@ def start_ffmpeg(port, sdp_path):
     cmd = [FF, '-hide_banner', '-loglevel', 'error'] + inputs + video + out
     return subprocess.Popen(cmd)
 
+# ---- USB tunnel without iproxy: talk to the Apple USB service (usbmuxd) directly. Use HOST = "usb". ----
+def _mux_open():
+    addr = os.environ.get('USBMUXD_SOCKET_ADDRESS', '')          # same variable libimobiledevice uses: "host:port" or a socket path
+    if ':' in addr and not addr.startswith('/'):
+        h, _, p = addr.rpartition(':')
+        return socket.create_connection((h or '127.0.0.1', int(p)), timeout=5)
+    if sys.platform == 'win32':
+        return socket.create_connection(('127.0.0.1', 27015), timeout=5)     # Apple Mobile Device Service (iTunes / Apple Devices)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(addr or '/var/run/usbmuxd')
+    return s
+
+def _mux_send(s, tag, msg):
+    body = plistlib.dumps(msg)
+    s.sendall(struct.pack('<IIII', 16 + len(body), 1, 8, tag) + body)
+
+def _mux_recv(s):
+    head = b''
+    while len(head) < 16:
+        c = s.recv(16 - len(head))
+        if not c: raise OSError('usbmuxd closed')
+        head += c
+    length = struct.unpack('<I', head[:4])[0]
+    body = b''
+    while len(body) < length - 16:
+        c = s.recv(length - 16 - len(body))
+        if not c: raise OSError('usbmuxd closed')
+        body += c
+    return plistlib.loads(body)
+
+def usb_connect(port):
+    """Open a TCP-like tunnel to `port` on the first USB-connected iPhone/iPad. Raises OSError if none / refused."""
+    s = _mux_open()
+    base = {'ClientVersionString': 'auxcam', 'ProgName': 'auxcam'}
+    _mux_send(s, 1, dict(base, MessageType='ListDevices'))
+    devs = [d for d in _mux_recv(s).get('DeviceList', []) if d.get('Properties', {}).get('ConnectionType', 'USB') == 'USB']
+    s.close()
+    if not devs:
+        raise OSError('no iPhone found on USB (plug in, unlock, tap "Trust")')
+    dev = devs[0]['DeviceID']
+    s = _mux_open()
+    _mux_send(s, 2, dict(base, MessageType='Connect', DeviceID=dev, PortNumber=socket.htons(port)))
+    r = _mux_recv(s)
+    if r.get('Number', 1) != 0:
+        s.close()
+        raise OSError('phone refused port %d (is AuxCam open?) code=%s' % (port, r.get('Number')))
+    return s
+
 def connect():
     while True:
         try:
-            s = socket.create_connection((HOST, PORT), timeout=5)
+            s = usb_connect(PORT) if HOST == 'usb' else socket.create_connection((HOST, PORT), timeout=5)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.settimeout(None)
             print('connected %s:%d' % (HOST, PORT), flush=True)
