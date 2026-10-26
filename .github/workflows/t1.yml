@@ -1,0 +1,23 @@
+name: t1
+on: [workflow_dispatch]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq clang lld llvm file
+        clang --version | head -2
+    - name: sdk
+      run: |
+        git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks sdk-src
+        cd sdk-src && git sparse-checkout set iPhoneOS16.5.sdk && du -sh iPhoneOS16.5.sdk
+        echo "SDK=$PWD/iPhoneOS16.5.sdk" >> "$GITHUB_ENV"
+    - name: hello
+      run: |
+        printf '#include <stdio.h>\nint main(void){printf("hi\\n");return 0;}\n' > t.c
+        clang -target arm64-apple-ios15.0 -isysroot "$SDK" -fuse-ld=lld -O1 -o t t.c 2>&1 | tail -20
+        file t || true
+        ls -l t || true
