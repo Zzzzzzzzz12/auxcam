@@ -1,0 +1,7 @@
+#!/bin/sh
+chmod 755 /usr/libexec/auxcamd
+chmod 644 /Library/LaunchDaemons/com.auxcam.daemon.plist
+# 装完立刻拉起，不用重启；开机由 RunAtLoad 自动起来
+launchctl unload /Library/LaunchDaemons/com.auxcam.daemon.plist 2>/dev/null || true
+launchctl load -w /Library/LaunchDaemons/com.auxcam.daemon.plist 2>/dev/null || true
+exit 0

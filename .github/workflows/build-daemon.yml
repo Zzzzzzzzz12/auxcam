@@ -1,0 +1,24 @@
+name: bdm
+on: [push, workflow_dispatch]
+jobs:
+  b:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Randomblock1/theos-action@v1
+    - name: Build OpenH264 for iPhone
+      run: |
+        git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264.git "$RUNNER_TEMP/openh264"
+        make -C "$RUNNER_TEMP/openh264" OS=ios ARCH=arm64 SDK_MIN=15.0 libraries
+        echo "OPENH264_DIR=$RUNNER_TEMP/openh264" >> "$GITHUB_ENV"
+    - name: build
+      run: |
+        cd auxcamd
+        make package DEBUG=0 FINALPACKAGE=1
+        ls -l packages/
+        dpkg-deb -c packages/*.deb
+    - uses: actions/upload-artifact@v4
+      with:
+        name: auxcamd-deb
+        path: auxcamd/packages/*.deb
+        if-no-files-found: error

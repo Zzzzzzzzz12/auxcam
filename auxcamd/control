@@ -1,0 +1,8 @@
+Package: com.auxcam.daemon
+Name: AuxCam Stream Daemon
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: AuxCam 推流接收守护进程：开机自启，不随 App 被杀（28765 常驻监听）
+Maintainer: AuxCam
+Author: AuxCam
+Section: Tweaks

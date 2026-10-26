@@ -28,6 +28,7 @@ W_ARG = sys.argv[6] if len(sys.argv) > 6 else ''          # optional test size, 
 MBPS = int(sys.argv[7]) if len(sys.argv) > 7 else 25       # video bitrate in Mbit/s (USB can take 30+)
 PRESET = sys.argv[8] if len(sys.argv) > 8 else 'faster'   # x264 speed: veryfast < faster < fast < medium (slower = nicer, more CPU)
 W, H, FPS = 1080, 1920, 30
+SEND_TIMEOUT = 2.0   # seconds a send may stall before we treat the phone as disconnected
 if W_ARG:
     W, H = [int(x) for x in W_ARG.split('x')]
 FF = os.environ.get('AUX_FFMPEG') or shutil.which('ffmpeg') or r'D:\Codex\ivcam\ffmpeg.exe'
@@ -79,43 +80,22 @@ def avcc_record(sps, pps):
     return bytes(rec)
 
 def pick_dshow_format(name):
-    """Ask the Windows camera which formats/sizes it offers. Returns (pixel_format, 'WxH' or '').
-    The OBS Virtual Camera offers YUY2 (= ffmpeg 'yuyv422'); some versions also offer nv12.
-    We want the camera to deliver exactly W x H, so no scaling is needed on the PC."""
+    """Ask the Windows camera which pixel formats it offers and pick one we can use directly.
+    The OBS Virtual Camera offers YUY2 (= ffmpeg 'yuyv422'); some versions also offer nv12."""
     try:
         r = subprocess.run([FF, '-hide_banner', '-f', 'dshow', '-list_options', 'true', '-i', 'video=' + name],
                            capture_output=True, text=True, errors='ignore', timeout=20)
         text = (r.stderr or '') + (r.stdout or '')
     except Exception:
-        return '', ''
-    rows = re.findall(r'(?:pixel_format|vcodec)=(\w+)\s+min s=(\d+)x(\d+) fps=[\d.]+ max s=(\d+)x(\d+)', text)
-    rank = ['yuyv422', 'nv12', 'uyvy422']
-    best = ('', '')
-    for want in rank:
-        sizes = [(int(a), int(b), int(c), int(d)) for f, a, b, c, d in rows if f == want]
-        if not sizes:
-            continue
-        size = ''
-        for (mnw, mnh, mxw, mxh) in sizes:
-            if mnw <= W <= mxw and mnh <= H <= mxh:
-                size = '%dx%d' % (W, H)          # camera can deliver our exact size
-                break
-        if not size:
-            size = '%dx%d' % (sizes[0][2], sizes[0][3])
-        best = (want, size)
-        break
-    if not best[0]:
-        fmts = re.findall(r'pixel_format=(\w+)', text)
-        for want in rank:
-            if want in fmts:
-                return want, ''
-    return best
-
-NOSCALE = False
+        return ''
+    fmts = re.findall(r'pixel_format=(\w+)', text)
+    for want in ('yuyv422', 'nv12', 'uyvy422'):
+        if want in fmts:
+            return want
+    return ''
 
 def start_ffmpeg(port, sdp_path):
     pre = ['-hwaccel', 'videotoolbox' if sys.platform == 'darwin' else 'auto'] if HWDEC else []
-    global NOSCALE
     if SRC.startswith('cam:'):
         name = SRC[4:] or 'OBS Virtual Camera'
         if sys.platform == 'darwin':
@@ -126,23 +106,17 @@ def start_ffmpeg(port, sdp_path):
                       '-framerate', str(FPS), '-i', name + ':none']
         else:
             # dshow: let the device use its own default format; set AUX_CAMFMT=nv12 (or yuyv422) to force one.
-            fmt, csize = os.environ.get('AUX_CAMFMT', ''), ''
-            if not fmt:
-                fmt, csize = pick_dshow_format(name)
-            print('camera format: %s size: %s' % (fmt or 'default', csize or 'default'), flush=True)
-            if csize and csize != '%dx%d' % (W, H):
-                print('WARN camera size %s is not %dx%d: the PC has to scale every frame (slow). Set the OBS canvas to %dx%d.'
-                      % (csize, W, H, W, H), flush=True)
-            if csize == '%dx%d' % (W, H):
-                NOSCALE = True
-            inputs = ['-f', 'dshow', '-rtbufsize', '256M'] + (['-pixel_format', fmt] if fmt else []) + \
-                     (['-video_size', csize] if csize else []) + ['-framerate', str(FPS), '-i', 'video=' + name]
+            fmt = os.environ.get('AUX_CAMFMT', '') or pick_dshow_format(name)
+            if fmt:
+                print('camera format: %s' % fmt, flush=True)
+            inputs = ['-f', 'dshow', '-rtbufsize', '64M'] + (['-pixel_format', fmt] if fmt else []) + \
+                     ['-framerate', str(FPS), '-i', 'video=' + name]
     elif SRC:
         live = '://' in SRC
         inputs = pre + (['-fflags', '+nobuffer', '-flags', '+low_delay'] if live else ['-re', '-stream_loop', '-1']) + ['-i', SRC]
     else:
         inputs = ['-re', '-f', 'lavfi', '-i', 'testsrc2=size=%dx%d:rate=%d' % (W, H, FPS)]
-    size_filter = ('fps=%d' % FPS) if NOSCALE else ('scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,fps=%d' % (W, H, W, H, FPS))
+    size_filter = 'scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,fps=%d' % (W, H, W, H, FPS)
     tags = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709']
     if ENC == 'vt':
         # Hardware encoder: almost no CPU, so the Mac cannot starve and stall the stream.
@@ -229,11 +203,11 @@ def connect():
         try:
             s = usb_connect(PORT) if HOST == 'usb' else socket.create_connection((HOST, PORT), timeout=5)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(None)
+            s.settimeout(SEND_TIMEOUT)   # 发送卡住超过这个时间就当断线，重连，不再无限阻塞
             print('connected %s:%d' % (HOST, PORT), flush=True)
             return s
         except OSError as e:
-            print('waiting phone... %s' % (e if isinstance(e, OSError) and not getattr(e, 'winerror', None) else 'code=%s %s' % (getattr(e, 'winerror', None) or e.errno, e if 'phone' in str(e) or 'iPhone' in str(e) else '')), flush=True)
+            print('waiting phone...', e, flush=True)
             time.sleep(3)
 
 def drain(us):
@@ -353,8 +327,8 @@ def main():
     us.bind(('127.0.0.1', 0))
     us.settimeout(1.0)
     port = us.getsockname()[1]
-    s = connect()                         # phone first: ffmpeg must not start (and overflow its buffers) while nobody listens
     proc = start_ffmpeg(port, sdp_path)
+    s = connect()
     drain(us)
     rtp = RtpFrames()
     drop_rate = float(os.environ.get('AUX_TEST_DROP', '0'))     # test only: randomly lose packets
@@ -366,7 +340,6 @@ def main():
     send_max = 0.0
     last_hb = 0.0
     t0 = time.time()
-    last_seen = t0
     while True:
         try:
             pkt = us.recv(65535)
@@ -374,18 +347,7 @@ def main():
             if proc.poll() is not None:
                 print('ffmpeg ended', flush=True)
                 return
-            now = time.time()
-            if now - last_hb >= 1.0:               # keep the phone from giving up (it drops silent connections after 5 s)
-                try:
-                    s.sendall(packet(5, 0, b'', seq, int(now * 1000000))); seq += 1
-                    last_hb = now
-                except OSError:
-                    pass
-            if t0 and now - last_seen > 3:
-                print('no video from ffmpeg for %d s (camera stalled or encoder too slow)' % (now - last_seen), flush=True)
-                last_seen = now
             continue
-        last_seen = time.time()
         if drop_rate and random.random() < drop_rate:
             continue
         res = rtp.feed(pkt)
@@ -419,7 +381,7 @@ def main():
                       % (frames, frames / (now - t0), gap_max, gap_late, send_max, rtp.dropped), flush=True)
                 gap_max = 0.0; gap_late = 0; send_max = 0.0
         except OSError as e:
-            print('disconnected: %s code=%s - reconnecting' % (type(e).__name__, getattr(e, 'winerror', None) or e.errno), flush=True)
+            print('disconnected:', e, '- reconnecting', flush=True)
             try: s.close()
             except OSError: pass
             s = connect()

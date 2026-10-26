@@ -83,10 +83,6 @@ def list_cameras(ff):
 def friendly(line):
     """Turn the sender's technical messages into plain Chinese for the status bar. Returns (state, text) or None."""
     low = line.lower()
-    if low.startswith('warn camera size'):
-        return 'warn', '⚠ OBS 画布不是 1080×1920，电脑要缩放每一帧，会卡。请把 OBS 设置→视频 的基础分辨率和输出分辨率都改成 1080×1920'
-    if low.startswith('no video from ffmpeg'):
-        return 'warn', '电脑这边没有画面进来：OBS 虚拟摄像头是否开着？或者电脑编码太慢'
     if low.startswith('connected'):
         return 'ok', '已连上手机'
     if low.startswith('waiting phone'):
@@ -173,7 +169,7 @@ def main():
 
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry('480x600')
+    root.geometry('480x560')
     root.resizable(False, False)
     pad = {'padx': 14}
 
@@ -209,13 +205,6 @@ def main():
     btn = tk.Button(root, text='开始推流', font=('Microsoft YaHei UI', 15, 'bold'), bg='#2fb67c', fg='white',
                     activebackground='#269966', activeforeground='white', relief='flat', height=2)
     btn.pack(fill='x', pady=12, **pad)
-
-    def copy_log():
-        root.clipboard_clear()
-        root.clipboard_append(log.get('1.0', 'end'))
-        set_status('ok', '日志已复制，直接粘贴发给开发者')
-
-    ttk.Button(root, text='复制日志（出问题时点这个，再发给开发者）', command=copy_log).pack(pady=(0, 6), **pad)
 
     log = tk.Text(root, height=9, font=('Consolas', 9), bg='#f6f6f6', relief='flat', state='disabled')
     log.pack(fill='both', expand=True, pady=(0, 12), **pad)
@@ -286,6 +275,7 @@ def main():
             set_status('bad', '启动失败：%s' % e)
             return
         st['proc'], st['running'] = proc, True
+        st['last_ok'] = 0.0
         threading.Thread(target=reader, args=(proc,), daemon=True).start()
         btn.config(text='停止推流', bg='#d9534f', activebackground='#b94441')
         set_status('warn', '正在启动…')
@@ -309,6 +299,9 @@ def main():
     btn.config(command=toggle)
 
     def poll():
+        # 推流程序还活着，但超过 4 秒没有新的统计行 = 画面卡住了（比如手机端停止读取），不能继续显示“正常”
+        if st['running'] and st['last_ok'] and time.time() - st['last_ok'] > 4:
+            set_status('warn', '画面卡住了（4 秒没有新数据），正在等待重连…')
         try:
             while True:
                 kind, val = q.get_nowait()
@@ -320,9 +313,6 @@ def main():
                         fps, gap, late, drop = float(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
                         stats_var.set('帧率 %.0f 帧/秒   最大间隔 %d 毫秒   卡顿 %d 次   丢帧 %d' % (fps, gap, late, drop))
                         st['last_ok'] = time.time()
-                        st['n'] = st.get('n', 0) + 1
-                        if st['n'] % 5 == 1:
-                            add_log(val)
                         if fps >= 25:
                             set_status('ok', '推流中（正常）')
                         else:
