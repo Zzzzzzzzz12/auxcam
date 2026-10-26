@@ -23,7 +23,7 @@ jobs:
       run: |
         set -e
         git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264 oh264
-        INC="-Ioh264/codec/api/svc -Ioh264/codec/common/inc -Ioh264/codec/processing/interface -Ioh264/codec/decoder/core/inc -Ioh264/codec/encoder/core/inc"
+        INC="-Ioh264/codec/api/wels -Ioh264/codec/common/inc -Ioh264/codec/processing/interface -Ioh264/codec/decoder/core/inc -Ioh264/codec/encoder/core/inc"
         mkdir -p obj
         n=0
         for f in $(find oh264/codec/common oh264/codec/decoder oh264/codec/api -name '*.cpp'); do
@@ -39,7 +39,7 @@ jobs:
       run: |
         set -e
         clang -target arm64-apple-ios15.0 -isysroot "$SDK" -fuse-ld=lld -O2 -DNDEBUG \
-          -Iios-app/AuxCam -Ioh264/codec/api/svc \
+          -Iios-app/AuxCam -Ioh264/codec/api/wels \
           auxcamd/main.c auxcamd/vcu1.c ios-app/AuxCam/OpenH264Bridge.c \
           libopenh264.a -lc++ -lc++abi \
           -framework CoreVideo -framework IOSurface -framework VideoToolbox \
