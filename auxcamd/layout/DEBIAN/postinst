@@ -1,7 +1,8 @@
 #!/bin/sh
-chmod 755 /usr/libexec/auxcamd
-chmod 644 /Library/LaunchDaemons/com.auxcam.daemon.plist
-# 装完立刻拉起，不用重启；开机由 RunAtLoad 自动起来
-launchctl unload /Library/LaunchDaemons/com.auxcam.daemon.plist 2>/dev/null || true
-launchctl load -w /Library/LaunchDaemons/com.auxcam.daemon.plist 2>/dev/null || true
+PLIST=/var/jb/Library/LaunchDaemons/com.auxcam.daemon.plist
+chmod 755 /var/jb/usr/libexec/auxcamd
+chmod 644 "$PLIST"
+# 装完立刻拉起；开机由 RunAtLoad 自动起来
+launchctl bootout system "$PLIST" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
+launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
 exit 0

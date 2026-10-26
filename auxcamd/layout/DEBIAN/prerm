@@ -1,3 +1,4 @@
 #!/bin/sh
-launchctl unload -w /Library/LaunchDaemons/com.auxcam.daemon.plist 2>/dev/null || true
+PLIST=/var/jb/Library/LaunchDaemons/com.auxcam.daemon.plist
+launchctl bootout system "$PLIST" 2>/dev/null || launchctl unload -w "$PLIST" 2>/dev/null || true
 exit 0
