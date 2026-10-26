@@ -1,0 +1,77 @@
+name: bdl
+on: [workflow_dispatch]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq clang lld llvm dpkg-dev file
+        clang --version | head -1
+
+    - name: ios sdk
+      run: |
+        git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks sdk-src
+        (cd sdk-src && git sparse-checkout set iPhoneOS16.5.sdk)
+        test -d "$PWD/sdk-src/iPhoneOS16.5.sdk/usr/include" && echo "SDK ok"
+        echo "SDK=$PWD/sdk-src/iPhoneOS16.5.sdk" >> "$GITHUB_ENV"
+
+    - name: openh264
+      run: |
+        set -e
+        git clone --depth 1 --branch v2.6.0 https://github.com/cisco/openh264 oh264
+        INC="-Ioh264/codec/api/svc -Ioh264/codec/common/inc -Ioh264/codec/processing/interface -Ioh264/codec/decoder/core/inc -Ioh264/codec/encoder/core/inc"
+        mkdir -p obj
+        n=0
+        for f in $(find oh264/codec/common oh264/codec/decoder oh264/codec/api -name '*.cpp'); do
+          o="obj/$(echo "$f" | tr '/' '_').o"
+          clang++ -target arm64-apple-ios15.0 -isysroot "$SDK" -std=c++17 -O2 -fPIC -DNDEBUG -DAPPLE_IOS $INC -c "$f" -o "$o" || { echo "FAILED: $f"; exit 1; }
+          n=$((n+1))
+        done
+        echo "compiled $n files"
+        llvm-ar rcs libopenh264.a obj/*.o
+        ls -l libopenh264.a
+
+    - name: build auxcamd
+      run: |
+        set -e
+        clang -target arm64-apple-ios15.0 -isysroot "$SDK" -fuse-ld=lld -O2 -DNDEBUG \
+          -Iios-app/AuxCam -Ioh264/codec/api/svc \
+          auxcamd/main.c auxcamd/vcu1.c ios-app/AuxCam/OpenH264Bridge.c \
+          libopenh264.a -lc++ -lc++abi \
+          -framework CoreVideo -framework IOSurface -framework VideoToolbox \
+          -framework CoreFoundation -framework CoreGraphics \
+          -o auxcamd-bin
+        file auxcamd-bin
+        ls -l auxcamd-bin
+
+    - name: ldid
+      run: |
+        curl -fsSL -o ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64 || true
+        if [ -s ldid ]; then chmod +x ldid; ./ldid -S auxcamd-bin && echo "signed"; else echo "ldid 不可用，跳过签名"; fi
+
+    - name: package deb
+      run: |
+        set -e
+        rm -rf pkg
+        mkdir -p pkg/DEBIAN pkg/var/jb/usr/libexec pkg/var/jb/Library/LaunchDaemons
+        cp auxcamd-bin pkg/var/jb/usr/libexec/auxcamd
+        chmod 755 pkg/var/jb/usr/libexec/auxcamd
+        cp auxcamd/layout/DEBIAN/control pkg/DEBIAN/control
+        cp auxcamd/layout/DEBIAN/postinst pkg/DEBIAN/postinst
+        cp auxcamd/layout/DEBIAN/prerm pkg/DEBIAN/prerm
+        chmod 755 pkg/DEBIAN/postinst pkg/DEBIAN/prerm
+        cp auxcamd/layout/var/jb/Library/LaunchDaemons/com.auxcam.daemon.plist pkg/var/jb/Library/LaunchDaemons/
+        chmod 644 pkg/var/jb/Library/LaunchDaemons/com.auxcam.daemon.plist
+        dpkg-deb --build pkg auxcamd.deb
+        ls -l auxcamd.deb
+        dpkg-deb -c auxcamd.deb
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: auxcamd-deb-linux
+        path: auxcamd.deb
+        if-no-files-found: error
