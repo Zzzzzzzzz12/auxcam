@@ -562,6 +562,7 @@ int main(void) {
         return 1;
     }
     d->listening = 1;
+    fprintf(stderr, "auxcamd start dir=%s pid=%d\n", dir, (int)getpid());
     vcu1_log(d->logPath, "auxcamd start pid=%d listening 127.0.0.1:%d", (int)getpid(), AUXCAMD_PORT);
     write_status(d);
 
