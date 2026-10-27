@@ -1489,59 +1489,274 @@ final class HLSFrameSource: ObservableObject {
     }
 }
 
-// ───────────────────────── auxcamd 状态读取（只读，不再开 28765） ─────────────────────────
-// 推流接收已搬到开机自启的 LaunchDaemon（auxcamd，常驻，不随 App 被杀）。
-// App 只读 daemon 写在 DCIM 下的状态文件：是否在跑、帧率、有没有电脑连上。
-final class DaemonStatusReader: ObservableObject {
-    @Published var status = "等待 auxcamd"
+// ───────────────────────── VCU1 接收层（接万相桌面端） ─────────────────────────
+// 万相电脑端通过数据线(usbmux)连 iPhone 的 28765 端口，包格式：
+//   24 字节头: "VCU1" + 版本(1B) + 类型(1B) + flags(2B BE) + 长度(4B BE) + 序号(4B BE) + 时间戳(8B BE 微秒)
+//   类型: 1=视频配置(AVCC SPS/PPS) 2=视频帧(H264 NALU, flags bit0=关键帧) 3=音频配置 4=音频帧(ADTS) 5=心跳(每秒)
+final class VCU1Receiver: ObservableObject {
+    @Published var status = "等待电脑连接"
     @Published var fps = 0.0
     @Published var alive = false
 
-    static let statusPath = "/var/mobile/Media/DCIM/.auxcamd.status"
-    // daemon 每秒刷新一次；超过这个时间没更新，就认为 daemon 已经停了
-    private static let staleAfter: TimeInterval = 5
-    private var timer: Timer?
-    private var totalBytes: Int64 = 0
+    static let listenPort: UInt16 = 28765
+    static let outPath = "/var/mobile/Media/DCIM/stream.h264"
+    let decoder = StreamDecoder()
+    private var listenFd: Int32 = -1
+    private var shouldRun = false
+    private var frameCount: Int32 = 0
+    private var lastCountAt = Date()
+    private var totalVideoBytes: Int64 = 0
+    private let lock = NSLock()
+    private let maxFile: Int64 = 8 * 1024 * 1024
+    private var sps: Data = Data()
+    private var pps: Data = Data()
+    private var ringHandle: FileHandle?
+    private var ringSize: Int64 = 0
+    private var ringNeedsKeyframe = false
+    private var jpegSeen = 0
+    // 到包间隔统计（AUXGAP）：看电脑/USB 送画面是否均匀
+    private var gapLastAt: Double = 0
+    private var gapMax: Double = 0
+    private var gapOver50 = 0
+    private var gapUnder15 = 0
+    private var gapCount = 0
 
     func start() {
-        guard timer == nil else { return }
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        if shouldRun { return }
+        shouldRun = true
+        lock.lock()
+        sps = Data(); pps = Data(); totalVideoBytes = 0; frameCount = 0
+        lock.unlock()
+        DispatchQueue.global(qos: .userInitiated).async { self.serve() }
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        shouldRun = false
+        if listenFd >= 0 { close(listenFd); listenFd = -1 }
+        DispatchQueue.main.async { self.status = "已停止"; self.alive = false }
     }
 
-    // 累计收到的视频字节数（daemon 写在状态文件里），给主界面的心跳判断用
-    func videoByteCount() -> Int64 {
-        totalBytes
-    }
-
-    private func refresh() {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: Self.statusPath)),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            alive = false
-            fps = 0
-            status = "auxcamd 未运行（请检查守护进程是否已安装）"
+    private func serve() {
+        listenFd = socket(AF_INET, SOCK_STREAM, 0)
+        guard listenFd >= 0 else {
+            DispatchQueue.main.async { self.status = "开监听失败" }
+            slog("socket failed")
             return
         }
-        let updated = (obj["updated"] as? Double) ?? 0
-        let fresh = Date().timeIntervalSince1970 - updated < Self.staleAfter
-        let listening = (obj["listening"] as? Bool) ?? false
-        let connected = (obj["connected"] as? Bool) ?? false
-        totalBytes = (obj["bytes"] as? NSNumber)?.int64Value ?? 0
-        alive = fresh && connected
-        fps = fresh ? ((obj["fps"] as? Double) ?? 0) : 0
-        if !fresh {
-            status = "auxcamd 状态已停止更新（守护进程可能已退出）"
-        } else if !listening {
-            status = "auxcamd 未开门"
-        } else if connected {
-            status = "电脑已连上，收画面中"
+        var on: Int32 = 1
+        setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = VCU1Receiver.listenPort.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let b = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(listenFd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if b != 0 {
+            DispatchQueue.main.async { self.status = "端口被占" }
+            slog("bind failed errno=\(errno)")
+            close(listenFd); listenFd = -1
+            return
+        }
+        listen(listenFd, 128)
+        slog("listening 28765")
+        DispatchQueue.main.async { self.status = "已开门(28765)，等电脑连" }
+        while shouldRun {
+            var caddr = sockaddr_in()
+            var clen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let cfd = withUnsafeMutablePointer(to: &caddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(listenFd, $0, &clen)
+                }
+            }
+            guard cfd >= 0 else { break }
+            // 读超时 5 秒：对端不送数据就别占着连接（防重连风暴拖死）
+            var tv = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            DispatchQueue.main.async { self.status = "电脑已连上，收画面中"; self.alive = true }
+            handleConnection(cfd)
+            close(cfd)
+            if shouldRun {
+                DispatchQueue.main.async { self.status = "断开，等电脑重连"; self.alive = false }
+            }
+        }
+    }
+
+    private func readFull(_ fd: Int32, _ n: Int) -> Data? {
+        var buf = Data()
+        var tmp = [UInt8](repeating: 0, count: n)
+        while buf.count < n {
+            let r = read(fd, &tmp, n - buf.count)
+            if r <= 0 { return nil }
+            buf.append(tmp, count: r)
+        }
+        return buf
+    }
+
+    // 诊断日志（写到 DCIM，电脑随时能拉）
+    private func slog(_ s: String) {
+        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
+        let path = "/var/mobile/Media/DCIM/.vcu1.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            try? h.close()
         } else {
-            status = "已开门(28765)，等电脑连"
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func handleConnection(_ fd: Int32) {
+        var lastHb = Date()
+        slog("conn accepted")
+        while shouldRun {
+            guard let head = readFull(fd, 24) else { slog("conn closed by peer"); return }
+            let magic = String(bytes: head[0..<4], encoding: .ascii) ?? ""
+            guard magic == "VCU1" else { slog("bad magic: " + magic); return }
+            let version = Int(head[4])
+            let type = Int(head[5])
+            let flags = Int(head[6]) << 8 | Int(head[7])
+            let len = Int(head[8]) << 24 | Int(head[9]) << 16 | Int(head[10]) << 8 | Int(head[11])
+            guard version == 1, len >= 0, len <= 4 * 1024 * 1024 else {
+                slog("bad ver/len: v=\(version) len=\(len)"); return
+            }
+            let payload = len > 0 ? (readFull(fd, len) ?? Data()) : Data()
+            if len > 0 && payload.count < len { slog("payload short"); return }
+            switch type {
+            case 1:
+                parseAVCC(payload)
+                decoder.setConfig(sps: sps, pps: pps)
+                slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
+            case 2:
+                // 先把最新帧送进 VideoToolbox 并发布共享画面，兼容环形文件写入放后面。
+                let gapNow = CFAbsoluteTimeGetCurrent()
+                if gapLastAt > 0 {
+                    let gapMs = (gapNow - gapLastAt) * 1000
+                    gapCount += 1
+                    if gapMs > gapMax { gapMax = gapMs }
+                    if gapMs > 50 { gapOver50 += 1 }
+                    if gapMs < 15 { gapUnder15 += 1 }
+                    if gapCount >= 90 {
+                        slog("到包间隔 近90帧: 最大=\(Int(gapMax))ms 超过50ms=\(gapOver50)次 小于15ms=\(gapUnder15)次")
+                        gapMax = 0
+                        gapOver50 = 0
+                        gapUnder15 = 0
+                        gapCount = 0
+                    }
+                }
+                gapLastAt = gapNow
+                decoder.feed(payload, keyframe: (flags & 1) != 0)
+                countFrame(payload.count)
+                if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
+            case 10:
+                // MJPEG 帧：系统硬件 JPEG 解码 → 共享画面（最稳路径）
+                jpegSeen += 1
+                if jpegSeen <= 3 || jpegSeen % 150 == 0 { slog("type10 JPEG #\(jpegSeen) len=\(payload.count)") }
+                decoder.feedJPEG(payload)
+                countFrame(payload.count)
+            case 5: lastHb = Date()
+            default: break
+            }
+            if Date().timeIntervalSince(lastHb) > 8 { slog("heartbeat timeout"); return }
+        }
+    }
+
+    // type1: AVCC 配置（AVCDecoderConfigurationRecord）→ 提出 SPS/PPS
+    private func parseAVCC(_ d: Data) {
+        guard d.count > 7, d[0] == 1 else { return }
+        var i = 5
+        let numSPS = Int(d[i] & 0x1F); i += 1
+        var s = Data(); var p = Data()
+        for _ in 0..<numSPS where i + 2 <= d.count {
+            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
+            guard i + l <= d.count else { return }
+            s = d.subdata(in: i..<(i + l)); i += l
+        }
+        guard i < d.count else { return }
+        let numPPS = Int(d[i] & 0x1F); i += 1
+        for _ in 0..<numPPS where i + 2 <= d.count {
+            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
+            guard i + l <= d.count else { return }
+            p = d.subdata(in: i..<(i + l)); i += l
+        }
+        if !s.isEmpty && !p.isEmpty {
+            lock.lock(); sps = s; pps = p; lock.unlock()
+        }
+    }
+
+    private static let startCode = Data([0, 0, 0, 1])
+
+    // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（8MB 环形缓存）
+    private func appendVideo(_ d: Data, keyframe: Bool) {
+        var nalu = d
+        let sc4 = Data([UInt8(0), UInt8(0), UInt8(0), UInt8(1)])
+        let sc3 = Data([UInt8(0), UInt8(0), UInt8(1)])
+        if nalu.starts(with: sc4) { nalu = nalu.subdata(in: 4..<nalu.count) }
+        else if nalu.starts(with: sc3) { nalu = nalu.subdata(in: 3..<nalu.count) }
+        guard !nalu.isEmpty else { return }
+
+        let fm = FileManager.default
+        if ringHandle == nil {
+            if !fm.fileExists(atPath: VCU1Receiver.outPath) {
+                fm.createFile(atPath: VCU1Receiver.outPath, contents: nil)
+            }
+            ringHandle = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
+            if let attributes = try? fm.attributesOfItem(atPath: VCU1Receiver.outPath) {
+                ringSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            }
+            try? ringHandle?.seekToEnd()
+        }
+        guard let fh = ringHandle else { return }
+
+        var head = Data()
+        if keyframe {
+            lock.lock()
+            let s = sps, p = pps
+            lock.unlock()
+            if !s.isEmpty && !p.isEmpty {
+                head.append(VCU1Receiver.startCode); head.append(s)
+                head.append(VCU1Receiver.startCode); head.append(p)
+            }
+        }
+        head.append(VCU1Receiver.startCode)
+        head.append(nalu)
+
+        if ringNeedsKeyframe && !keyframe { return }
+        if ringSize + Int64(head.count) > maxFile {
+            try? fh.truncate(atOffset: 0)
+            try? fh.seek(toOffset: 0)
+            ringSize = 0
+            ringNeedsKeyframe = true
+            // 环形缓存从完整 GOP 起步，避免绕回后以 P 帧开头。
+            if !keyframe { return }
+        }
+        try? fh.write(contentsOf: head)
+        ringSize += Int64(head.count)
+        if keyframe { ringNeedsKeyframe = false }
+    }
+
+    func videoByteCount() -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return totalVideoBytes
+    }
+
+    private func countFrame(_ payloadBytes: Int) {
+        lock.lock()
+        frameCount += 1
+        totalVideoBytes += Int64(payloadBytes)
+        let now = Date()
+        var measuredFPS: Double?
+        if now.timeIntervalSince(lastCountAt) >= 1 {
+            let f = Double(frameCount) / now.timeIntervalSince(lastCountAt)
+            frameCount = 0
+            lastCountAt = now
+            measuredFPS = f
+        }
+        lock.unlock()
+        if let measuredFPS {
+            DispatchQueue.main.async { self.fps = measuredFPS }
         }
     }
 }
@@ -1743,7 +1958,7 @@ private struct StreamPiPPreview: UIViewRepresentable {
 }
 struct ContentView: View {
     @StateObject private var cam = Cam()
-    @StateObject private var daemon = DaemonStatusReader()
+    @StateObject private var vcu = VCU1Receiver()
     @StateObject private var hlsSource = HLSFrameSource()
     @State private var st: [String: String] = [:]
     @State private var state: LiveState = .idle
@@ -1958,14 +2173,14 @@ struct ContentView: View {
 
     private var infoRow: some View {
         HStack(spacing: 8) {
-            Circle().fill(daemon.alive ? Color.green : Color.orange).frame(width: 10, height: 10)
+            Circle().fill(vcu.alive ? Color.green : Color.orange).frame(width: 10, height: 10)
             VStack(alignment: .leading, spacing: 2) {
-                Text(daemon.alive ? "已连上电脑" : "等待电脑连接（请插好 USB）").font(.footnote).bold()
-                Text("源：" + daemon.status).font(.caption2).foregroundStyle(.secondary)
+                Text(vcu.alive ? "已连上电脑" : "等待电脑连接（请插好 USB）").font(.footnote).bold()
+                Text("源：" + vcu.status).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
-            if daemon.fps > 0 {
-                Text(String(format: "%.0f 帧/秒", daemon.fps)).font(.footnote).bold().foregroundStyle(.green)
+            if vcu.fps > 0 {
+                Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.footnote).bold().foregroundStyle(.green)
             }
         }
         .padding(10)
@@ -2073,7 +2288,7 @@ struct ContentView: View {
             self.cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
             DispatchQueue.main.async { self.keepAliveAudio() }   // 保留静音播放器，退后台也继续收画面
         }
-        daemon.start()   // 只读 auxcamd 状态；28765 由守护进程常驻监听，App 不再抢端口
+        vcu.start()   // 开门 28765，等万相电脑端连
         if fakeCameraOn { vcamControl(true) }
         Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
         if wasLive {
@@ -2185,7 +2400,7 @@ struct ContentView: View {
         // 心跳：电脑画面每秒都在往手机里写数据 = 直连活着
         let now = Date()
         let previousBytes = lastES
-        let cur = usingHLSSource ? hlsSource.frameCount : (usingStreamSource ? daemon.videoByteCount() : Link.vcamStamp())
+        let cur = usingHLSSource ? hlsSource.frameCount : (usingStreamSource ? vcu.videoByteCount() : Link.vcamStamp())
         let progressing = previousBytes >= 0 && cur > previousBytes
         if lastTick.timeIntervalSince(now) > 0.7, cur >= 0, lastES >= 0 {
             let dt = now.timeIntervalSince(lastTick)
@@ -2400,7 +2615,7 @@ struct ContentView: View {
             } else if useHLS {
                 hint = "正在连接电脑画面：\(builtURL)"
             } else if useUSBStream {
-                hint = daemon.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
+                hint = vcu.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
             } else {
                 hint = "已切换：相机放视频"
             }
