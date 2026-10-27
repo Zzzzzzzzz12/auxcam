@@ -66,6 +66,7 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
         ssize_t k = write(fd, p, n);
         if (k < 0) {
             if (errno == EINTR) continue;
+            fprintf(stderr, "write failed errno=%d\n", errno);
             return -1;
         }
         p += k;
@@ -169,6 +170,9 @@ void vcu1_log(const char *path, const char *fmt, ...) {
     }
     char line[640];
     int n = snprintf(line, sizeof(line), "%ld %s\n", (long)time(NULL), msg);
-    if (n > 0) write_all(fd, (const uint8_t *)line, (size_t)n);
+    if (n > 0) {
+        int w = write_all(fd, (const uint8_t *)line, (size_t)n);
+        fprintf(stderr, "log write rc=%d n=%d fd=%d\n", w, n, fd);
+    }
     close(fd);
 }
