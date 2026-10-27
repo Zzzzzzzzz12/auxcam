@@ -88,7 +88,10 @@ void vcu1_ring_close(VCU1Ring *ring) {
 static int ring_open(VCU1Ring *ring) {
     if (ring->fd >= 0) return 0;
     int fd = open(ring->path, O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        fprintf(stderr, "ring open failed path=%s errno=%d\n", ring->path, errno);
+        return -1;
+    }
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);
@@ -153,7 +156,11 @@ void vcu1_log(const char *path, const char *fmt, ...) {
     va_end(ap);
 
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) return;
+    if (fd < 0) {
+        // 调试：写日志失败时把路径和错误码打到标准错误
+        fprintf(stderr, "vcu1_log open failed path=%s errno=%d\n", path, errno);
+        return;
+    }
     struct stat st;
     if (fstat(fd, &st) == 0 && st.st_size > VCU1_LOG_MAX_BYTES) {
         close(fd);
