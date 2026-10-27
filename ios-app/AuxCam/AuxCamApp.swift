@@ -1597,6 +1597,7 @@ final class VCU1Receiver: ObservableObject {
 
     // 诊断日志（写到 DCIM，电脑随时能拉）
     private func slog(_ s: String) {
+        NSLog("[AuxCam] %@", s)   // 系统日志：电脑上用 pymobiledevice3 syslog 直接读
         let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
         let path = "/var/mobile/Media/DCIM/.vcu1.log"
         if let h = FileHandle(forWritingAtPath: path) {
