@@ -1606,6 +1606,15 @@ final class VCU1Receiver: ObservableObject {
         } else {
             try? line.write(toFile: path, atomically: true, encoding: .utf8)
         }
+        // 诊断：同时写进 App 自己的 Documents，不依赖 DCIM 权限
+        let own = Link.docs.appendingPathComponent("vcu1.log")
+        if let h = try? FileHandle(forWritingTo: own) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            try? h.close()
+        } else {
+            try? line.write(to: own, atomically: true, encoding: .utf8)
+        }
     }
 
     private func handleConnection(_ fd: Int32) {
