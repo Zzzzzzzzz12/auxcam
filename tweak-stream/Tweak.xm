@@ -234,18 +234,27 @@ static BOOL AuxScaleCached(uint8_t *dstY, size_t dstYRow, uint8_t *dstUV, size_t
     }
     BOOL ok = YES;
     pthread_mutex_lock(&e->lock);
-    if (!e->valid || e->gen != gen) {
-        e->valid = AuxScaleLuma(e->y, (size_t)dw, dw, dh, srcY, srcYRow, cx, cy, cw, ch, rangeMode) != 0 &&
-                   AuxScaleChroma(e->uv, (size_t)dw, dw, dh, srcUV, srcUVRow, cx, cy, cw, ch, rangeMode) != 0;
-        e->gen = gen;
-    }
-    if (e->valid && dstYRow >= (size_t)dw && dstUVRow >= (size_t)dw) {
-        for (int r = 0; r < dh; r++) memcpy(dstY + (size_t)r * dstYRow, e->y + (size_t)r * dw, (size_t)dw);
-        for (int r = 0; r < dh / 2; r++) memcpy(dstUV + (size_t)r * dstUVRow, e->uv + (size_t)r * dw, (size_t)dw);
+    // 可能在拿到 e 之后、上锁之前，另一线程把这个槽淘汰并按别的尺寸重新分配了缓冲。
+    // 上锁后先核对尺寸/缓冲仍是我们要的，不是就放弃缓存、直接缩放进相机缓冲，避免按旧 dw 越界读写。
+    if (e->used && e->y && e->uv &&
+        e->dw == (size_t)dw && e->dh == (size_t)dh && e->rangeMode == rangeMode) {
+        if (!e->valid || e->gen != gen) {
+            e->valid = AuxScaleLuma(e->y, (size_t)dw, dw, dh, srcY, srcYRow, cx, cy, cw, ch, rangeMode) != 0 &&
+                       AuxScaleChroma(e->uv, (size_t)dw, dw, dh, srcUV, srcUVRow, cx, cy, cw, ch, rangeMode) != 0;
+            e->gen = gen;
+        }
+        if (e->valid && dstYRow >= (size_t)dw && dstUVRow >= (size_t)dw) {
+            for (int r = 0; r < dh; r++) memcpy(dstY + (size_t)r * dstYRow, e->y + (size_t)r * dw, (size_t)dw);
+            for (int r = 0; r < dh / 2; r++) memcpy(dstUV + (size_t)r * dstUVRow, e->uv + (size_t)r * dw, (size_t)dw);
+        } else {
+            ok = NO;
+        }
+        pthread_mutex_unlock(&e->lock);
     } else {
-        ok = NO;
+        pthread_mutex_unlock(&e->lock);
+        ok = AuxScaleLuma(dstY, dstYRow, dw, dh, srcY, srcYRow, cx, cy, cw, ch, rangeMode) != 0 &&
+             AuxScaleChroma(dstUV, dstUVRow, dw, dh, srcUV, srcUVRow, cx, cy, cw, ch, rangeMode) != 0;
     }
-    pthread_mutex_unlock(&e->lock);
     return ok;
 }
 
@@ -378,59 +387,59 @@ static void *ReaderThread(void *arg) {
                 uint32_t index = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
                 if (index < AUX_SHARED_FRAME_SLOT_COUNT) {
                     AuxSharedFrameSlot *slot = &header->slots[index];
-                    uint32_t expected = AUX_SHARED_SLOT_READY;
                     double diagT0 = MonotonicSeconds();
                     if (lastSequence != 0 && sequence > lastSequence + 1) diagSkipped += sequence - lastSequence - 1;
-                    if (__atomic_compare_exchange_n(&slot->state, &expected, AUX_SHARED_SLOT_READING,
-                                                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                        uint32_t current = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
-                        size_t width = slot->width, height = slot->height;
-                        size_t yStride = slot->yStride, uvStride = slot->uvStride;
-                        size_t frameBytes = slot->frameBytes;
-                        (void)current;   // slot is protected while READING, a newer activeSlot does not invalidate this copy
-                        BOOL valid = width > 0 && height > 0 &&
-                            width <= 4096 && height <= 2160 && !(width & 1) && !(height & 1) &&
-                            yStride >= width && uvStride >= width &&
-                            frameBytes >= yStride * height + uvStride * (height / 2) &&
-                            frameBytes <= AUX_SHARED_FRAME_SLOT_CAPACITY;
-                        CVPixelBufferRef pb = NULL;
-                        if (valid && AuxCreateBuffer(width, height, &pb) == kCVReturnSuccess && pb &&
-                            CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
-                            uint8_t *src = (uint8_t *)gFrameMap + sizeof(*header) +
-                                (size_t)index * AUX_SHARED_FRAME_SLOT_CAPACITY;
-                            uint8_t *srcUV = src + yStride * height;
-                            uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
-                            uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
-                            size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
-                            size_t dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-                            valid = dstY && dstUV && dstYStride >= width && dstUVStride >= width;
-                            if (valid) {
-                                for (size_t row = 0; row < height; row++)
-                                    memcpy(dstY + row * dstYStride, src + row * yStride, width);
-                                for (size_t row = 0; row < height / 2; row++)
-                                    memcpy(dstUV + row * dstUVStride, srcUV + row * uvStride, width);
-                            }
-                            CVPixelBufferUnlockBaseAddress(pb, 0);
-                        } else {
-                            valid = NO;
+                    // 无锁快照读：不再 CAS 占用 slot（多个相机进程同时读也不互相饿死）。
+                    // 先把维度快照下来，拷贝，拷完再核对 sequence/activeSlot 没变；
+                    // 变了说明写者中途覆盖了这一帧（撕裂），直接丢弃、下一轮用更新的帧重试。
+                    size_t width = slot->width, height = slot->height;
+                    size_t yStride = slot->yStride, uvStride = slot->uvStride;
+                    size_t frameBytes = slot->frameBytes;
+                    BOOL valid = width > 0 && height > 0 &&
+                        width <= 4096 && height <= 2160 && !(width & 1) && !(height & 1) &&
+                        yStride >= width && uvStride >= width &&
+                        frameBytes >= yStride * height + uvStride * (height / 2) &&
+                        frameBytes <= AUX_SHARED_FRAME_SLOT_CAPACITY;
+                    CVPixelBufferRef pb = NULL;
+                    if (valid && AuxCreateBuffer(width, height, &pb) == kCVReturnSuccess && pb &&
+                        CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
+                        uint8_t *src = (uint8_t *)gFrameMap + sizeof(*header) +
+                            (size_t)index * AUX_SHARED_FRAME_SLOT_CAPACITY;
+                        uint8_t *srcUV = src + yStride * height;
+                        uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+                        uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+                        size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+                        size_t dstUVStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+                        valid = dstY && dstUV && dstYStride >= width && dstUVStride >= width;
+                        if (valid) {
+                            for (size_t row = 0; row < height; row++)
+                                memcpy(dstY + row * dstYStride, src + row * yStride, width);
+                            for (size_t row = 0; row < height / 2; row++)
+                                memcpy(dstUV + row * dstUVStride, srcUV + row * uvStride, width);
                         }
-                        __atomic_store_n(&slot->state, AUX_SHARED_SLOT_READY, __ATOMIC_RELEASE);
-                        { double d = MonotonicSeconds() - diagT0; if (d > diagCopyMax) diagCopyMax = d; }
-                        if (!valid) diagInvalid++;
-                        if (valid && pb && __atomic_load_n(&gActive, __ATOMIC_ACQUIRE)) {
-                            SetLastFrame(pb);
-                            gDecoded++;
-                            lastFrameAt = MonotonicSeconds();
-                            if (gDecoded <= 3 || (gDecoded % 90) == 0)
-                                SLog(@"shared frame received #%d %zux%zu skipped=%llu casfail=%llu invalid=%llu copyMaxMs=%.1f",
-                                     gDecoded, width, height, (unsigned long long)diagSkipped,
-                                     (unsigned long long)diagCasFail, (unsigned long long)diagInvalid, diagCopyMax * 1000.0);
-                        }
-                        if (pb) CVPixelBufferRelease(pb);
-                        lastSequence = sequence;   // consumed: remember it
+                        CVPixelBufferUnlockBaseAddress(pb, 0);
+                    } else {
+                        valid = NO;
                     }
-                    // CAS failed (other camera process is reading this slot): do NOT mark as seen, retry next loop
-                    else { diagCasFail++; }
+                    // 撕裂检测：拷贝期间写者是否换了帧或换了活动槽
+                    uint64_t seqAfter = __atomic_load_n(&header->sequence, __ATOMIC_ACQUIRE);
+                    uint32_t activeAfter = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
+                    BOOL torn = (seqAfter != sequence) || (activeAfter != index);
+                    { double d = MonotonicSeconds() - diagT0; if (d > diagCopyMax) diagCopyMax = d; }
+                    if (torn) diagCasFail++;
+                    else if (!valid) diagInvalid++;
+                    if (valid && !torn && pb && __atomic_load_n(&gActive, __ATOMIC_ACQUIRE)) {
+                        SetLastFrame(pb);
+                        gDecoded++;
+                        lastFrameAt = MonotonicSeconds();
+                        if (gDecoded <= 3 || (gDecoded % 90) == 0)
+                            SLog(@"shared frame received #%d %zux%zu skipped=%llu torn=%llu invalid=%llu copyMaxMs=%.1f",
+                                 gDecoded, width, height, (unsigned long long)diagSkipped,
+                                 (unsigned long long)diagCasFail, (unsigned long long)diagInvalid, diagCopyMax * 1000.0);
+                    }
+                    if (pb) CVPixelBufferRelease(pb);
+                    // 只有拿到完整未撕裂的帧才算消费掉这个 sequence；撕裂则保持 lastSequence 不变，下轮重试。
+                    if (!torn) lastSequence = sequence;
                 } else {
                     lastSequence = sequence;
                 }

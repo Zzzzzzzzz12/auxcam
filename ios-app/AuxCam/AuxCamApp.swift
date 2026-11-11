@@ -275,6 +275,15 @@ final class StreamDecoder {
     private var openH264NeedsParameterSets = true
     private var vtAttrVariant = 0
     private var lastVTRetryAt: Double = 0   // AUXRETRY: 软解时每隔一会儿自动试着切回硬解
+    // 防重建（AUXNOTHRASH）：偶发的单帧 -12911 不再整条推倒重建解码器。
+    // 只有连续失败到阈值才重建；记住一个能用的属性方案，别每次从 0 重来；
+    // 硬解反复起不来（比如开直播时抖音占着硬件芯片）就退到软解稳住，不再每 10 秒反复横跳。
+    private var vtRejectStreak = 0            // 连续被拒的帧数
+    private var vtGoodVariant = -1            // 曾经成功出图的属性方案；-1=还没有
+    private var vtGiveUpCount = 0             // 从硬解整体退到软解的累计次数
+    private var vtRetryBackoff: Double = 30   // 软解→硬解的重试间隔（秒），会指数退避
+    private static let vtRejectRebuildThreshold = 8   // 连续被拒多少帧才重建
+    private static let vtMaxGiveUps = 4               // 退到软解这么多次后，本次会话不再试硬解
     // 抖动缓冲（AUXPACER）：解码出来的画面先排队，再按固定 30 帧的节奏交给相机插件。
     // 电脑/USB 送画面时快时慢，直接交出去会让相机里的画面一顿一顿；排一两帧的队就能抹平。
     static let pacerEnabled = true
@@ -305,6 +314,7 @@ final class StreamDecoder {
     private var jpegVTHeight = 0
     private var jpegVTFailStreak = 0
     private var jpegVTDisabled = false
+    private var jpegVTDisabledAt: Double = 0   // 硬解被临时关掉的时刻：冷却一段时间后自动再试一次
     private var jpegVTCount: Int64 = 0
     private let jpegVTLock = NSLock()
     private var jpegVTOutput: CVPixelBuffer?
@@ -319,6 +329,12 @@ final class StreamDecoder {
     private static var buildCount: Int = 0
     private static var feedCount: Int = 0
     private static let runID = String(UUID().uuidString.prefix(8))
+    // 背压（AUXBP-H264）：解码来不及时只保留最新一帧，旧帧直接丢。
+    // 收网络数据的线程(VCU1Receiver)调 feed 后立刻返回，永不被解码拖住 ——
+    // 这样手机解码变慢时也不会停止读 socket，电脑端就不会被 TCP 反压（不再出现“发给手机 1.4 秒”）。
+    private let h264PendingLock = NSLock()
+    private var h264Pending: (Data, Bool)?
+    private var h264Draining = false
 
     deinit {
         if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
@@ -347,9 +363,18 @@ final class StreamDecoder {
 
     func setConfig(sps: Data, pps: Data) {
         queue.sync {
+            let changed = (sps != self.sps || pps != self.pps)
             self.sps = sps
             self.pps = pps
             self.frameIndex = 0
+            if changed {
+                // 真正换了码流参数(新流/新分辨率)：给硬解一次全新机会，清掉之前的放弃/退避状态。
+                self.vtGiveUpCount = 0
+                self.vtRetryBackoff = 30
+                self.vtGoodVariant = -1
+                self.vtAttrVariant = 0
+                self.vtRejectStreak = 0
+            }
             self.setWaitingForKeyframe(true)
             self.resetPacer()
             self.build()
@@ -616,10 +641,28 @@ final class StreamDecoder {
     }
 
     func feed(_ raw: Data, keyframe: Bool) {
-        // VCU1 的接收循环也在后台队列。让 TCP 自然背压，避免 VT 变慢时
-        // 把整段旧帧无限堆进 GCD 队列，造成延迟和内存持续增长。
-        queue.sync {
-            self.decode(raw, keyframe: keyframe)
+        // 只保留最新一帧，旧的未解码帧直接丢（至多排 1 帧，不会无限堆积、也不占内存）。
+        // 关键：这里不再用 queue.sync 等解码完成 —— 收网络线程立刻返回，解码慢也不卡收包。
+        h264PendingLock.lock()
+        h264Pending = (raw, keyframe)
+        let alreadyDraining = h264Draining
+        if !alreadyDraining { h264Draining = true }
+        h264PendingLock.unlock()
+        if alreadyDraining { return }      // 已有人在解码，新帧放着等它回头来取
+        queue.async { [weak self] in self?.drainH264() }
+    }
+
+    private func drainH264() {
+        while true {
+            h264PendingLock.lock()
+            guard let next = h264Pending else {
+                h264Draining = false
+                h264PendingLock.unlock()
+                return
+            }
+            h264Pending = nil
+            h264PendingLock.unlock()
+            autoreleasepool { decode(next.0, keyframe: next.1) }
         }
     }
 
@@ -854,13 +897,16 @@ final class StreamDecoder {
         if isWaitingForKeyframe() && !hasIDR { return }
         if hasIDR { setWaitingForKeyframe(false) }
 
-        // 目前在软解、又遇到关键帧：每 10 秒试一次切回硬解，失败了就继续软解，不会丢这一帧。
-        if videoToolboxSession == nil && softwareDecoder != nil && hasIDR {
+        // 在软解、遇到关键帧时才考虑切回硬解：间隔指数退避(30→60→…→240s)，
+        // 反复起不来(例如开直播时抖音占着硬件芯片)累计到上限就彻底不试了，稳在软解，避免无休止重建。
+        if videoToolboxSession == nil && softwareDecoder != nil && hasIDR
+            && vtGiveUpCount < StreamDecoder.vtMaxGiveUps {
             let retryNow = CFAbsoluteTimeGetCurrent()
-            if retryNow - lastVTRetryAt > 10 {
+            if retryNow - lastVTRetryAt > vtRetryBackoff {
                 lastVTRetryAt = retryNow
-                vtAttrVariant = 0
-                StreamDecoder.dlog("硬解重试：尝试从软解切回 VideoToolbox")
+                vtRetryBackoff = min(vtRetryBackoff * 2, 240)
+                vtAttrVariant = max(0, vtGoodVariant)   // 从上次能用的方案起，别每次从 0 重来
+                StreamDecoder.dlog("硬解重试(第\(vtGiveUpCount + 1)次机会，下次最早\(Int(vtRetryBackoff))s 后)")
                 build()
             }
         }
@@ -871,31 +917,44 @@ final class StreamDecoder {
                 let type = raw[range.lowerBound] & 0x1F
                 return type == 1 || type == 5
             }
-            if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) { return }
-            if vtAttrVariant < 2 {
-                vtAttrVariant += 1
-                StreamDecoder.dlog("VideoToolbox rejected frame; retry with attribute variant \(vtAttrVariant)")
-                build()
-                if videoToolboxSession != nil {
-                    if hasIDR { setWaitingForKeyframe(false) }
-                    let retrySlices = nalRanges.filter { range in
-                        guard range.lowerBound < raw.count else { return false }
-                        let type = raw[range.lowerBound] & 0x1F
-                        return type == 1 || type == 5
-                    }
-                    if decodeVideoToolbox(raw, slices: retrySlices, isKeyframe: hasIDR) { return }
-                }
-                decode(raw, keyframe: keyframe)
+            if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) {
+                vtRejectStreak = 0              // 出图成功：清零连续失败，并记住这个能用的方案
+                vtGoodVariant = vtAttrVariant
                 return
             }
-            StreamDecoder.dlog("VideoToolbox rejected frame; switching to OpenH264")
+            // 单帧失败：偶发的 -12911 只丢这一帧、等下个关键帧重同步，绝不逢帧重建。
+            vtRejectStreak += 1
+            if vtRejectStreak < StreamDecoder.vtRejectRebuildThreshold {
+                setWaitingForKeyframe(true)
+                return
+            }
+            // 连续失败到阈值，才认为这个会话真的坏了：换一种输出属性方案重建一次。
+            StreamDecoder.dlog("VideoToolbox 连续被拒 \(vtRejectStreak) 帧")
+            vtRejectStreak = 0
+            if vtAttrVariant < 2 {
+                vtAttrVariant += 1
+                StreamDecoder.dlog("换输出属性方案 \(vtAttrVariant) 重建 VideoToolbox")
+                build()
+                setWaitingForKeyframe(true)     // 新会话从下个关键帧开始，别拿旧 P 帧硬喂
+                return
+            }
+            // 三种方案都不行：退到软解稳住，本帧若是关键帧就立刻用软解出图。
+            StreamDecoder.dlog("VideoToolbox 三种方案都不行，退到软解 OpenH264")
             if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
             videoToolboxSession = nil
             videoFormatDescription = nil
-            if hasIDR { setWaitingForKeyframe(false) }
-            else { setWaitingForKeyframe(true); return }
+            vtGiveUpCount += 1
+            vtGoodVariant = -1
+            vtAttrVariant = 0
+            lastVTRetryAt = CFAbsoluteTimeGetCurrent()   // 退避计时从现在起
             softwareDecoder = auxh264_create()
             openH264NeedsParameterSets = true
+            if hasIDR {
+                setWaitingForKeyframe(false)
+            } else {
+                setWaitingForKeyframe(true)
+                return
+            }
         }
         decodeOpenH264(raw, types: types, hasIDR: hasIDR)
     }
@@ -1205,7 +1264,8 @@ final class StreamDecoder {
         }
         if jpegVTFailStreak >= 3 {
             jpegVTDisabled = true
-            StreamDecoder.dlog("JPEG硬解: 连续失败，改用 CPU 路径（ImageIO）")
+            jpegVTDisabledAt = CFAbsoluteTimeGetCurrent()
+            StreamDecoder.dlog("JPEG硬解: 连续失败，暂时改用 CPU 路径（ImageIO），稍后自动再试硬件")
         }
     }
 
@@ -1238,6 +1298,12 @@ final class StreamDecoder {
         jpegEntered += 1
         if jpegEntered <= 3 || jpegEntered % 150 == 0 {
             StreamDecoder.dlog("decodeJPEG 进入 #\(jpegEntered) bytes=\(data.count) 已发布=\(jpegFrameCount)")
+        }
+        // 硬解被临时关掉后，冷却 15 秒自动再试一次：避免偶发的一帧失败把整场都压到 CPU 上。
+        if jpegVTDisabled, CFAbsoluteTimeGetCurrent() - jpegVTDisabledAt > 15 {
+            jpegVTDisabled = false
+            jpegVTFailStreak = 0
+            StreamDecoder.dlog("JPEG硬解: 冷却结束，重新尝试硬件解码")
         }
         // 先试硬件解码：只读 JPEG 头部拿宽高，不解码像素
         if !jpegVTDisabled,
@@ -1489,59 +1555,274 @@ final class HLSFrameSource: ObservableObject {
     }
 }
 
-// ───────────────────────── auxcamd 状态读取（只读，不再开 28765） ─────────────────────────
-// 推流接收已搬到开机自启的 LaunchDaemon（auxcamd，常驻，不随 App 被杀）。
-// App 只读 daemon 写在 DCIM 下的状态文件：是否在跑、帧率、有没有电脑连上。
-final class DaemonStatusReader: ObservableObject {
-    @Published var status = "等待 auxcamd"
+// ───────────────────────── VCU1 接收层（接万相桌面端） ─────────────────────────
+// 万相电脑端通过数据线(usbmux)连 iPhone 的 28765 端口，包格式：
+//   24 字节头: "VCU1" + 版本(1B) + 类型(1B) + flags(2B BE) + 长度(4B BE) + 序号(4B BE) + 时间戳(8B BE 微秒)
+//   类型: 1=视频配置(AVCC SPS/PPS) 2=视频帧(H264 NALU, flags bit0=关键帧) 3=音频配置 4=音频帧(ADTS) 5=心跳(每秒)
+final class VCU1Receiver: ObservableObject {
+    @Published var status = "等待电脑连接"
     @Published var fps = 0.0
     @Published var alive = false
 
-    static let statusPath = "/var/mobile/Media/DCIM/.auxcamd.status"
-    // daemon 每秒刷新一次；超过这个时间没更新，就认为 daemon 已经停了
-    private static let staleAfter: TimeInterval = 5
-    private var timer: Timer?
-    private var totalBytes: Int64 = 0
+    static let listenPort: UInt16 = 28765
+    static let outPath = "/var/mobile/Media/DCIM/stream.h264"
+    let decoder = StreamDecoder()
+    private var listenFd: Int32 = -1
+    private var shouldRun = false
+    private var frameCount: Int32 = 0
+    private var lastCountAt = Date()
+    private var totalVideoBytes: Int64 = 0
+    private let lock = NSLock()
+    private let maxFile: Int64 = 8 * 1024 * 1024
+    private var sps: Data = Data()
+    private var pps: Data = Data()
+    private var ringHandle: FileHandle?
+    private var ringSize: Int64 = 0
+    private var ringNeedsKeyframe = false
+    private var jpegSeen = 0
+    // 到包间隔统计（AUXGAP）：看电脑/USB 送画面是否均匀
+    private var gapLastAt: Double = 0
+    private var gapMax: Double = 0
+    private var gapOver50 = 0
+    private var gapUnder15 = 0
+    private var gapCount = 0
 
     func start() {
-        guard timer == nil else { return }
-        refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        if shouldRun { return }
+        shouldRun = true
+        lock.lock()
+        sps = Data(); pps = Data(); totalVideoBytes = 0; frameCount = 0
+        lock.unlock()
+        DispatchQueue.global(qos: .userInitiated).async { self.serve() }
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        shouldRun = false
+        if listenFd >= 0 { close(listenFd); listenFd = -1 }
+        DispatchQueue.main.async { self.status = "已停止"; self.alive = false }
     }
 
-    // 累计收到的视频字节数（daemon 写在状态文件里），给主界面的心跳判断用
-    func videoByteCount() -> Int64 {
-        totalBytes
-    }
-
-    private func refresh() {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: Self.statusPath)),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            alive = false
-            fps = 0
-            status = "auxcamd 未运行（请检查守护进程是否已安装）"
+    private func serve() {
+        listenFd = socket(AF_INET, SOCK_STREAM, 0)
+        guard listenFd >= 0 else {
+            DispatchQueue.main.async { self.status = "开监听失败" }
+            slog("socket failed")
             return
         }
-        let updated = (obj["updated"] as? Double) ?? 0
-        let fresh = Date().timeIntervalSince1970 - updated < Self.staleAfter
-        let listening = (obj["listening"] as? Bool) ?? false
-        let connected = (obj["connected"] as? Bool) ?? false
-        totalBytes = (obj["bytes"] as? NSNumber)?.int64Value ?? 0
-        alive = fresh && connected
-        fps = fresh ? ((obj["fps"] as? Double) ?? 0) : 0
-        if !fresh {
-            status = "auxcamd 状态已停止更新（守护进程可能已退出）"
-        } else if !listening {
-            status = "auxcamd 未开门"
-        } else if connected {
-            status = "电脑已连上，收画面中"
+        var on: Int32 = 1
+        setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = VCU1Receiver.listenPort.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let b = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(listenFd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if b != 0 {
+            DispatchQueue.main.async { self.status = "端口被占" }
+            slog("bind failed errno=\(errno)")
+            close(listenFd); listenFd = -1
+            return
+        }
+        listen(listenFd, 128)
+        slog("listening 28765")
+        DispatchQueue.main.async { self.status = "已开门(28765)，等电脑连" }
+        while shouldRun {
+            var caddr = sockaddr_in()
+            var clen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let cfd = withUnsafeMutablePointer(to: &caddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(listenFd, $0, &clen)
+                }
+            }
+            guard cfd >= 0 else { break }
+            // 读超时 5 秒：对端不送数据就别占着连接（防重连风暴拖死）
+            var tv = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            DispatchQueue.main.async { self.status = "电脑已连上，收画面中"; self.alive = true }
+            handleConnection(cfd)
+            close(cfd)
+            if shouldRun {
+                DispatchQueue.main.async { self.status = "断开，等电脑重连"; self.alive = false }
+            }
+        }
+    }
+
+    private func readFull(_ fd: Int32, _ n: Int) -> Data? {
+        var buf = Data()
+        var tmp = [UInt8](repeating: 0, count: n)
+        while buf.count < n {
+            let r = read(fd, &tmp, n - buf.count)
+            if r <= 0 { return nil }
+            buf.append(tmp, count: r)
+        }
+        return buf
+    }
+
+    // 诊断日志（写到 DCIM，电脑随时能拉）
+    private func slog(_ s: String) {
+        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
+        let path = "/var/mobile/Media/DCIM/.vcu1.log"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            try? h.close()
         } else {
-            status = "已开门(28765)，等电脑连"
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func handleConnection(_ fd: Int32) {
+        var lastHb = Date()
+        slog("conn accepted")
+        while shouldRun {
+            guard let head = readFull(fd, 24) else { slog("conn closed by peer"); return }
+            let magic = String(bytes: head[0..<4], encoding: .ascii) ?? ""
+            guard magic == "VCU1" else { slog("bad magic: " + magic); return }
+            let version = Int(head[4])
+            let type = Int(head[5])
+            let flags = Int(head[6]) << 8 | Int(head[7])
+            let len = Int(head[8]) << 24 | Int(head[9]) << 16 | Int(head[10]) << 8 | Int(head[11])
+            guard version == 1, len >= 0, len <= 4 * 1024 * 1024 else {
+                slog("bad ver/len: v=\(version) len=\(len)"); return
+            }
+            let payload = len > 0 ? (readFull(fd, len) ?? Data()) : Data()
+            if len > 0 && payload.count < len { slog("payload short"); return }
+            switch type {
+            case 1:
+                parseAVCC(payload)
+                decoder.setConfig(sps: sps, pps: pps)
+                slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
+            case 2:
+                // 先把最新帧送进 VideoToolbox 并发布共享画面，兼容环形文件写入放后面。
+                let gapNow = CFAbsoluteTimeGetCurrent()
+                if gapLastAt > 0 {
+                    let gapMs = (gapNow - gapLastAt) * 1000
+                    gapCount += 1
+                    if gapMs > gapMax { gapMax = gapMs }
+                    if gapMs > 50 { gapOver50 += 1 }
+                    if gapMs < 15 { gapUnder15 += 1 }
+                    if gapCount >= 90 {
+                        slog("到包间隔 近90帧: 最大=\(Int(gapMax))ms 超过50ms=\(gapOver50)次 小于15ms=\(gapUnder15)次")
+                        gapMax = 0
+                        gapOver50 = 0
+                        gapUnder15 = 0
+                        gapCount = 0
+                    }
+                }
+                gapLastAt = gapNow
+                decoder.feed(payload, keyframe: (flags & 1) != 0)
+                countFrame(payload.count)
+                if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
+            case 10:
+                // MJPEG 帧：系统硬件 JPEG 解码 → 共享画面（最稳路径）
+                jpegSeen += 1
+                if jpegSeen <= 3 || jpegSeen % 150 == 0 { slog("type10 JPEG #\(jpegSeen) len=\(payload.count)") }
+                decoder.feedJPEG(payload)
+                countFrame(payload.count)
+            case 5: lastHb = Date()
+            default: break
+            }
+            if Date().timeIntervalSince(lastHb) > 8 { slog("heartbeat timeout"); return }
+        }
+    }
+
+    // type1: AVCC 配置（AVCDecoderConfigurationRecord）→ 提出 SPS/PPS
+    private func parseAVCC(_ d: Data) {
+        guard d.count > 7, d[0] == 1 else { return }
+        var i = 5
+        let numSPS = Int(d[i] & 0x1F); i += 1
+        var s = Data(); var p = Data()
+        for _ in 0..<numSPS where i + 2 <= d.count {
+            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
+            guard i + l <= d.count else { return }
+            s = d.subdata(in: i..<(i + l)); i += l
+        }
+        guard i < d.count else { return }
+        let numPPS = Int(d[i] & 0x1F); i += 1
+        for _ in 0..<numPPS where i + 2 <= d.count {
+            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
+            guard i + l <= d.count else { return }
+            p = d.subdata(in: i..<(i + l)); i += l
+        }
+        if !s.isEmpty && !p.isEmpty {
+            lock.lock(); sps = s; pps = p; lock.unlock()
+        }
+    }
+
+    private static let startCode = Data([0, 0, 0, 1])
+
+    // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（8MB 环形缓存）
+    private func appendVideo(_ d: Data, keyframe: Bool) {
+        var nalu = d
+        let sc4 = Data([UInt8(0), UInt8(0), UInt8(0), UInt8(1)])
+        let sc3 = Data([UInt8(0), UInt8(0), UInt8(1)])
+        if nalu.starts(with: sc4) { nalu = nalu.subdata(in: 4..<nalu.count) }
+        else if nalu.starts(with: sc3) { nalu = nalu.subdata(in: 3..<nalu.count) }
+        guard !nalu.isEmpty else { return }
+
+        let fm = FileManager.default
+        if ringHandle == nil {
+            if !fm.fileExists(atPath: VCU1Receiver.outPath) {
+                fm.createFile(atPath: VCU1Receiver.outPath, contents: nil)
+            }
+            ringHandle = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
+            if let attributes = try? fm.attributesOfItem(atPath: VCU1Receiver.outPath) {
+                ringSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            }
+            try? ringHandle?.seekToEnd()
+        }
+        guard let fh = ringHandle else { return }
+
+        var head = Data()
+        if keyframe {
+            lock.lock()
+            let s = sps, p = pps
+            lock.unlock()
+            if !s.isEmpty && !p.isEmpty {
+                head.append(VCU1Receiver.startCode); head.append(s)
+                head.append(VCU1Receiver.startCode); head.append(p)
+            }
+        }
+        head.append(VCU1Receiver.startCode)
+        head.append(nalu)
+
+        if ringNeedsKeyframe && !keyframe { return }
+        if ringSize + Int64(head.count) > maxFile {
+            try? fh.truncate(atOffset: 0)
+            try? fh.seek(toOffset: 0)
+            ringSize = 0
+            ringNeedsKeyframe = true
+            // 环形缓存从完整 GOP 起步，避免绕回后以 P 帧开头。
+            if !keyframe { return }
+        }
+        try? fh.write(contentsOf: head)
+        ringSize += Int64(head.count)
+        if keyframe { ringNeedsKeyframe = false }
+    }
+
+    func videoByteCount() -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return totalVideoBytes
+    }
+
+    private func countFrame(_ payloadBytes: Int) {
+        lock.lock()
+        frameCount += 1
+        totalVideoBytes += Int64(payloadBytes)
+        let now = Date()
+        var measuredFPS: Double?
+        if now.timeIntervalSince(lastCountAt) >= 1 {
+            let f = Double(frameCount) / now.timeIntervalSince(lastCountAt)
+            frameCount = 0
+            lastCountAt = now
+            measuredFPS = f
+        }
+        lock.unlock()
+        if let measuredFPS {
+            DispatchQueue.main.async { self.fps = measuredFPS }
         }
     }
 }
@@ -1743,7 +2024,7 @@ private struct StreamPiPPreview: UIViewRepresentable {
 }
 struct ContentView: View {
     @StateObject private var cam = Cam()
-    @StateObject private var daemon = DaemonStatusReader()
+    @StateObject private var vcu = VCU1Receiver()
     @StateObject private var hlsSource = HLSFrameSource()
     @State private var st: [String: String] = [:]
     @State private var state: LiveState = .idle
@@ -1766,6 +2047,7 @@ struct ContentView: View {
     @State private var rotation = 0   // 0/90/180/270，顺时针
     private static let floatStartTS = Int(Date().timeIntervalSince1970)
     private static var floatTimer: DispatchSourceTimer?
+    private static var didBoot = false   // onAppear 可能多次触发：保证 boot() 只真正执行一次（否则会叠加 1 秒定时器）
     @State private var showDiag = false
     @AppStorage("pcIP") private var pcIP = "192.168.31.141"
     @AppStorage("streamURL") private var streamURL = ""
@@ -1958,14 +2240,14 @@ struct ContentView: View {
 
     private var infoRow: some View {
         HStack(spacing: 8) {
-            Circle().fill(daemon.alive ? Color.green : Color.orange).frame(width: 10, height: 10)
+            Circle().fill(vcu.alive ? Color.green : Color.orange).frame(width: 10, height: 10)
             VStack(alignment: .leading, spacing: 2) {
-                Text(daemon.alive ? "已连上电脑" : "等待电脑连接（请插好 USB）").font(.footnote).bold()
-                Text("源：" + daemon.status).font(.caption2).foregroundStyle(.secondary)
+                Text(vcu.alive ? "已连上电脑" : "等待电脑连接（请插好 USB）").font(.footnote).bold()
+                Text("源：" + vcu.status).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
-            if daemon.fps > 0 {
-                Text(String(format: "%.0f 帧/秒", daemon.fps)).font(.footnote).bold().foregroundStyle(.green)
+            if vcu.fps > 0 {
+                Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.footnote).bold().foregroundStyle(.green)
             }
         }
         .padding(10)
@@ -2062,6 +2344,10 @@ struct ContentView: View {
 
     // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
     private func boot() {
+        // onAppear 可能多次触发（切后台回来、视图重建），只允许第一次真正启动，
+        // 否则每次都会再建一个 1 秒定时器，tick() 叠加运行越跑越卡。
+        if ContentView.didBoot { return }
+        ContentView.didBoot = true
         // 老版本保存的是电脑 IP；首次升级时把它带到新的完整直播地址设置里。
         if UserDefaults.standard.object(forKey: "streamURL") == nil {
             streamURL = "http://\(pcIP):8899/obs/live.m3u8"
@@ -2073,7 +2359,7 @@ struct ContentView: View {
             self.cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
             DispatchQueue.main.async { self.keepAliveAudio() }   // 保留静音播放器，退后台也继续收画面
         }
-        daemon.start()   // 只读 auxcamd 状态；28765 由守护进程常驻监听，App 不再抢端口
+        vcu.start()   // 开门 28765，等万相电脑端连
         if fakeCameraOn { vcamControl(true) }
         Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
         if wasLive {
@@ -2185,9 +2471,9 @@ struct ContentView: View {
         // 心跳：电脑画面每秒都在往手机里写数据 = 直连活着
         let now = Date()
         let previousBytes = lastES
-        let cur = usingHLSSource ? hlsSource.frameCount : (usingStreamSource ? daemon.videoByteCount() : Link.vcamStamp())
+        let cur = usingHLSSource ? hlsSource.frameCount : (usingStreamSource ? vcu.videoByteCount() : Link.vcamStamp())
         let progressing = previousBytes >= 0 && cur > previousBytes
-        if lastTick.timeIntervalSince(now) > 0.7, cur >= 0, lastES >= 0 {
+        if now.timeIntervalSince(lastTick) > 0.7, cur >= 0, lastES >= 0 {   // 原来写反了(恒为负)，码率一直显示 0
             let dt = now.timeIntervalSince(lastTick)
             kbps = max(0, Double(cur - lastES) * 8.0 / dt / 1000.0)
         }
@@ -2400,7 +2686,7 @@ struct ContentView: View {
             } else if useHLS {
                 hint = "正在连接电脑画面：\(builtURL)"
             } else if useUSBStream {
-                hint = daemon.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
+                hint = vcu.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
             } else {
                 hint = "已切换：相机放视频"
             }
