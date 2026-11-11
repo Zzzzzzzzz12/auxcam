@@ -2,7 +2,7 @@ name: bs
 on: [push, workflow_dispatch]
 jobs:
   b:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
     - uses: actions/checkout@v4
     - uses: Randomblock1/theos-action@v1
