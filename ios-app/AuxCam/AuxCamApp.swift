@@ -922,21 +922,44 @@ final class StreamDecoder {
                 vtGoodVariant = vtAttrVariant
                 return
             }
-            // 单帧失败：偶发的 -12911 只丢这一帧、等下个关键帧重同步，绝不逢帧重建。
             vtRejectStreak += 1
-            if vtRejectStreak < StreamDecoder.vtRejectRebuildThreshold {
-                setWaitingForKeyframe(true)
-                return
-            }
-            // 连续失败到阈值，才认为这个会话真的坏了：换一种输出属性方案重建一次。
-            StreamDecoder.dlog("VideoToolbox 连续被拒 \(vtRejectStreak) 帧")
-            vtRejectStreak = 0
-            if vtAttrVariant < 2 {
-                vtAttrVariant += 1
-                StreamDecoder.dlog("换输出属性方案 \(vtAttrVariant) 重建 VideoToolbox")
-                build()
-                setWaitingForKeyframe(true)     // 新会话从下个关键帧开始，别拿旧 P 帧硬喂
-                return
+            if vtGoodVariant < 0 {
+                // 启动期：还没有任何能用的输出属性方案。本机实测"方案0"第一帧必被拒(-12911)，
+                // 必须在这一个关键帧上立刻把剩下的方案依次试一遍，秒级出图——
+                // 绝不能像稳态那样慢慢等(否则关键帧 2 秒才一个，凑够阈值要十几秒，画面一直黑)。
+                if hasIDR {
+                    while vtAttrVariant < 2 {
+                        vtAttrVariant += 1
+                        StreamDecoder.dlog("启动期换输出属性方案 \(vtAttrVariant) 立即重试本帧")
+                        build()
+                        guard videoToolboxSession != nil else { break }
+                        if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) {
+                            vtRejectStreak = 0
+                            vtGoodVariant = vtAttrVariant
+                            return
+                        }
+                    }
+                    // 本帧上三种方案都没出图 → 落到下面退软解
+                } else {
+                    setWaitingForKeyframe(true)   // 启动期非关键帧：等关键帧再定方案
+                    return
+                }
+            } else {
+                // 稳态：本来有能用的方案，现在突然被拒(多半是开直播被抖音抢了硬件芯片)。
+                // 耐心丢帧、等关键帧重同步，连续失败到阈值才换方案重建一次，避免反复横跳。
+                if vtRejectStreak < StreamDecoder.vtRejectRebuildThreshold {
+                    setWaitingForKeyframe(true)
+                    return
+                }
+                StreamDecoder.dlog("VideoToolbox 连续被拒 \(vtRejectStreak) 帧")
+                vtRejectStreak = 0
+                if vtAttrVariant < 2 {
+                    vtAttrVariant += 1
+                    StreamDecoder.dlog("换输出属性方案 \(vtAttrVariant) 重建 VideoToolbox")
+                    build()
+                    setWaitingForKeyframe(true)     // 新会话从下个关键帧开始，别拿旧 P 帧硬喂
+                    return
+                }
             }
             // 三种方案都不行：退到软解稳住，本帧若是关键帧就立刻用软解出图。
             StreamDecoder.dlog("VideoToolbox 三种方案都不行，退到软解 OpenH264")
