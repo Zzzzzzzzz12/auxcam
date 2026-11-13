@@ -191,8 +191,10 @@ int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
     if (frame == NULL || !CVPixelBufferIsPlanar(frame) || CVPixelBufferGetPlaneCount(frame) < 2) return -1;
     const size_t width = CVPixelBufferGetWidth(frame);
     const size_t height = CVPixelBufferGetHeight(frame);
+    // 宽、高各放宽到 4096（原来高度卡在 2160，竖屏素材如 1080×2274 会被拒收 → 手机没画面）。
+    // 真正的内存上限由下面的 slot 容量判断兜底（宽×高×1.5 ≤ 16MB），不会越界。
     if (width == 0 || height == 0 || (width & 1) || (height & 1) ||
-        width > 4096 || height > 2160 || width * height * 3 / 2 > AUX_SHARED_FRAME_SLOT_CAPACITY) return -2;
+        width > 4096 || height > 4096 || width * height * 3 / 2 > AUX_SHARED_FRAME_SLOT_CAPACITY) return -2;
     if (CVPixelBufferLockBaseAddress(frame, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -3;
     const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(frame, 0);
     const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(frame, 1);
