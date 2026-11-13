@@ -396,7 +396,7 @@ static void *ReaderThread(void *arg) {
                     size_t yStride = slot->yStride, uvStride = slot->uvStride;
                     size_t frameBytes = slot->frameBytes;
                     BOOL valid = width > 0 && height > 0 &&
-                        width <= 4096 && height <= 2160 && !(width & 1) && !(height & 1) &&
+                        width <= 4096 && height <= 4096 && !(width & 1) && !(height & 1) &&
                         yStride >= width && uvStride >= width &&
                         frameBytes >= yStride * height + uvStride * (height / 2) &&
                         frameBytes <= AUX_SHARED_FRAME_SLOT_CAPACITY;
