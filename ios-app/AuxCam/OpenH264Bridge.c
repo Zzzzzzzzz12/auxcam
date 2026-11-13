@@ -103,7 +103,10 @@ int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
     memset(&info, 0, sizeof(info));
     DECODING_STATE state = (*decoder->api)->DecodeFrameNoDelay(
         decoder->api, bytes, length, planes, &info);
-    if (state != dsErrorFree) return -2;
+    // 开了错误隐藏后，丢参考/码流小错时 OpenH264 仍会吐出一张"修补过"的画面(iBufferStatus==1)。
+    // 旧逻辑只要 state 不是完全无错就整帧扔掉并报错，导致一次小错就一直黑到下个关键帧。
+    // 现在：有画面就照样输出；只有既报错又没画面才算失败。
+    if (state != dsErrorFree && info.iBufferStatus != 1) return -2;
     if (info.iBufferStatus != 1) return 0;
 
     const int width = info.UsrData.sSystemBuffer.iWidth;

@@ -251,6 +251,89 @@ struct CamPreview: UIViewRepresentable {
 
 // ───────────────────────── 解码层（App 里解，画面贴公共画布） ─────────────────────────
 // App 解码 H264 → 把最新画面写进共享内存；插件读取它并替换相机帧。
+// MJPEG 的 CPU 解码工人（AUXJPEG2）：ImageIO 解 JPEG → BGRA → 系统像素转换成 NV12 全范围。
+// 每个工人有自己的缓冲和转换会话，只在自己的串行队列上用，所以多个工人可以同时解不同的图。
+// 实测这台机硬件 JPEG 解码一直 -12911，全靠 CPU：单线程 1080 宽只有 ~27 帧/秒，两个工人并行就能稳 30。
+final class JPEGCPUWorker {
+    let queue: DispatchQueue
+    private var nv: CVPixelBuffer?
+    private var bgra: CVPixelBuffer?
+    private var transfer: VTPixelTransferSession?
+    // 只在像素转换失败时才用的兜底：纯 CPU 软件渲染，lazy 保证平时不创建
+    private lazy var softwareContext = CIContext(options: [.useSoftwareRenderer: true])
+    private var failLogCount = 0
+
+    init(label: String) {
+        queue = DispatchQueue(label: label, qos: .userInitiated)
+    }
+
+    deinit {
+        if let transfer { VTPixelTransferSessionInvalidate(transfer) }
+    }
+
+    // 必须在 self.queue（或调用方保证独占）上调用。返回的缓冲属于这个工人，下次 convert 前有效。
+    func convert(_ data: Data) -> CVPixelBuffer? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(
+                source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
+            failLogCount += 1
+            if failLogCount <= 3 || failLogCount % 90 == 0 {
+                StreamDecoder.dlog("JPEG 解码失败 bytes=\(data.count) 累计=\(failLogCount)")
+            }
+            return nil
+        }
+        let width = cgImage.width
+        let height = cgImage.height
+        if nv == nil || bgra == nil ||
+            CVPixelBufferGetWidth(nv!) != width || CVPixelBufferGetHeight(nv!) != height {
+            var newNV: CVPixelBuffer?
+            var newBGRA: CVPixelBuffer?
+            // 属性传 nil：普通内存，不要 IOSurface（这台越狱机上带 IOSurface 属性每帧都创建失败）
+            let nvStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                               kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, nil, &newNV)
+            let bgStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
+                                               kCVPixelFormatType_32BGRA, nil, &newBGRA)
+            if nvStatus != kCVReturnSuccess || bgStatus != kCVReturnSuccess {
+                StreamDecoder.dlog("缓冲创建状态 NV12=\(nvStatus) BGRA=\(bgStatus) \(width)x\(height)")
+            }
+            nv = newNV
+            bgra = newBGRA
+        }
+        guard let buffer = nv, let bgra else { return nil }
+
+        // 第一步：JPEG 的像素画进 BGRA 缓冲（纯 CPU，不碰 GPU）
+        CVPixelBufferLockBaseAddress(bgra, [])
+        if let base = CVPixelBufferGetBaseAddress(bgra),
+           let ctx = CGContext(data: base, width: width, height: height, bitsPerComponent: 8,
+                               bytesPerRow: CVPixelBufferGetBytesPerRow(bgra),
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                   | CGBitmapInfo.byteOrder32Little.rawValue) {
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        CVPixelBufferUnlockBaseAddress(bgra, [])
+
+        // 第二步：BGRA → NV12 全范围（系统自带的像素转换服务）
+        if transfer == nil {
+            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transfer)
+        }
+        var convertStatus: OSStatus = -1
+        if let transfer {
+            convertStatus = VTPixelTransferSessionTransferImage(transfer, from: bgra, to: buffer)
+        }
+        if convertStatus != noErr {
+            failLogCount += 1
+            if failLogCount <= 3 || failLogCount % 90 == 0 {
+                StreamDecoder.dlog("像素转换失败 status=\(convertStatus)，改用软件转换")
+            }
+            softwareContext.render(CIImage(cvPixelBuffer: bgra), to: buffer,
+                                   bounds: CGRect(x: 0, y: 0, width: width, height: height),
+                                   colorSpace: CGColorSpaceCreateDeviceRGB())
+        }
+        return buffer
+    }
+}
+
 final class StreamDecoder {
     static let logPath = "/var/mobile/Media/DCIM/.dec.log"
     private var softwareDecoder: UnsafeMutableRawPointer?
@@ -273,6 +356,8 @@ final class StreamDecoder {
     // OpenH264 只在解码器初始化时补一次 SPS/PPS。
     // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
     private var openH264NeedsParameterSets = true
+    private var openH264ErrorStreak = 0
+    private var openH264ErrorTotal = 0
     private var vtAttrVariant = 0
     private var lastVTRetryAt: Double = 0   // AUXRETRY: 软解时每隔一会儿自动试着切回硬解
     // 防重建（AUXNOTHRASH）：偶发的单帧 -12911 不再整条推倒重建解码器。
@@ -290,6 +375,7 @@ final class StreamDecoder {
     private let pacerLock = NSLock()
     private var pacerQueue: [CVImageBuffer] = []
     private var pacerPrimed = false
+    private var pacerHoldTicks = 0
     private var pacerTimer: DispatchSourceTimer?
     private var pacerTicks = 0
     private var pacerUnderflow = 0
@@ -299,12 +385,17 @@ final class StreamDecoder {
     // MJPEG 路径：系统硬件 JPEG 解码 + Core Image GPU 转 NV12（全范围）
     // 注意：这里不再创建 GPU 的 CIContext —— 它在 App 一启动（成员初始化）时就去建 GPU 上下文，
     // 这台越狱机上建不起来会空指针段错误，App 必闪退。改成：ImageIO 解 JPEG → BGRA 中转 → 系统像素转换成 NV12。
-    private var jpegPixelBuffer: CVPixelBuffer?
-    private var jpegBGRABuffer: CVPixelBuffer?
-    private var jpegTransfer: VTPixelTransferSession?
-    // 只在像素转换失败时才用的兜底：纯 CPU 软件渲染，lazy 保证平时不创建
-    private lazy var jpegSoftwareContext = CIContext(options: [.useSoftwareRenderer: true])
-    private var jpegFrameCount: Int64 = 0
+    // CPU 解码工人：jpegMainWorker 只在 self.queue 上用（硬件还可能可用时的单线程路径）；
+    // 确认硬件不可用后改用 jpegWorkers 两个并行工人。
+    private let jpegMainWorker = JPEGCPUWorker(label: "auxcam.jpeg.main")
+    private let jpegWorkers = [JPEGCPUWorker(label: "auxcam.jpeg.0"), JPEGCPUWorker(label: "auxcam.jpeg.1")]
+    private var jpegWorkerBusy = [false, false]     // 受 jpegPendingLock 保护
+    private var jpegCPUOnly = false                 // 受 jpegPendingLock 保护：true=走并行 CPU 工人
+    private var jpegSeqIn: Int64 = 0                // 受 jpegPendingLock 保护：收到的帧序号
+    private var jpegQueueSeq: Int64 = 0             // 只在 self.queue 上用：当前单线程路径正在解的帧序号
+    private let jpegPublishLock = NSLock()
+    private var jpegLastPublishedSeq: Int64 = 0     // 受 jpegPublishLock 保护：并行解完的帧按序号发布，晚到的旧帧丢掉
+    private var jpegFrameCount: Int64 = 0           // 受 jpegPublishLock 保护
     private var jpegEntered: Int64 = 0
     // 硬件 JPEG 解码（VideoToolbox）：JPEG 直接解成 NV12，省掉 CPU 上的解码、BGRA 中转和颜色转换。
     // 失败会自动退回下面原来的 ImageIO 路径，所以最坏情况也只是和现在一样。
@@ -315,13 +406,18 @@ final class StreamDecoder {
     private var jpegVTFailStreak = 0
     private var jpegVTDisabled = false
     private var jpegVTDisabledAt: Double = 0   // 硬解被临时关掉的时刻：冷却一段时间后自动再试一次
+    private var jpegVTCooldown: Double = 15     // 冷却时长，连续失败会翻倍(上限 300 秒)
+    private var jpegVTRetrying = false          // 当前是冷却后的重试：失败 1 次就立刻退回 CPU
+    private var jpegVTEverWorked = false        // 本次运行硬件 JPEG 是否成功过
+    private var jpegVTGiveUps = 0
+    private var jpegVTPermanentlyOff = false    // 从没成功过且反复失败：本次运行不再试（实测这台机一直 -12911）
     private var jpegVTCount: Int64 = 0
     private let jpegVTLock = NSLock()
     private var jpegVTOutput: CVPixelBuffer?
     private var jpegVTStatus: OSStatus = noErr
     // 背压：解码来不及时只保留最新一帧，旧帧直接丢，防止帧排队把内存撑爆被系统杀掉。
     private let jpegPendingLock = NSLock()
-    private var jpegPending: Data?
+    private var jpegPending: (Data, Int64)?
     private var jpegDraining = false
     private let goldenDiffLock = NSLock()
     private var goldenFormatFields: [String: String]?
@@ -329,12 +425,16 @@ final class StreamDecoder {
     private static var buildCount: Int = 0
     private static var feedCount: Int = 0
     private static let runID = String(UUID().uuidString.prefix(8))
-    // 背压（AUXBP-H264）：解码来不及时只保留最新一帧，旧帧直接丢。
-    // 收网络数据的线程(VCU1Receiver)调 feed 后立刻返回，永不被解码拖住 ——
-    // 这样手机解码变慢时也不会停止读 socket，电脑端就不会被 TCP 反压（不再出现“发给手机 1.4 秒”）。
+    // 背压（AUXBP-H264 v2）：收网络线程调 feed 后立刻返回，永不被解码拖住（电脑端不会被 TCP 反压）。
+    // ⚠️ H.264 的 P 帧依赖前一帧，绝不能"只留最新一帧"随便丢 —— 丢一帧参考链就断，
+    // 下一帧必然解码失败 → 一直黑到下一个关键帧（实测日志：关键帧间隔 30 秒+，整段没画面）。
+    // 所以改成有序队列：正常情况下一帧不丢；真积压超过上限才整段丢弃并跳到下一个关键帧（丢在 GOP 边界，解码不会坏）。
     private let h264PendingLock = NSLock()
-    private var h264Pending: (Data, Bool)?
+    private var h264Pending: [(Data, Bool)] = []
     private var h264Draining = false
+    private var h264SkipToIDR = false
+    private var h264Dropped = 0
+    private static let h264MaxPending = 20   // 约 0.66 秒（30fps）。足够吸收试硬解/建会话时那 100ms 左右的停顿
 
     deinit {
         if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
@@ -362,6 +462,7 @@ final class StreamDecoder {
     }
 
     func setConfig(sps: Data, pps: Data) {
+        clearPendingH264()   // 旧配置下排着的帧不能拿新 SPS/PPS 去解
         queue.sync {
             let changed = (sps != self.sps || pps != self.pps)
             self.sps = sps
@@ -641,29 +742,65 @@ final class StreamDecoder {
     }
 
     func feed(_ raw: Data, keyframe: Bool) {
-        // 只保留最新一帧，旧的未解码帧直接丢（至多排 1 帧，不会无限堆积、也不占内存）。
-        // 关键：这里不再用 queue.sync 等解码完成 —— 收网络线程立刻返回，解码慢也不卡收包。
+        // 关键：这里不用 queue.sync 等解码完成 —— 收网络线程立刻返回，解码慢也不卡收包。
+        // 电脑端的 keyframe 标志可能不准，只认数据里真正的 IDR(类型 5)，免得把 P 帧当关键帧、误丢它前面的帧。
+        let isIDR = Self.containsIDR(raw)
+        var droppedNow = 0
         h264PendingLock.lock()
-        h264Pending = (raw, keyframe)
+        if isIDR {
+            // 关键帧之前排着的旧帧可以安全丢掉（关键帧不依赖它们）。只在已经积压时丢，平时照常按顺序解。
+            if h264Pending.count >= 2 { droppedNow = h264Pending.count; h264Pending.removeAll() }
+            h264SkipToIDR = false
+            h264Pending.append((raw, keyframe))
+        } else if h264SkipToIDR {
+            droppedNow = 1                  // 正在等关键帧：这一段的 P 帧解了也是坏的
+        } else if h264Pending.count >= Self.h264MaxPending {
+            // 解码持续跟不上：整段丢弃，直接跳到下一个关键帧，避免延迟越积越大
+            droppedNow = h264Pending.count + 1
+            h264Pending.removeAll()
+            h264SkipToIDR = true
+        } else {
+            h264Pending.append((raw, keyframe))
+        }
+        h264Dropped += droppedNow
+        let totalDropped = h264Dropped
         let alreadyDraining = h264Draining
-        if !alreadyDraining { h264Draining = true }
+        if !alreadyDraining && !h264Pending.isEmpty { h264Draining = true }
+        let shouldStart = !alreadyDraining && !h264Pending.isEmpty
         h264PendingLock.unlock()
-        if alreadyDraining { return }      // 已有人在解码，新帧放着等它回头来取
-        queue.async { [weak self] in self?.drainH264() }
+        if droppedNow > 0 && (totalDropped <= droppedNow || totalDropped % 300 < droppedNow) {
+            StreamDecoder.dlog("解码积压，丢弃 \(droppedNow) 帧(累计 \(totalDropped))，从下一个关键帧继续")
+        }
+        if shouldStart { queue.async { [weak self] in self?.drainH264() } }
     }
 
     private func drainH264() {
         while true {
             h264PendingLock.lock()
-            guard let next = h264Pending else {
+            guard !h264Pending.isEmpty else {
                 h264Draining = false
                 h264PendingLock.unlock()
                 return
             }
-            h264Pending = nil
+            let next = h264Pending.removeFirst()
             h264PendingLock.unlock()
             autoreleasepool { decode(next.0, keyframe: next.1) }
         }
+    }
+
+    private func clearPendingH264() {
+        h264PendingLock.lock()
+        h264Pending.removeAll()
+        h264SkipToIDR = false
+        h264PendingLock.unlock()
+    }
+
+    // 快速判断这包里有没有 IDR(类型 5) 切片
+    private static func containsIDR(_ data: Data) -> Bool {
+        for range in splitAnnexBRanges(data) where range.lowerBound < data.count {
+            if data[range.lowerBound] & 0x1F == 5 { return true }
+        }
+        return false
     }
 
     private func setWaitingForKeyframe(_ value: Bool) {
@@ -690,6 +827,7 @@ final class StreamDecoder {
         pacerLock.lock()
         pacerQueue.removeAll()
         pacerPrimed = false
+        pacerHoldTicks = 0
         pacerLock.unlock()
     }
 
@@ -728,9 +866,17 @@ final class StreamDecoder {
         if pacerQueue.isEmpty {
             pacerUnderflow += 1
             pacerPrimed = false
+            pacerHoldTicks = 0
         } else {
             if !pacerPrimed && pacerQueue.count >= pacerTargetDepth { pacerPrimed = true }
+            // 低帧率源(或电脑刚停推)时可能一直凑不够 2 张，旧逻辑会把这 1 张永远扣着不放。
+            // 等满 3 拍(约 100ms)还凑不齐，就直接放出去。
+            if !pacerPrimed {
+                pacerHoldTicks += 1
+                if pacerHoldTicks >= 3 { pacerPrimed = true }
+            }
             if pacerPrimed {
+                pacerHoldTicks = 0
                 while pacerQueue.count > pacerTargetDepth + 1 {
                     pacerQueue.removeFirst()
                     pacerOverflow += 1
@@ -1112,11 +1258,19 @@ final class StreamDecoder {
             StreamDecoder.dlog("OpenH264 decode #\(decodeCallCount) result=\(result) output=\(unmanagedImage != nil) idr=\(hasIDR)")
         }
         if result < 0 {
-            setWaitingForKeyframe(true)
-            if decodeCallCount <= 5 || decodeCallCount % 90 == 0 {
-                StreamDecoder.dlog("OpenH264 failed result=\(result) bytes=\(accessUnit.count) idr=\(hasIDR)")
+            // 旧逻辑：失败一次就 setWaitingForKeyframe(true)，把之后所有帧丢到下一个关键帧为止。
+            // 实测关键帧间隔 30 秒+ → 一次小错就整段黑屏。OpenH264 开了错误隐藏(ERROR_CON_SLICE_COPY)，
+            // 继续喂后面的帧它能自己恢复，所以这里只记数，不再等关键帧。
+            openH264ErrorStreak += 1
+            openH264ErrorTotal += 1
+            if openH264ErrorStreak <= 3 || openH264ErrorTotal % 90 == 0 {
+                StreamDecoder.dlog("OpenH264 failed result=\(result) bytes=\(accessUnit.count) idr=\(hasIDR) 连续=\(openH264ErrorStreak) 累计=\(openH264ErrorTotal)")
             }
             return
+        }
+        if openH264ErrorStreak > 0 {
+            StreamDecoder.dlog("OpenH264 恢复出图(之前连续失败 \(openH264ErrorStreak) 帧)")
+            openH264ErrorStreak = 0
         }
         if hasIDR { setWaitingForKeyframe(false) }
         if let image = unmanagedImage?.takeRetainedValue() {
@@ -1265,15 +1419,10 @@ final class StreamDecoder {
             return false
         }
         jpegVTFailStreak = 0
-        let published = auxcam_publish_shared_frame(output)
-        if published == 1 {
-            jpegFrameCount += 1
-            if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
-                StreamDecoder.dlog("MJPEG 硬解帧 #\(jpegFrameCount) \(width)x\(height) bytes=\(data.count)")
-            }
-        } else if jpegFrameCount <= 3 || jpegEntered % 90 == 0 {
-            StreamDecoder.dlog("MJPEG 硬解发布失败 rc=\(published)")
-        }
+        jpegVTRetrying = false
+        jpegVTEverWorked = true
+        jpegVTCooldown = 15
+        publishJPEG(output, seq: jpegQueueSeq, kind: "硬解", bytes: data.count)
         return true
     }
 
@@ -1285,46 +1434,129 @@ final class StreamDecoder {
             jpegVTSession = nil
             jpegVTFormat = nil
         }
-        if jpegVTFailStreak >= 3 {
+        // 冷却后的重试只给 1 次机会（原来每次重试都要连败 3 次，约 0.1 秒，画面会顿一下）
+        if jpegVTFailStreak >= 3 || jpegVTRetrying {
             jpegVTDisabled = true
+            jpegVTRetrying = false
             jpegVTDisabledAt = CFAbsoluteTimeGetCurrent()
-            StreamDecoder.dlog("JPEG硬解: 连续失败，暂时改用 CPU 路径（ImageIO），稍后自动再试硬件")
+            if !jpegVTEverWorked {
+                jpegVTGiveUps += 1
+                jpegVTCooldown = min(jpegVTCooldown * 2, 300)   // 15→30→60…，别每 15 秒顿一次
+            }
+            // 本次运行从没成功过、一上来就连败：这台机硬件 JPEG 不可用（所有历史日志里一次都没成功过），
+            // 直接固定走 CPU，并切到两个工人并行解，不再反复试（每次试失败都会让画面顿 0.1 秒）。
+            if !jpegVTEverWorked && jpegVTGiveUps >= 1 {
+                jpegVTPermanentlyOff = true
+                jpegPendingLock.lock()
+                jpegCPUOnly = true
+                jpegPendingLock.unlock()
+                StreamDecoder.dlog("JPEG硬解: 本机硬件 JPEG 解码不可用，本次运行固定走 CPU，切换为 \(jpegWorkers.count) 线程并行解码")
+            } else {
+                StreamDecoder.dlog("JPEG硬解: 连续失败，暂时改用 CPU 路径（ImageIO），\(Int(jpegVTCooldown)) 秒后再试硬件")
+            }
         }
     }
 
     // MARK: - MJPEG 路径（CPU 回退：ImageIO 解码 + 系统像素转换）
     func feedJPEG(_ data: Data) {
+        // JPEG 每张独立，丢旧帧不会坏画面：永远只留最新一帧，防止排队把内存撑爆、延迟越积越大。
         jpegPendingLock.lock()
-        jpegPending = data                 // 永远只留最新一帧
-        let alreadyDraining = jpegDraining
-        if !alreadyDraining { jpegDraining = true }
+        jpegSeqIn += 1
+        jpegPending = (data, jpegSeqIn)
+        var startWorker = -1
+        var startMain = false
+        if jpegCPUOnly {
+            // 并行模式：有空闲工人就叫一个起来取这帧；都在忙就放着，谁先忙完谁来取
+            if let idle = jpegWorkerBusy.firstIndex(of: false) {
+                jpegWorkerBusy[idle] = true
+                startWorker = idle
+            }
+        } else if !jpegDraining {
+            jpegDraining = true
+            startMain = true
+        }
         jpegPendingLock.unlock()
-        if alreadyDraining { return }      // 已经有人在解码，新帧放着，等它回头来取
-        queue.async { [weak self] in self?.drainJPEG() }
+        if startMain {
+            queue.async { [weak self] in self?.drainJPEG() }
+        } else if startWorker >= 0 {
+            let worker = jpegWorkers[startWorker]
+            worker.queue.async { [weak self] in self?.drainJPEGWorker(startWorker) }
+        }
     }
 
+    // 单线程路径（硬件 JPEG 还可能可用时）：在 self.queue 上跑
     private func drainJPEG() {
         while true {
             jpegPendingLock.lock()
-            guard let next = jpegPending else {
+            guard !jpegCPUOnly, let next = jpegPending else {
                 jpegDraining = false
+                let handOff = jpegCPUOnly && jpegPending != nil
+                var idle = -1
+                if handOff, let i = jpegWorkerBusy.firstIndex(of: false) {
+                    jpegWorkerBusy[i] = true
+                    idle = i
+                }
+                jpegPendingLock.unlock()
+                // 刚切到并行模式、还有帧没人取：交给并行工人
+                if idle >= 0 {
+                    jpegWorkers[idle].queue.async { [weak self] in self?.drainJPEGWorker(idle) }
+                }
+                return
+            }
+            jpegPending = nil
+            jpegPendingLock.unlock()
+            jpegQueueSeq = next.1
+            autoreleasepool { decodeJPEG(next.0) }
+        }
+    }
+
+    // 并行路径：每个工人在自己的队列上跑，各用各的缓冲
+    private func drainJPEGWorker(_ index: Int) {
+        let worker = jpegWorkers[index]
+        while true {
+            jpegPendingLock.lock()
+            guard let next = jpegPending else {
+                jpegWorkerBusy[index] = false
                 jpegPendingLock.unlock()
                 return
             }
             jpegPending = nil
             jpegPendingLock.unlock()
-            autoreleasepool { decodeJPEG(next) }
+            autoreleasepool {
+                if let buffer = worker.convert(next.0) {
+                    publishJPEG(buffer, seq: next.1, kind: "CPU并行", bytes: next.0.count)
+                }
+            }
+        }
+    }
+
+    // 按帧序号发布：两个工人并行时，晚解完的旧帧直接丢，画面不会倒退
+    private func publishJPEG(_ buffer: CVPixelBuffer, seq: Int64, kind: String, bytes: Int) {
+        jpegPublishLock.lock()
+        defer { jpegPublishLock.unlock() }
+        guard seq > jpegLastPublishedSeq else { return }
+        let published = auxcam_publish_shared_frame(buffer)
+        if published == 1 {
+            jpegLastPublishedSeq = seq
+            jpegFrameCount += 1
+            if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
+                StreamDecoder.dlog("MJPEG 帧(\(kind)) #\(jpegFrameCount) 收到序号=\(seq) \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) bytes=\(bytes)")
+            }
+        } else if jpegFrameCount <= 3 || seq % 90 == 0 {
+            StreamDecoder.dlog("MJPEG 发布失败(\(kind)) rc=\(published)")
         }
     }
 
     private func decodeJPEG(_ data: Data) {
         jpegEntered += 1
         if jpegEntered <= 3 || jpegEntered % 150 == 0 {
-            StreamDecoder.dlog("decodeJPEG 进入 #\(jpegEntered) bytes=\(data.count) 已发布=\(jpegFrameCount)")
+            jpegPublishLock.lock(); let publishedSoFar = jpegFrameCount; jpegPublishLock.unlock()
+            StreamDecoder.dlog("decodeJPEG 进入 #\(jpegEntered) bytes=\(data.count) 已发布=\(publishedSoFar)")
         }
         // 硬解被临时关掉后，冷却 15 秒自动再试一次：避免偶发的一帧失败把整场都压到 CPU 上。
-        if jpegVTDisabled, CFAbsoluteTimeGetCurrent() - jpegVTDisabledAt > 15 {
+        if jpegVTDisabled, !jpegVTPermanentlyOff, CFAbsoluteTimeGetCurrent() - jpegVTDisabledAt > jpegVTCooldown {
             jpegVTDisabled = false
+            jpegVTRetrying = true
             jpegVTFailStreak = 0
             StreamDecoder.dlog("JPEG硬解: 冷却结束，重新尝试硬件解码")
         }
@@ -1338,81 +1570,9 @@ final class StreamDecoder {
            decodeJPEGHardware(data, width: probeWidth, height: probeHeight) {
             return
         }
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(
-                source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
-            if jpegFrameCount == 0 || jpegFrameCount % 90 == 0 {
-                StreamDecoder.dlog("JPEG 解码失败 bytes=\(data.count)")
-            }
-            return
-        }
-        let width = cgImage.width
-        let height = cgImage.height
-        if jpegPixelBuffer == nil || jpegBGRABuffer == nil ||
-            CVPixelBufferGetWidth(jpegPixelBuffer!) != width ||
-            CVPixelBufferGetHeight(jpegPixelBuffer!) != height {
-            var nv: CVPixelBuffer?
-            var bg: CVPixelBuffer?
-            // 属性传 nil：和 OpenH264Bridge.c 里已验证可用的建法一致（普通内存，不要 IOSurface）。
-            // 上一版带 IOSurface 属性，在这台越狱机上每帧都创建失败。
-            let nvStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                               kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                               nil, &nv)
-            let bgStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                               kCVPixelFormatType_32BGRA,
-                                               nil, &bg)
-            if nvStatus != kCVReturnSuccess || bgStatus != kCVReturnSuccess {
-                if jpegEntered <= 3 || jpegEntered % 150 == 0 {
-                    StreamDecoder.dlog("缓冲创建状态 NV12=\(nvStatus) BGRA=\(bgStatus) \(width)x\(height)")
-                }
-            }
-            jpegPixelBuffer = nv
-            jpegBGRABuffer = bg
-        }
-        guard let buffer = jpegPixelBuffer, let bgra = jpegBGRABuffer else {
-            if jpegEntered <= 3 || jpegEntered % 150 == 0 {
-                StreamDecoder.dlog("MJPEG 缓冲创建失败 \(width)x\(height)")
-            }
-            return
-        }
-
-        // 第一步：JPEG 的像素画进 BGRA 缓冲（纯 CPU，不碰 GPU）
-        CVPixelBufferLockBaseAddress(bgra, [])
-        if let base = CVPixelBufferGetBaseAddress(bgra),
-           let ctx = CGContext(data: base, width: width, height: height, bitsPerComponent: 8,
-                               bytesPerRow: CVPixelBufferGetBytesPerRow(bgra),
-                               space: CGColorSpaceCreateDeviceRGB(),
-                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                   | CGBitmapInfo.byteOrder32Little.rawValue) {
-            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        CVPixelBufferUnlockBaseAddress(bgra, [])
-
-        // 第二步：BGRA → NV12 全范围（系统自带的像素转换服务）
-        if jpegTransfer == nil {
-            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault,
-                                         pixelTransferSessionOut: &jpegTransfer)
-        }
-        var convertStatus: OSStatus = -1
-        if let transfer = jpegTransfer {
-            convertStatus = VTPixelTransferSessionTransferImage(transfer, from: bgra, to: buffer)
-        }
-        if convertStatus != noErr {
-            if jpegFrameCount == 0 || jpegFrameCount % 90 == 0 {
-                StreamDecoder.dlog("像素转换失败 status=\(convertStatus)，改用软件转换")
-            }
-            jpegSoftwareContext.render(CIImage(cvPixelBuffer: bgra), to: buffer,
-                                       bounds: CGRect(x: 0, y: 0, width: width, height: height),
-                                       colorSpace: CGColorSpaceCreateDeviceRGB())
-        }
-        let published = auxcam_publish_shared_frame(buffer)
-        if published == 1 {
-            jpegFrameCount += 1
-            if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
-                StreamDecoder.dlog("MJPEG 帧 #\(jpegFrameCount) \(width)x\(height) bytes=\(data.count)")
-            }
-        } else if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
-            StreamDecoder.dlog("MJPEG 发布失败 rc=\(published)")
+        // CPU 路径（单线程，硬件还可能可用的阶段）：和并行工人用同一份转换代码
+        if let buffer = jpegMainWorker.convert(data) {
+            publishJPEG(buffer, seq: jpegQueueSeq, kind: "CPU", bytes: data.count)
         }
     }
 

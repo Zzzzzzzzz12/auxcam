@@ -396,6 +396,8 @@ static void *ReaderThread(void *arg) {
                     size_t yStride = slot->yStride, uvStride = slot->uvStride;
                     size_t frameBytes = slot->frameBytes;
                     BOOL valid = width > 0 && height > 0 &&
+                        // 高度上限必须和 App 写入端(OpenH264Bridge.c)一致放到 4096：
+                        // 原来这里还是 2160，竖屏高素材(1080x2274 等)App 能发布、插件却当 invalid 全丢 → 没画面。
                         width <= 4096 && height <= 4096 && !(width & 1) && !(height & 1) &&
                         yStride >= width && uvStride >= width &&
                         frameBytes >= yStride * height + uvStride * (height / 2) &&
@@ -422,6 +424,8 @@ static void *ReaderThread(void *arg) {
                         valid = NO;
                     }
                     // 撕裂检测：拷贝期间写者是否换了帧或换了活动槽
+                    // 先上读屏障：保证上面 memcpy 的读取不会被 CPU 重排到下面复查 sequence 之后（ARM 弱内存序）
+                    __atomic_thread_fence(__ATOMIC_ACQUIRE);
                     uint64_t seqAfter = __atomic_load_n(&header->sequence, __ATOMIC_ACQUIRE);
                     uint32_t activeAfter = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
                     BOOL torn = (seqAfter != sequence) || (activeAfter != index);
