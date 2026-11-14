@@ -1,6 +1,7 @@
 // AuxCamStream - replaces the camera output with the shared NV12 frames decoded by the App.
 // The App receives and decodes the PC video; this plugin only reads the latest NV12 frame and swaps the camera sample.
 // Config: /var/mobile/Media/DCIM/stream.cfg  active=1 enables replacement; active=0 passes the real camera through.
+// If the App stops sending frames, the last frame is held (the real camera is only shown again when active=0).
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
@@ -23,7 +24,11 @@
 static NSString *const kConfPath = @"/var/mobile/Media/DCIM/stream.cfg";
 static const char *kFramePath = "/var/mobile/Media/DCIM/.frame.ring";
 static NSString *const kBeatPath = @"/var/mobile/Media/DCIM/.auxcam-stream-heartbeat";
-static NSString *const kLogPath  = @"/var/mobile/Media/DCIM/.auxcam-stream.log";
+#ifndef AUX_PLUGIN_LOG_PATH
+#define AUX_PLUGIN_LOG_PATH "/var/mobile/Media/DCIM/.auxcam-stream.log"   // 电脑上测试时可以换路径
+#endif
+static NSString *const kLogPath  = @AUX_PLUGIN_LOG_PATH;
+static const off_t kLogMaxBytes = 4 * 1024 * 1024;   // 日志超过 4MB 就换新文件，旧的只留一份（.1）
 
 static int gActive = 0;
 static pthread_mutex_t gFrameMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -37,16 +42,24 @@ static const size_t kFrameMapBytes = sizeof(AuxSharedFrameHeader) +
     (size_t)AUX_SHARED_FRAME_SLOT_COUNT * AUX_SHARED_FRAME_SLOT_CAPACITY;
 
 
+static pthread_mutex_t gLogLock = PTHREAD_MUTEX_INITIALIZER;
 static void SLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
+    pthread_mutex_lock(&gLogLock);
+    struct stat st;
+    if (stat(kLogPath.UTF8String, &st) == 0 && st.st_size > kLogMaxBytes) {
+        NSString *old = [kLogPath stringByAppendingString:@".1"];
+        rename(kLogPath.UTF8String, old.UTF8String);   // 覆盖掉更旧的那份，总共最多约 8MB
+    }
     FILE *f = fopen(kLogPath.UTF8String, "a");
     if (f) {
         NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], s];
         fputs(line.UTF8String, f);
         fclose(f);
     }
+    pthread_mutex_unlock(&gLogLock);
 }
 
 static void SetLastFrame(CVPixelBufferRef frame) {
@@ -317,17 +330,88 @@ static BOOL Blit(CVPixelBufferRef src, CVPixelBufferRef dst, uint64_t gen) {
 // ---------- hook ----------
 static IMP gOrigEmit = NULL;
 
+// 诊断：替换一帧相机画面要花多久（这一步在相机自己的线程里做，太慢会拖慢相机出帧 → 画面卡）。
+// 每 300 次替换写一行：平均/最大耗时、超过 15ms 的次数、最慢那次的目标尺寸。
+static pthread_mutex_t gBlitDiagLock = PTHREAD_MUTEX_INITIALIZER;
+static int gBlitN = 0, gBlitSlow = 0;
+static double gBlitSum = 0, gBlitMax = 0, gBlitWindowStart = 0;
+static size_t gBlitMaxW = 0, gBlitMaxH = 0;
+
+static void NoteBlitTime(double seconds, CVPixelBufferRef dst) {
+    pthread_mutex_lock(&gBlitDiagLock);
+    double now = MonotonicSeconds();
+    if (gBlitWindowStart == 0) gBlitWindowStart = now;
+    gBlitN++;
+    gBlitSum += seconds;
+    if (seconds > 0.015) gBlitSlow++;
+    if (seconds > gBlitMax) {
+        gBlitMax = seconds;
+        gBlitMaxW = CVPixelBufferGetWidth(dst);
+        gBlitMaxH = CVPixelBufferGetHeight(dst);
+    }
+    if (gBlitN >= 300) {
+        double span = now - gBlitWindowStart;
+        SLog(@"blit diag: n=%d perSec=%.1f avgMs=%.1f maxMs=%.1f (%zux%zu) over15ms=%d",
+             gBlitN, span > 0 ? gBlitN / span : 0.0, gBlitSum / gBlitN * 1000.0, gBlitMax * 1000.0,
+             gBlitMaxW, gBlitMaxH, gBlitSlow);
+        gBlitN = 0; gBlitSlow = 0; gBlitSum = 0; gBlitMax = 0; gBlitWindowStart = now;
+    }
+    pthread_mutex_unlock(&gBlitDiagLock);
+}
+
+// 把一帧相机画面涂成黑色（Y 全黑，UV 中性灰）。只处理 NV12（420f / 420v），其它格式不动。
+static pthread_mutex_t gBlackLogLock = PTHREAD_MUTEX_INITIALIZER;
+static int gBlackCount = 0;
+static void FillBlack(CVPixelBufferRef dst) {
+    OSType f = CVPixelBufferGetPixelFormatType(dst);
+    BOOL full = f == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    if (!full && f != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) return;
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return;
+    uint8_t *y = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+    uint8_t *uv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+    size_t yRow = CVPixelBufferGetBytesPerRowOfPlane(dst, 0), uvRow = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+    size_t yH = CVPixelBufferGetHeightOfPlane(dst, 0), uvH = CVPixelBufferGetHeightOfPlane(dst, 1);
+    if (y && uv) {
+        memset(y, full ? 0 : 16, yRow * yH);
+        memset(uv, 128, uvRow * uvH);
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    pthread_mutex_lock(&gBlackLogLock);
+    gBlackCount++;
+    if (gBlackCount == 1 || gBlackCount % 300 == 0)
+        SLog(@"replacement on but no PC frame yet: output black (not the real camera), count=%d", gBlackCount);
+    pthread_mutex_unlock(&gBlackLogLock);
+}
+
+// 心跳窗口计数：最近这 150 个相机帧里，有多少帧真的换成了电脑画面（App 用它判断"插件是否真在工作"）
+static int gWinCamera = 0, gWinReplaced = 0;
+
 static void AuxEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sb) {
-    if (__atomic_load_n(&gActive, __ATOMIC_ACQUIRE) && sb) {
+    CVPixelBufferRef dst = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
+    if (__atomic_load_n(&gActive, __ATOMIC_ACQUIRE) && dst) {   // 只管带画面的帧（不带画面的数据原样放行）
         gFrames++;
-        CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(sb);
+        gWinCamera++;
         uint64_t srcGen = 0;
         CVPixelBufferRef src = CopyLastFrame(&srcGen);
-        if (dst && src && Blit(src, dst, srcGen)) gCopied++;
+        if (src) {
+            double blitT0 = MonotonicSeconds();
+            if (Blit(src, dst, srcGen)) {
+                gCopied++;
+                gWinReplaced++;
+                NoteBlitTime(MonotonicSeconds() - blitT0, dst);
+            }
+        } else {
+            // 替换已打开，但还没有电脑画面（电脑没开始推 / App 没打开 / 相机进程刚重启）：
+            // 输出黑屏，绝不把真实相机画面放出去。
+            FillBlack(dst);
+        }
         if (src) CVPixelBufferRelease(src);
-        if ((gFrames % 150) == 0) {
-            NSString *beat = [NSString stringWithFormat:@"camera=%d replaced=%d received=%d time=%@\n",
-                              gFrames, gCopied, gDecoded, [NSDate date]];
+        if (gWinCamera >= 150) {
+            NSString *beat = [NSString stringWithFormat:@"camera=%d replaced=%d total=%d received=%d process=%@ time=%@\n",
+                              gWinCamera, gWinReplaced, gFrames, gDecoded,
+                              [[NSProcessInfo processInfo] processName], [NSDate date]];
+            gWinCamera = 0;
+            gWinReplaced = 0;
             [beat writeToFile:kBeatPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
     }
@@ -367,12 +451,9 @@ static void *ReaderThread(void *arg) {
         @autoreleasepool {
             if (!__atomic_load_n(&gActive, __ATOMIC_ACQUIRE)) {
                 ClearLastFrame();
-                if (gFrameMap != MAP_FAILED) {
-                    AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)gFrameMap;
-                    lastSequence = __atomic_load_n(&header->sequence, __ATOMIC_ACQUIRE);
-                } else {
-                    lastSequence = 0;
-                }
+                // 关着时把"已读到哪一帧"清零：一打开替换，马上读共享内存里现有的最新一帧，
+                // 不用干等下一张新画面（电脑那一刻刚好没发新画面时，也不会露出真相机）。
+                lastSequence = 0;
                 lastFrameAt = 0;
                 usleep(100 * 1000);
                 continue;
@@ -436,7 +517,7 @@ static void *ReaderThread(void *arg) {
                         SetLastFrame(pb);
                         gDecoded++;
                         lastFrameAt = MonotonicSeconds();
-                        if (gDecoded <= 3 || (gDecoded % 90) == 0)
+                        if (gDecoded <= 3 || (gDecoded % 1800) == 0)   // 开头 3 张 + 之后每分钟一行
                             SLog(@"shared frame received #%d %zux%zu skipped=%llu torn=%llu invalid=%llu copyMaxMs=%.1f",
                                  gDecoded, width, height, (unsigned long long)diagSkipped,
                                  (unsigned long long)diagCasFail, (unsigned long long)diagInvalid, diagCopyMax * 1000.0);
@@ -448,10 +529,11 @@ static void *ReaderThread(void *arg) {
                     lastSequence = sequence;
                 }
             }
+            // 画面中断（电脑停推 / WiFi 卡住 / App 被杀）：保持最后一张画面，绝不自动露出真相机。
+            // 只有用户在 App 里关掉替换（active=0）才切回真相机。
             if (lastFrameAt > 0 && MonotonicSeconds() - lastFrameAt > 1.5) {
-                ClearLastFrame();
                 lastFrameAt = 0;
-                SLog(@"shared frame stalled, passing through the real camera");
+                SLog(@"shared frame stalled > 1.5s: holding the last frame (real camera stays hidden)");
             }
         }
         usleep(1000);
@@ -460,7 +542,11 @@ static void *ReaderThread(void *arg) {
 }
 
 __attribute__((constructor)) static void AuxCamStreamInit(void) {
-    SLog(@"shared-memory replacement plugin loaded (process %@)", [[NSProcessInfo processInfo] processName]);
+    // 只在系统相机进程里工作（applecamerad / cameracaptured）。
+    // 就算被误注入到别的进程（任何 App），也立刻返回、什么都不做：不钩任何东西、不开线程、不写文件。
+    NSString *proc = [[NSProcessInfo processInfo] processName];
+    if (![proc isEqualToString:@"applecamerad"] && ![proc isEqualToString:@"cameracaptured"]) return;
+    SLog(@"shared-memory replacement plugin loaded (process %@)", proc);
     LoadConf();
     pthread_t t;
     pthread_create(&t, NULL, ReaderThread, NULL);

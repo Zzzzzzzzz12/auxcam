@@ -1,5 +1,7 @@
-# AuxCamPC.py -- Windows (also runs on Mac) desktop app: capture the OBS Virtual Camera and push it to the phone over USB.
-# No iproxy needed: the sender talks to the Apple USB service directly (HOST = "usb").
+# AuxCamPC.py -- Windows (also runs on Mac) desktop app: capture the OBS Virtual Camera and push it to the phone.
+# USB: no iproxy needed, the sender talks to the Apple USB service directly (HOST = "usb").
+# Network (WiFi or a wired network adapter on the phone): type the phone's IP shown in the AuxCam App
+# (turn on "允许网络连接" there first).
 import json, os, queue, re, runpy, shutil, subprocess, sys, threading, time
 
 APP_NAME = 'AuxCam 电脑端'
@@ -86,7 +88,8 @@ def friendly(line):
     if low.startswith('connected'):
         return 'ok', '已连上手机'
     if low.startswith('waiting phone'):
-        if 'no iphone' in low:
+        if 'timed out' in low or 'unreachable' in low or 'no route' in low:
+            return 'warn', '连不上手机的网络地址：检查手机和电脑是不是连同一个路由器、IP 有没有填对、App 里"允许网络连接"是否打开'
             return 'warn', '没找到手机：请插好 USB 线、解锁手机、点“信任”'
         if 'refused port' in low:
             return 'warn', '手机已连上，但 AuxCam 没打开：请先打开手机上的 AuxCam'
@@ -125,13 +128,13 @@ def open_apple_store():
         webbrowser.open('https://apps.microsoft.com/search?query=Apple%20Devices')
 
 
-def sender_args(camera, enc, mbps):
+def sender_args(camera, enc, mbps, host='usb'):
     sender = find_sender()
     if FROZEN:
         base = [sys.executable, '--sender']
     else:
         base = [sys.executable, '-u', sender]
-    return base + ['usb', '28765', 'cam:' + camera, 'high', '', '', str(mbps)]
+    return base + [host, '28765', 'cam:' + camera, 'high', '', '', str(mbps)]
 
 
 def kill_tree(proc):
@@ -161,7 +164,7 @@ def main():
     import tkinter as tk
     from tkinter import ttk
 
-    cfg = {'camera': 'OBS Virtual Camera', 'enc': '自动', 'mbps': '25'}
+    cfg = {'camera': 'OBS Virtual Camera', 'enc': '自动', 'mbps': '15', 'link': 'USB 数据线', 'ip': ''}
     try:
         cfg.update(json.load(open(CFG_PATH, encoding='utf-8')))
     except Exception:
@@ -169,7 +172,7 @@ def main():
 
     root = tk.Tk()
     root.title(APP_NAME)
-    root.geometry('480x560')
+    root.geometry('480x640')
     root.resizable(False, False)
     pad = {'padx': 14}
 
@@ -188,10 +191,21 @@ def main():
     ttk.Combobox(box, textvariable=enc_var, width=32, state='readonly',
                  values=['自动', 'NVIDIA 显卡', 'Intel 核显', 'AMD 显卡', 'CPU（吃性能）']).grid(row=1, column=1, padx=4)
     ttk.Label(box, text='画质(码率)').grid(row=2, column=0, sticky='w', padx=8, pady=6)
+    if str(cfg['mbps']) not in ('10', '12', '15', '20'):
+        cfg['mbps'] = '15'          # 旧版默认 25：手机解码吃力，换成 15
     mbps_var = tk.StringVar(value=str(cfg['mbps']))
     ttk.Combobox(box, textvariable=mbps_var, width=32, state='readonly',
-                 values=['10', '15', '20', '25', '30']).grid(row=2, column=1, padx=4)
-    ttk.Label(box, text='Mbps，默认 25 就够，不用动', foreground='#777').grid(row=3, column=1, sticky='w', padx=4, pady=(0, 6))
+                 values=['10', '12', '15', '20']).grid(row=2, column=1, padx=4)
+    ttk.Label(box, text='Mbps，默认 15：1080 很清楚，手机也解得动', foreground='#777').grid(row=3, column=1, sticky='w', padx=4, pady=(0, 6))
+    ttk.Label(box, text='连接方式').grid(row=4, column=0, sticky='w', padx=8, pady=6)
+    NET = '网络（WiFi / 有线网卡）'
+    link_var = tk.StringVar(value=NET if cfg.get('link') in ('WiFi', NET) else 'USB 数据线')
+    ttk.Combobox(box, textvariable=link_var, width=32, state='readonly',
+                 values=['USB 数据线', NET]).grid(row=4, column=1, padx=4)
+    ttk.Label(box, text='手机 IP').grid(row=5, column=0, sticky='w', padx=8, pady=6)
+    ip_var = tk.StringVar(value=cfg.get('ip', ''))
+    ttk.Entry(box, textvariable=ip_var, width=34).grid(row=5, column=1, padx=4)
+    ttk.Label(box, text='选"网络"时才要填：看手机 AuxCam 设置里显示的地址', foreground='#777').grid(row=6, column=1, sticky='w', padx=4, pady=(0, 6))
 
     status_var = tk.StringVar(value='未开始')
     status_lbl = tk.Label(root, textvariable=status_var, font=('Microsoft YaHei UI', 12, 'bold'),
@@ -231,7 +245,11 @@ def main():
         if not st['ff']:
             set_status('bad', '没找到 ffmpeg：请把 ffmpeg.exe 放在本程序同一个文件夹')
             return
-        cams = list_cameras(st['ff'])
+        # Listing devices runs ffmpeg and can take seconds: do it in the background so the window never freezes.
+        ff = st['ff']
+        threading.Thread(target=lambda: q.put(('cams', list_cameras(ff), None)), daemon=True).start()
+
+    def apply_cams(cams):
         cam_box['values'] = cams
         if cams and cam_var.get() not in cams:
             pick = [c for c in cams if 'obs' in c.lower()]
@@ -243,8 +261,8 @@ def main():
 
     def reader(proc):
         for raw in iter(proc.stdout.readline, ''):
-            q.put(('line', raw.rstrip()))
-        q.put(('exit', proc.wait()))
+            q.put(('line', raw.rstrip(), proc))
+        q.put(('exit', proc.wait(), proc))
 
     def start():
         if not find_sender():
@@ -261,12 +279,18 @@ def main():
         env = dict(os.environ, AUX_FFMPEG=ff, PYTHONIOENCODING='utf-8', PYTHONUNBUFFERED='1')
         enc = {'自动': 'auto', 'NVIDIA 显卡': 'nvenc', 'Intel 核显': 'qsv', 'AMD 显卡': 'amf', 'CPU（吃性能）': 'x264'}.get(enc_var.get(), 'auto')
         env['AUX_ENC'] = enc
+        wifi = link_var.get() != 'USB 数据线'
+        ip = ip_var.get().strip()
+        if wifi and not re.match(r'^\d{1,3}(\.\d{1,3}){3}$', ip):
+            set_status('bad', '请填手机的 IP 地址（手机 AuxCam 设置里打开"允许网络连接"后会显示）')
+            return
         try:
-            json.dump({'camera': cam, 'enc': enc_var.get(), 'mbps': mbps_var.get()}, open(CFG_PATH, 'w', encoding='utf-8'))
+            json.dump({'camera': cam, 'enc': enc_var.get(), 'mbps': mbps_var.get(), 'link': link_var.get(), 'ip': ip},
+                      open(CFG_PATH, 'w', encoding='utf-8'))
         except Exception:
             pass
-        args = sender_args(cam, enc, int(mbps_var.get() or 25))
-        add_log('启动：摄像头=%s 编码=%s 码率=%sM' % (cam, enc_var.get(), mbps_var.get()))
+        args = sender_args(cam, enc, int(mbps_var.get() or 15), ip if wifi else 'usb')
+        add_log('启动：摄像头=%s 编码=%s 码率=%sM 连接=%s' % (cam, enc_var.get(), mbps_var.get(), ip if wifi else 'USB'))
         try:
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
                                     errors='replace', env=env, creationflags=NOWIN,
@@ -275,7 +299,6 @@ def main():
             set_status('bad', '启动失败：%s' % e)
             return
         st['proc'], st['running'] = proc, True
-        st['last_ok'] = 0.0
         threading.Thread(target=reader, args=(proc,), daemon=True).start()
         btn.config(text='停止推流', bg='#d9534f', activebackground='#b94441')
         set_status('warn', '正在启动…')
@@ -299,12 +322,14 @@ def main():
     btn.config(command=toggle)
 
     def poll():
-        # 推流程序还活着，但超过 4 秒没有新的统计行 = 画面卡住了（比如手机端停止读取），不能继续显示“正常”
-        if st['running'] and st['last_ok'] and time.time() - st['last_ok'] > 4:
-            set_status('warn', '画面卡住了（4 秒没有新数据），正在等待重连…')
         try:
             while True:
-                kind, val = q.get_nowait()
+                kind, val, owner = q.get_nowait()
+                if kind == 'cams':
+                    apply_cams(val)
+                    continue
+                if owner is not st['proc']:
+                    continue                # output or exit from a run that was already stopped
                 if kind == 'line':
                     if not val:
                         continue
@@ -313,6 +338,7 @@ def main():
                         fps, gap, late, drop = float(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
                         stats_var.set('帧率 %.0f 帧/秒   最大间隔 %d 毫秒   卡顿 %d 次   丢帧 %d' % (fps, gap, late, drop))
                         st['last_ok'] = time.time()
+                        st['restarts'] = 0          # healthy again: the retry budget starts over
                         if fps >= 25:
                             set_status('ok', '推流中（正常）')
                         else:

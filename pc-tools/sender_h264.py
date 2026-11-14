@@ -1,15 +1,20 @@
 # sender_h264.py -- push an H.264 live stream to the phone (VCU1 over USB/iproxy)
 # ffmpeg encodes and hands the stream over as RTP packets on localhost, so the end of every frame is known EXACTLY
 # (RTP marker bit). Nothing is ever cut in half, and a frame is sent the moment it is complete.
-# Portrait 1080x1920, 30 fps, full range, no B-frames, low latency.
+# Portrait 1080x1920, 30 fps, no B-frames, low latency.
+# CAVLC entropy coding (not CABAC): the phone decodes it in software about 2x faster, same picture quality
+# at this bitrate. Turn it off with AUX_CAVLC=0 only if your encoder refuses it.
 # Usage:
 #   python3 sender_h264.py                      test pattern
+#   python3 sender_h264.py usb 28765 SOURCE     over the USB cable (no iproxy needed)
+#   python3 sender_h264.py 192.168.1.23 28765 SOURCE
+#                                               over WiFi: the phone's IP (shown in the AuxCam App, "允许 WiFi 连接" on)
 #   python3 sender_h264.py HOST PORT SOURCE     SOURCE = video file, or any ffmpeg input URL
 #                                               (e.g. udp://0.0.0.0:5000, srt://..., rtmp://...)
 #   python3 sender_h264.py 127.0.0.1 28765 cam:"OBS Virtual Camera"
 #                                               capture the OBS Virtual Camera directly (Mac: avfoundation, Windows: dshow)
 #   python3 sender_h264.py --list-cameras       list camera names this computer offers
-import base64, os, plistlib, random, re, shutil, socket, struct, subprocess, sys, tempfile, time
+import atexit, base64, os, plistlib, random, re, shutil, socket, struct, subprocess, sys, tempfile, time
 
 if len(sys.argv) > 1 and sys.argv[1] == '--list-cameras':
     _ff = os.environ.get('AUX_FFMPEG') or shutil.which('ffmpeg') or 'ffmpeg'
@@ -25,10 +30,9 @@ SRC = sys.argv[3] if len(sys.argv) > 3 else ''
 PROFILE = sys.argv[4] if len(sys.argv) > 4 else 'high'   # high / main / baseline
 LEVEL = sys.argv[5] if len(sys.argv) > 5 else ''          # e.g. 4.2
 W_ARG = sys.argv[6] if len(sys.argv) > 6 else ''          # optional test size, e.g. 720x1280
-MBPS = int(sys.argv[7]) if len(sys.argv) > 7 else 25       # video bitrate in Mbit/s (USB can take 30+)
+MBPS = int(sys.argv[7]) if len(sys.argv) > 7 else 15       # video bitrate in Mbit/s. 15 = very clean 1080p and easy for the phone
 PRESET = sys.argv[8] if len(sys.argv) > 8 else 'faster'   # x264 speed: veryfast < faster < fast < medium (slower = nicer, more CPU)
 W, H, FPS = 1080, 1920, 30
-SEND_TIMEOUT = 2.0   # seconds a send may stall before we treat the phone as disconnected
 if W_ARG:
     W, H = [int(x) for x in W_ARG.split('x')]
 FF = os.environ.get('AUX_FFMPEG') or shutil.which('ffmpeg') or r'D:\Codex\ivcam\ffmpeg.exe'
@@ -36,6 +40,10 @@ FF = os.environ.get('AUX_FFMPEG') or shutil.which('ffmpeg') or r'D:\Codex\ivcam\
 # AUX_HWDEC = 1 lets ffmpeg decode the SOURCE video with the Mac hardware as well (video files / big streams)
 ENC = os.environ.get('AUX_ENC', 'auto').lower()
 HWDEC = os.environ.get('AUX_HWDEC', '0') == '1'
+CAVLC = os.environ.get('AUX_CAVLC', '1') != '0'
+
+# "fast to decode" switch for each encoder (CAVLC instead of CABAC)
+CAVLC_ARGS = {'vt': ['-coder', 'cavlc'], 'nvenc': ['-coder', 'cavlc'], 'qsv': ['-cavlc', '1'], 'amf': ['-coder', 'cavlc']}
 
 def has_encoder(name):
     try:
@@ -44,11 +52,11 @@ def has_encoder(name):
     except Exception:
         return False
 
-def works(name):
+def works(name, extra=()):
     """ffmpeg lists every encoder it was built with, even without the matching GPU. Really try one tiny encode."""
     try:
         r = subprocess.run([FF, '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=size=640x360:rate=30',
-                            '-frames:v', '3', '-pix_fmt', 'nv12', '-c:v', name, '-f', 'null', '-'],
+                            '-frames:v', '3', '-pix_fmt', 'nv12', '-c:v', name] + list(extra) + ['-f', 'null', '-'],
                            capture_output=True, timeout=30)
         return r.returncode == 0
     except Exception:
@@ -69,7 +77,15 @@ if ENC == 'auto':
         ENC = 'x264'
 _LABEL = {'vt': 'VideoToolbox hardware', 'nvenc': 'NVIDIA NVENC hardware', 'qsv': 'Intel QSV hardware',
           'amf': 'AMD AMF hardware', 'x264': 'x264 software'}
-print('encoder: %s%s' % (_LABEL.get(ENC, ENC), ' + hardware decode' if HWDEC else ''), flush=True)
+# make sure this encoder accepts the CAVLC switch; if not, send CABAC (still works, phone just decodes slower)
+CODER = []
+if CAVLC and ENC in CAVLC_ARGS:
+    if works(HW_NAMES[ENC], CAVLC_ARGS[ENC]):
+        CODER = CAVLC_ARGS[ENC]
+    else:
+        print('note: this encoder refuses CAVLC, sending CABAC (phone decodes slower)', flush=True)
+print('encoder: %s%s  %s  %d Mbps' % (_LABEL.get(ENC, ENC), ' + hardware decode' if HWDEC else '',
+                                     'CAVLC' if (CODER or (CAVLC and ENC == 'x264')) else 'CABAC', MBPS), flush=True)
 
 def packet(ftype, flags, payload, seq, ts):
     return b'VCU1' + struct.pack('>BBHIIQ', 1, ftype, flags, len(payload), seq & 0xFFFFFFFF, ts) + payload
@@ -123,20 +139,20 @@ def start_ffmpeg(port, sdp_path):
         # Standard (limited) range is fine: the phone decoder converts to full range by itself.
         video = ['-vf', size_filter + ',format=nv12',
                  '-c:v', 'h264_videotoolbox', '-profile:v', PROFILE if PROFILE in ('baseline', 'main', 'high') else 'high',
-                 '-realtime', '1', '-allow_sw', '0', '-g', str(FPS), '-bf', '0',
+                 '-realtime', '1', '-allow_sw', '0', '-g', str(FPS), '-bf', '0'] + CODER + [
                  '-b:v', '%dM' % MBPS, '-maxrate', '%dM' % (MBPS * 8 // 7)] + tags
     elif ENC in ('nvenc', 'qsv', 'amf'):
         prof = PROFILE if PROFILE in ('baseline', 'main', 'high') else 'high'
         common = ['-vf', size_filter + ',format=nv12', '-profile:v', prof, '-g', str(FPS), '-bf', '0',
                   '-b:v', '%dM' % MBPS, '-maxrate', '%dM' % (MBPS * 8 // 7), '-bufsize', '%dM' % max(2, MBPS * 2 // 5)]
         if ENC == 'nvenc':
-            video = common[:0] + ['-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'll', '-rc', 'cbr', '-zerolatency', '1',
-                                  '-forced-idr', '1'] + common + tags
+            video = ['-c:v', 'h264_nvenc', '-preset', 'p4', '-tune', 'll', '-rc', 'cbr', '-zerolatency', '1',
+                     '-forced-idr', '1'] + CODER + common + tags
         elif ENC == 'qsv':
-            video = ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-look_ahead', '0', '-forced_idr', '1'] + common + tags
+            video = ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-look_ahead', '0', '-forced_idr', '1'] + CODER + common + tags
         else:
             video = ['-c:v', 'h264_amf', '-usage', 'ultralowlatency', '-quality', 'speed', '-rc', 'cbr',
-                     '-header_insertion_mode', 'idr', '-gops_per_idr', '1'] + common + tags
+                     '-header_insertion_mode', 'idr', '-gops_per_idr', '1'] + CODER + common + tags
     else:
         video = ['-vf', size_filter + ',format=yuvj420p',
                  '-c:v', 'libx264', '-preset', PRESET, '-tune', 'zerolatency',
@@ -144,7 +160,8 @@ def start_ffmpeg(port, sdp_path):
                 (['-level', LEVEL] if LEVEL else []) + \
                 ['-g', str(FPS), '-keyint_min', str(FPS), '-sc_threshold', '0', '-bf', '0',
                  '-b:v', '%dM' % MBPS, '-maxrate', '%dM' % (MBPS * 8 // 7), '-bufsize', '%dM' % max(2, MBPS * 2 // 5)] + tags + \
-                ['-x264-params', 'sliced-threads=0:slices=1:repeat-headers=1:fullrange=on:aud=0:sync-lookahead=0']
+                ['-x264-params', 'sliced-threads=0:slices=1:repeat-headers=1:fullrange=on:aud=0:sync-lookahead=0' +
+                                 (':cabac=0' if CAVLC else '')]
     out = ['-an', '-f', 'rtp', '-sdp_file', sdp_path, 'rtp://127.0.0.1:%d?pkt_size=1400' % port]
     cmd = [FF, '-hide_banner', '-loglevel', 'error'] + inputs + video + out
     return subprocess.Popen(cmd)
@@ -198,12 +215,23 @@ def usb_connect(port):
         raise OSError('phone refused port %d (is AuxCam open?) code=%s' % (port, r.get('Number')))
     return s
 
-def connect():
+def connect(proc):
+    """Keep trying to reach the phone. Gives up (returns None) if ffmpeg has already died, so we never wait forever."""
     while True:
+        if proc.poll() is not None:
+            print('ffmpeg ended', flush=True)
+            return None
         try:
             s = usb_connect(PORT) if HOST == 'usb' else socket.create_connection((HOST, PORT), timeout=5)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(SEND_TIMEOUT)   # 发送卡住超过这个时间就当断线，重连，不再无限阻塞
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # not supported on the Mac USB (unix) socket
+            except OSError:
+                pass
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)   # WiFi: room for short hiccups
+            except OSError:
+                pass
+            s.settimeout(8.0)                              # a phone that stops reading must raise, not hang forever
             print('connected %s:%d' % (HOST, PORT), flush=True)
             return s
         except OSError as e:
@@ -328,7 +356,14 @@ def main():
     us.settimeout(1.0)
     port = us.getsockname()[1]
     proc = start_ffmpeg(port, sdp_path)
-    s = connect()
+    atexit.register(lambda: proc.poll() is None and proc.kill())     # never leave ffmpeg holding the camera
+    def _remove_sdp():                                               # don't leave a temp file behind on every run
+        try: os.remove(sdp_path)
+        except OSError: pass
+    atexit.register(_remove_sdp)
+    s = connect(proc)
+    if s is None:
+        return
     drain(us)
     rtp = RtpFrames()
     drop_rate = float(os.environ.get('AUX_TEST_DROP', '0'))     # test only: randomly lose packets
@@ -384,7 +419,9 @@ def main():
             print('disconnected:', e, '- reconnecting', flush=True)
             try: s.close()
             except OSError: pass
-            s = connect()
+            s = connect(proc)
+            if s is None:
+                return
             drain(us)
             rtp = RtpFrames()                          # fresh state: wait for a new key frame
             config = False; seq = 0

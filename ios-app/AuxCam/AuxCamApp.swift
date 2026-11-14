@@ -1,2880 +1,2141 @@
-// AuxCam v4 手机端 —— 万相同款"智能"版
-// 人只按一下「开始视频直播」，其余全部手机自动：
-//   自动唤醒相机进程 → 自动注入 → 自动进直连 → 断流自动重连 → 卡顿自动换路 → 四态自动显示
+// AuxCam 手机端（整理版 v5）
+//
+// 只做一件事：
+//   电脑发画面（USB 或 WiFi，端口 28765，VCU1 协议）
+//   → 手机解码（视频：硬件能用就用硬件，不能用自动换软件；图片：CPU 两路并行）
+//   → 节拍器排队，按固定节奏放出
+//   → 写进共享内存 /var/mobile/Media/DCIM/.frame.ring
+//   → 相机插件 AuxCamStream（只在系统相机进程里）读取它，把系统相机的画面换掉
+//
+// 和插件的约定（不能改）：
+//   stream.cfg 里 active=1 / 0     打开 / 关闭替换
+//
+// 日志：/var/mobile/Media/DCIM/.dec.log（每 5 秒一行"状态"，排查问题主要看它）
 import SwiftUI
 import AVFoundation
-import AVKit
-import PhotosUI
-import CoreTransferable
-import Foundation
-import Darwin
 import VideoToolbox
-import UniformTypeIdentifiers
-import QuartzCore
+import CoreMedia
+import CoreVideo
 import CoreImage
 import ImageIO
+import UserNotifications
+import Darwin
 import os
+
+let kAppVersion = "整理版 v5（2026-11-13）"
 
 @main
 struct AuxCamApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
+    var body: some Scene {
+        WindowGroup { MainView() }
+    }
 }
 
-// ───────────────────────── 通道层 ─────────────────────────
-struct Link {
-    static var docs: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
-    static var cmdURL: URL { docs.appendingPathComponent("auxcam.cmd") }
-    static var statURL: URL { docs.appendingPathComponent("auxcam.stat") }
-    static var dcimStatURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/auxcam.stat") }
-    static var esURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.h264") }
-    static var streamCfgURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/stream.cfg") }
-    static var vcamURL: URL { URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4") }
-    static var videoURL: URL { docs.appendingPathComponent("picked.mp4") }
+// MARK: - 文件位置
 
-    static func send(_ lines: [String: String]) {
-        var t = ""
-        for (k, v) in lines { t += "\(k)=\(v)\n" }
-        t += "ts=\(Int(Date().timeIntervalSince1970))\n"
-        try? t.write(to: cmdURL, atomically: true, encoding: .utf8)
+enum Paths {
+    static let dcim = "/var/mobile/Media/DCIM"
+    static let log = dcim + "/.dec.log"
+    static let streamCfg = dcim + "/stream.cfg"
+    static let pluginBeat = dcim + "/.auxcam-stream-heartbeat"
+    static let vcamPlist = dcim + "/vcam.plist"
+}
+
+// MARK: - 日志（后台线程写文件，超过 8MB 换新文件，旧的留一份 .dec.log.1）
+
+enum Log {
+    private static let queue = DispatchQueue(label: "auxcam.log", qos: .utility)
+    private static let runID = String(UUID().uuidString.prefix(8))
+    private static var handle: FileHandle?
+    private static var written: UInt64 = 0
+
+    static func write(_ text: String) {
+        let line = String(format: "%.3f [%@] ", Date().timeIntervalSince1970, runID) + text + "\n"
+        queue.async {
+            if handle == nil { open() }
+            guard let handle, let data = line.data(using: .utf8) else { return }
+            do { try handle.write(contentsOf: data) } catch { self.handle = nil; return }
+            written += UInt64(data.count)
+            if written > 8_000_000 { rotate() }
+        }
     }
 
-    static func parse(_ t: String) -> [String: String] {
-        var d: [String: String] = [:]
-        for line in t.split(separator: "\n") {
-            if let i = line.firstIndex(of: "=") {
-                d[String(line[..<i]).trimmingCharacters(in: .whitespaces)] =
-                    String(line[line.index(after: i)...]).trimmingCharacters(in: .whitespaces)
+    private static func open() {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: Paths.log) { fm.createFile(atPath: Paths.log, contents: nil) }
+        handle = FileHandle(forWritingAtPath: Paths.log)
+        written = (try? handle?.seekToEnd()) ?? 0
+    }
+
+    private static func rotate() {
+        try? handle?.close()
+        handle = nil
+        let old = Paths.log + ".1"
+        try? FileManager.default.removeItem(atPath: old)
+        try? FileManager.default.moveItem(atPath: Paths.log, toPath: old)
+        open()
+    }
+}
+
+// MARK: - 统计（各线程往里加数，界面每秒取一次）
+
+final class Stats {
+    struct Snapshot {
+        var recvFrames = 0, recvBytes = 0
+        var decoded = 0, decodeErrors = 0, gopDrops = 0
+        var decodeMsSum = 0.0, decodeMsMax = 0.0
+        var published = 0, publishFail = 0, underflow = 0, overflow = 0
+
+        mutating func merge(_ o: Snapshot) {
+            recvFrames += o.recvFrames; recvBytes += o.recvBytes
+            decoded += o.decoded; decodeErrors += o.decodeErrors; gopDrops += o.gopDrops
+            decodeMsSum += o.decodeMsSum; decodeMsMax = max(decodeMsMax, o.decodeMsMax)
+            published += o.published; publishFail += o.publishFail
+            underflow += o.underflow; overflow += o.overflow
+        }
+    }
+
+    private let lock = NSLock()
+    private var current = Snapshot()
+
+    func add(_ change: (inout Snapshot) -> Void) {
+        lock.lock(); change(&current); lock.unlock()
+    }
+
+    func take() -> Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        let s = current
+        current = Snapshot()
+        return s
+    }
+}
+
+// MARK: - 节拍器（抖动缓冲）
+// 解码好的画面先排队，再按固定节奏一张一张写进共享内存。
+// 电脑 / 网络送画面时快时慢，直接交出去相机里就一顿一顿；排几张队就能抹平。
+// 网络抖得厉害时自动多排一张（最多 8 张，约 0.27 秒），稳定 1 分钟后再慢慢减回来。
+
+final class Pacer {
+    private let stats: Stats
+    private let lock = NSLock()
+    private var queue: [(CVPixelBuffer, Bool)] = []
+    private var primed = false
+    private var holdTicks = 0
+    private var catchUpTicks = 0
+    private var timer: DispatchSourceTimer?
+    private let timerQueue = DispatchQueue(label: "auxcam.pacer", qos: .userInteractive)
+
+    private(set) var fps: Double = 30
+    private var minTarget = 2
+    private var target = 2
+    /// 现在缓冲几张（界面显示用）
+    var bufferCount: Int { lock.lock(); defer { lock.unlock() }; return target }
+    private var lastPushAt: Double = 0
+    private var emptySince: Double = 0        // 队列空了的时刻；下一张很快又来了才算"供不上"（电脑停推不算）
+    private var underflowTimes: [Double] = []
+    private var lastUnderflowAt: Double = 0
+    private var arrivals = 0
+    private var windowStart: Double = 0
+    private var windowBroken = false          // 这段时间里断过流（开始/停止/切换），测出来的帧率不算数
+    private var avgInterval = 1.0 / 30        // 最近画面到达的平均间隔（平滑过的）
+    private var fpsMismatchWindows = 0
+    private var latestFrame: (CVPixelBuffer, Bool)?
+
+    init(stats: Stats) { self.stats = stats }
+
+    /// USB 时最少排 2 张，WiFi 时最少排 3 张（WiFi 天生更抖）
+    func setMinimumBuffer(_ n: Int) {
+        lock.lock()
+        minTarget = n
+        if target < n { target = n }
+        lock.unlock()
+    }
+
+    func push(_ buffer: CVPixelBuffer, limitedRange: Bool) {
+        let now = CACurrentMediaTime()
+        lock.lock()
+        queue.append((buffer, limitedRange))
+        if lastPushAt > 0 {
+            let gap = now - lastPushAt
+            if gap > 0.25 { windowBroken = true } else { avgInterval = avgInterval * 0.95 + gap * 0.05 }
+        }
+        lastPushAt = now
+        arrivals += 1
+        var underflow = false
+        if emptySince > 0 {
+            underflow = now - emptySince < 0.5   // 空了一下又马上来了 = 中途断档（相机会重复上一张）
+            emptySince = 0
+            if underflow { noteUnderflow(now) }
+        }
+        let needStart = timer == nil
+        lock.unlock()
+        if underflow { stats.add { $0.underflow += 1 } }
+        if needStart { startTimer() }
+    }
+
+    func reset() {
+        lock.lock()
+        queue.removeAll()
+        primed = false
+        holdTicks = 0
+        lock.unlock()
+    }
+
+    /// 最近放出去的一张（给界面预览用）
+    func latest() -> (CVPixelBuffer, Bool)? {
+        lock.lock(); defer { lock.unlock() }
+        return latestFrame
+    }
+
+    private func startTimer() {
+        lock.lock()
+        if timer != nil { lock.unlock(); return }
+        let t = DispatchSource.makeTimerSource(flags: .strict, queue: timerQueue)
+        t.schedule(deadline: .now(), repeating: .nanoseconds(Int(1_000_000_000 / fps)), leeway: .milliseconds(1))
+        t.setEventHandler { [weak self] in self?.tick() }
+        timer = t
+        windowStart = CACurrentMediaTime()
+        lock.unlock()
+        t.resume()
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+        var out: (CVPixelBuffer, Bool)?
+        var dropped = 0
+        lock.lock()
+        if queue.isEmpty {
+            if primed && emptySince == 0 { emptySince = now }
+            primed = false
+            holdTicks = 0
+        } else {
+            if !primed {
+                if queue.count >= target {
+                    primed = true
+                } else {
+                    holdTicks += 1
+                    if holdTicks >= 3 { primed = true }   // 帧率低、凑不齐时，最多扣 3 拍就放
+                }
             }
+            if primed {
+                holdTicks = 0
+                // 积压了（网络卡一下之后一下子涌进来一堆）：慢慢追，每 5 拍最多丢 1 张，
+                // 画面只是稍微快一点点，不会"跳一下"；积压超过半秒才一次性丢到正常水平。
+                if queue.count > target + 15 {
+                    while queue.count > target + 2 { queue.removeFirst(); dropped += 1 }
+                } else if queue.count > target + 6 {
+                    queue.removeFirst(); dropped += 1     // 来得明显比放得快（比如电脑发 60 帧）：每拍匀着丢 1 张
+                } else if queue.count > target + 2 {
+                    catchUpTicks += 1
+                    if catchUpTicks >= 5 { catchUpTicks = 0; queue.removeFirst(); dropped += 1 }
+                } else {
+                    catchUpTicks = 0
+                }
+                out = queue.removeFirst()
+                latestFrame = out
+            }
+        }
+        if target > minTarget && lastUnderflowAt > 0 && now - lastUnderflowAt > 60 {
+            target -= 1
+            lastUnderflowAt = now
+            Log.write("网络稳定了，缓冲减到 \(target) 张")
+        }
+        var adaptFPS = now - windowStart >= 2.0
+        var measured = 0.0
+        if adaptFPS {
+            measured = Double(arrivals) / (now - windowStart)
+            if windowBroken || now - lastPushAt > 0.25 {
+                adaptFPS = false
+                fpsMismatchWindows = 0
+            }
+            windowBroken = false
+            arrivals = 0
+            windowStart = now
+        }
+        lock.unlock()
+
+        if dropped > 0 { stats.add { $0.overflow += dropped } }
+        if let out {
+            let r = auxcam_publish_frame(out.0, out.1 ? 1 : 0)
+            stats.add { if r == 1 { $0.published += 1 } else { $0.publishFail += 1 } }
+        }
+        if adaptFPS && measured > 5 { adaptRate(measured) }
+    }
+
+    // 在锁里调用
+    private func noteUnderflow(_ now: Double) {
+        // 电脑本来就发得比节拍器慢（比如 25 帧）：这是帧率没对上，不是网络抖，不加缓冲（等帧率自动对上）
+        if 1 / avgInterval < fps - 2 { return }
+        lastUnderflowAt = now
+        underflowTimes.append(now)
+        underflowTimes.removeAll { now - $0 > 10 }
+        if underflowTimes.count >= 2 && target < 8 {
+            target += 1
+            underflowTimes.removeAll()
+            Log.write("画面供不上（网络或解码抖动），缓冲加到 \(target) 张")
+        }
+    }
+
+    /// 电脑发的少于 30 帧（比如 25）时，节拍器跟着改，避免一直"缺一张补一张"
+    private func adaptRate(_ measured: Double) {
+        // 最高 30：相机本身就是 30 帧，电脑发 60 帧也只按 30 帧放（多的匀着丢掉）
+        let standard: [Double] = [15, 20, 24, 25, 30]
+        let nearest = standard.min { abs($0 - measured) < abs($1 - measured) } ?? 30
+        lock.lock()
+        if abs(nearest - fps) < 0.5 || abs(measured - nearest) > 2.5 {
+            fpsMismatchWindows = 0
+            lock.unlock()
+            return
+        }
+        fpsMismatchWindows += 1
+        guard fpsMismatchWindows >= 2, let timer else { lock.unlock(); return }   // 连续 4 秒都对不上才改
+        fpsMismatchWindows = 0
+        fps = nearest
+        target = minTarget
+        underflowTimes.removeAll()
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(Int(1_000_000_000 / nearest)), leeway: .milliseconds(1))
+        lock.unlock()
+        Log.write("电脑帧率约 \(Int(measured.rounded()))，节拍器改为 \(Int(nearest)) 帧/秒")
+    }
+}
+
+// MARK: - H.264 工具
+
+enum H264 {
+    /// 把一帧拆成一个个 NAL（返回每个 NAL 内容所在的范围）。支持 Annex-B（00 00 00 01）和 4 字节长度前缀两种格式。
+    /// 先按"长度前缀"严格试一遍（长度正好首尾相接、每个 NAL 头都合法才算）；不是再按 Annex-B 拆。
+    /// 不能只看开头是不是 00 00 01：长度在 256~511 之间时，长度前缀的开头也恰好是 00 00 01 xx。
+    static func nalUnits(_ data: Data) -> [Range<Int>] {
+        data.withUnsafeBytes { raw -> [Range<Int>] in
+            guard let p = raw.bindMemory(to: UInt8.self).baseAddress, raw.count > 4 else { return [] }
+            let n = raw.count
+            var lengthPrefixed: [Range<Int>] = []
+            var j = 0
+            while j + 4 <= n {
+                let len = Int(p[j]) << 24 | Int(p[j + 1]) << 16 | Int(p[j + 2]) << 8 | Int(p[j + 3])
+                j += 4
+                guard len > 0, j + len <= n, p[j] & 0x80 == 0, (1...23).contains(p[j] & 0x1F) else {
+                    lengthPrefixed = []
+                    break
+                }
+                lengthPrefixed.append(j..<(j + len))
+                j += len
+            }
+            if j == n && !lengthPrefixed.isEmpty { return lengthPrefixed }
+            let annexB = (p[0] == 0 && p[1] == 0 && p[2] == 1) || (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1)
+            if annexB {
+                var starts: [(code: Int, body: Int)] = []
+                var i = 0
+                while i + 2 < n {
+                    if p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1 {
+                        starts.append((i > 0 && p[i - 1] == 0 ? i - 1 : i, i + 3))
+                        i += 3
+                    } else {
+                        i += 1
+                    }
+                }
+                var out: [Range<Int>] = []
+                for k in starts.indices {
+                    let body = starts[k].body
+                    var end = k + 1 < starts.count ? starts[k + 1].code : n
+                    while end > body && p[end - 1] == 0 { end -= 1 }
+                    if end > body { out.append(body..<end) }
+                }
+                return out
+            }
+            return []
+        }
+    }
+
+    static func type(_ data: Data, _ r: Range<Int>) -> UInt8 { data[r.lowerBound] & 0x1F }
+
+    static func containsIDR(_ data: Data) -> Bool {
+        nalUnits(data).contains { type(data, $0) == 5 }
+    }
+
+    /// 这个画面切片是不是 B 帧（slice_type 除以 5 余 1）
+    static func isBSlice(_ data: Data, _ r: Range<Int>) -> Bool {
+        let t = type(data, r)
+        guard t == 1 || t == 5, r.count > 1 else { return false }
+        var reader = BitReader(rbsp: data[(r.lowerBound + 1)..<min(r.upperBound, r.lowerBound + 16)])
+        guard reader.ue() != nil, let sliceType = reader.ue() else { return false }
+        return sliceType % 5 == 1
+    }
+
+    /// 读 PPS 里的 entropy_coding_mode_flag：true = CABAC（解码慢一倍多），false = CAVLC（快）
+    static func ppsUsesCABAC(_ pps: Data) -> Bool? {
+        var reader = BitReader(rbsp: pps.dropFirst())
+        guard reader.ue() != nil, reader.ue() != nil, let flag = reader.bit() else { return nil }
+        return flag == 1
+    }
+
+    struct BitReader {
+        private var bytes: [UInt8] = []
+        private var pos = 0
+        init(rbsp: Data.SubSequence) {
+            var zeros = 0
+            for b in rbsp {   // 去掉防竞争字节 00 00 03
+                if zeros >= 2 && b == 3 { zeros = 0; continue }
+                bytes.append(b)
+                zeros = b == 0 ? zeros + 1 : 0
+            }
+        }
+        mutating func bit() -> Int? {
+            guard pos < bytes.count * 8 else { return nil }
+            let v = Int(bytes[pos / 8] >> (7 - UInt8(pos % 8))) & 1
+            pos += 1
+            return v
+        }
+        mutating func ue() -> Int? {
+            var zeros = 0
+            while let b = bit(), b == 0 { zeros += 1; if zeros > 31 { return nil } }
+            var v = 0
+            for _ in 0..<zeros { guard let b = bit() else { return nil }; v = v << 1 | b }
+            return (1 << zeros) - 1 + v
+        }
+    }
+}
+
+// MARK: - 视频解码
+// 硬件解码（VideoToolbox）能用就用（又快又省电）；第一次失败就换软件解码（OpenH264），本次运行不再来回切。
+// 收到的帧按顺序排队解，不乱丢（H.264 后一帧依赖前一帧）；真积压太多才整段丢到下一个关键帧。
+
+final class VideoDecoder {
+    enum Mode: Int { case auto = 0, software = 1, hardware = 2 }
+    private enum Item { case config(Data, Data), frame(Data) }
+
+    private let pacer: Pacer
+    private let stats: Stats
+    private let queue = DispatchQueue(label: "auxcam.h264", qos: .userInitiated)
+
+    // 排队（收数据线程放、解码线程取）
+    private let pendingLock = NSLock()
+    private var pending: [Item] = []
+    private var pendingFrames = 0
+    private var draining = false
+    private var skipToIDR = false
+    private static let maxPending = 45      // 约 1.5 秒
+    private static let catchUpAtIDR = 8     // 关键帧到来时还积压这么多帧 = 落后了，直接从这个关键帧追上
+
+    // 以下只在 queue 上用
+    private var sps = Data(), pps = Data()
+    private var format: CMVideoFormatDescription?
+    private var limitedRange = false
+    private var mode: Mode
+    private var hardwareBrokenThisRun = false
+    private var vt: VTDecompressionSession?
+    private var soft: UnsafeMutableRawPointer?
+    private var softNeedsParams = true
+    private var softErrorStreak = 0
+    private var hardMissStreak = 0          // 硬件解码"没报错但没出画面"的连续次数
+    private var streamHasB = false          // 码流里出现过 B 帧：软件解码就不能"立刻出画面"，要让解码器按顺序排
+    private var waitIDR = true
+
+    // 给界面看
+    private let infoLock = NSLock()
+    private var _backend = "等待画面"
+    var backend: String { infoLock.lock(); defer { infoLock.unlock() }; return _backend }
+
+    init(pacer: Pacer, stats: Stats, mode: Mode) {
+        self.pacer = pacer
+        self.stats = stats
+        self.mode = mode
+    }
+
+    // ── 收数据线程调用 ──
+
+    func setConfig(sps: Data, pps: Data) {
+        pendingLock.lock()
+        // 旧参数下排着的帧不能拿新参数去解，全部丢掉
+        pending.removeAll()
+        pendingFrames = 0
+        pending.append(.config(sps, pps))
+        skipToIDR = false
+        startDrainLocked()
+        pendingLock.unlock()
+    }
+
+    func feed(_ data: Data) {
+        let isIDR = H264.containsIDR(data)
+        var dropped = 0
+        pendingLock.lock()
+        if isIDR {
+            if pendingFrames >= Self.catchUpAtIDR {
+                dropped = dropFramesLocked()
+            }
+            skipToIDR = false
+            appendFrameLocked(data)
+        } else if skipToIDR {
+            dropped = 1
+        } else if pendingFrames >= Self.maxPending {
+            dropped = dropFramesLocked() + 1
+            skipToIDR = true
+        } else {
+            appendFrameLocked(data)
+        }
+        startDrainLocked()
+        pendingLock.unlock()
+        if dropped > 1 {
+            stats.add { $0.gopDrops += 1 }
+            Log.write("解码跟不上，丢掉积压的 \(dropped) 帧，从关键帧接上")
+        }
+    }
+
+    func setMode(_ m: Mode) {
+        queue.async {
+            self.mode = m
+            self.hardwareBrokenThisRun = false
+            Log.write("解码方式改为：\(["自动", "软件", "硬件"][m.rawValue])")
+            self.rebuild()
+        }
+    }
+
+    private func appendFrameLocked(_ data: Data) {
+        pending.append(.frame(data))
+        pendingFrames += 1
+    }
+
+    private func dropFramesLocked() -> Int {
+        let n = pendingFrames
+        pending.removeAll { if case .frame = $0 { return true } else { return false } }
+        pendingFrames = 0
+        return n
+    }
+
+    private func startDrainLocked() {
+        guard !draining, !pending.isEmpty else { return }
+        draining = true
+        queue.async { self.drain() }
+    }
+
+    private func drain() {
+        while true {
+            pendingLock.lock()
+            guard !pending.isEmpty else {
+                draining = false
+                pendingLock.unlock()
+                return
+            }
+            let item = pending.removeFirst()
+            if case .frame = item { pendingFrames -= 1 }
+            pendingLock.unlock()
+            switch item {
+            case .config(let s, let p): applyConfig(sps: s, pps: p)
+            case .frame(let d): decode(d)
+            }
+        }
+    }
+
+    // ── 以下都在解码线程 ──
+
+    private func applyConfig(sps newSPS: Data, pps newPPS: Data) {
+        guard newSPS.count > 3, newPPS.count > 1 else { return }
+        if newSPS == sps && newPPS == pps && (vt != nil || soft != nil) {
+            waitIDR = true
+            return
+        }
+        sps = newSPS
+        pps = newPPS
+        format = nil
+        streamHasB = false
+        var fmt: CMVideoFormatDescription?
+        let status = sps.withUnsafeBytes { s in
+            pps.withUnsafeBytes { p -> OSStatus in
+                let pointers = [s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!]
+                let sizes = [sps.count, pps.count]
+                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: kCFAllocatorDefault, parameterSetCount: 2, parameterSetPointers: pointers,
+                    parameterSetSizes: sizes, nalUnitHeaderLength: 4, formatDescriptionOut: &fmt)
+            }
+        }
+        var size = "?"
+        if status == noErr, let fmt {
+            format = fmt
+            let full = CMFormatDescriptionGetExtension(fmt, extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool ?? false
+            limitedRange = !full
+            let d = CMVideoFormatDescriptionGetDimensions(fmt)
+            size = "\(d.width)x\(d.height)"
+        } else {
+            limitedRange = false
+        }
+        let profile = sps.count > 1 ? Int(sps[1]) : 0
+        let profileName = [66: "Baseline", 77: "Main", 100: "High"][profile] ?? "profile\(profile)"
+        let cabac = H264.ppsUsesCABAC(pps)
+        let coder = cabac == nil ? "?" : (cabac! ? "CABAC（解码慢）" : "CAVLC（解码快）")
+        Log.write("收到视频参数：\(size) \(profileName) 编码=\(coder) 范围=\(limitedRange ? "窄(会自动拉伸)" : "全") 格式状态=\(status)")
+        if cabac == true {
+            Log.write("提示：电脑端用的是 CABAC 编码，软件解码会慢一倍多。电脑端加 -coder cavlc 可以快很多")
+        }
+        rebuild()
+    }
+
+    private func rebuild() {
+        if let vt { VTDecompressionSessionInvalidate(vt) }
+        vt = nil
+        if let soft { auxh264_destroy(soft) }
+        soft = nil
+        waitIDR = true
+        softErrorStreak = 0
+        guard !sps.isEmpty else { return }
+        let wantHardware = mode == .hardware || (mode == .auto && !hardwareBrokenThisRun)
+        if wantHardware, makeHardware() {
+            setInfo("硬件解码")
+            Log.write("用硬件解码")
+            return
+        }
+        makeSoftware()
+    }
+
+    private func makeHardware() -> Bool {
+        guard let format else { return false }
+        // 只要求像素格式，不要求 IOSurface（这台越狱机上带 IOSurface 要求会失败）
+        let pixelFormat = limitedRange ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        let attrs = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: pixelFormat)] as CFDictionary
+        var session: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: format,
+                                                  decoderSpecification: nil, imageBufferAttributes: attrs,
+                                                  outputCallback: nil, decompressionSessionOut: &session)
+        guard status == noErr, let session else {
+            Log.write("硬件解码建不起来 status=\(status)")
+            return false
+        }
+        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        vt = session
+        return true
+    }
+
+    private func makeSoftware() {
+        soft = auxh264_create()
+        softNeedsParams = true
+        setInfo(soft != nil ? "软件解码" : "软件解码器建不起来")
+        Log.write(soft != nil ? "用软件解码（OpenH264 单线程）" : "软件解码器建不起来")
+    }
+
+    private func decode(_ data: Data) {
+        let nals = H264.nalUnits(data)
+        guard !nals.isEmpty else { return }
+        var hasIDR = false, hasVCL = false
+        var inlineSPS: Data?, inlinePPS: Data?
+        for r in nals {
+            switch H264.type(data, r) {
+            case 5: hasIDR = true; hasVCL = true
+            case 1:
+                hasVCL = true
+                if !streamHasB && H264.isBSlice(data, r) {
+                    streamHasB = true
+                    Log.write("提示：电脑端发的视频带 B 帧，软件解码会多一帧延迟。电脑端把 B 帧设成 0 更好")
+                }
+            case 7: inlineSPS = data.subdata(in: r)
+            case 8: inlinePPS = data.subdata(in: r)
+            default: break
+            }
+        }
+        // 帧里自带参数，且和当前不同（电脑换了分辨率等）→ 当作新参数
+        if let s = inlineSPS, let p = inlinePPS, s != sps || p != pps {
+            applyConfig(sps: s, pps: p)
+        }
+        guard hasVCL else { return }
+        if vt == nil && soft == nil {
+            if sps.isEmpty { return }   // 还没收到参数
+            rebuild()
+        }
+        if waitIDR {
+            guard hasIDR else { return }
+            waitIDR = false
+        }
+        let t0 = CACurrentMediaTime()
+        if vt != nil {
+            switch decodeHardware(data, nals: nals, isIDR: hasIDR) {
+            case .ok:
+                hardMissStreak = 0
+                noteDecoded(t0)
+                return
+            case .noImage where hardMissStreak < 2:
+                hardMissStreak += 1          // 偶尔一帧没出画面：先忍着，连续 3 次才算硬件不行
+                return
+            default:
+                break
+            }
+            hardMissStreak = 0
+            // 硬件不行了：本次运行换成软件，不再来回切（来回切会反复卡顿）
+            hardwareBrokenThisRun = true
+            if let vt { VTDecompressionSessionInvalidate(vt) }
+            vt = nil
+            Log.write("硬件解码失败，换成软件解码（本次运行不再试硬件）")
+            makeSoftware()
+            if !hasIDR { waitIDR = true; return }
+        }
+        decodeSoftware(data, nals: nals, isIDR: hasIDR, t0: t0)
+    }
+
+    private enum HardResult { case ok, noImage, failed }
+
+    private func decodeHardware(_ data: Data, nals: [Range<Int>], isIDR: Bool) -> HardResult {
+        guard let session = vt, let format else { return .failed }
+        var avcc = Data()
+        for r in nals {
+            let t = H264.type(data, r)
+            guard t == 1 || t == 5 else { continue }
+            var len = UInt32(r.count).bigEndian
+            withUnsafeBytes(of: &len) { avcc.append(contentsOf: $0) }
+            avcc.append(data[r])
+        }
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: avcc.count,
+                                                 blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+                                                 dataLength: avcc.count, flags: kCMBlockBufferAssureMemoryNowFlag,
+                                                 blockBufferOut: &block) == noErr, let block else { return .failed }
+        let copied = avcc.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: avcc.count)
+        }
+        guard copied == noErr else { return .failed }
+        var sample: CMSampleBuffer?
+        var sampleSize = avcc.count
+        guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
+                                        sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
+                                        sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
+                                        sampleBufferOut: &sample) == noErr, let sample else { return .failed }
+        var outStatus: OSStatus = -1
+        var outImage: CVImageBuffer?
+        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { st, _, image, _, _ in
+            outStatus = st
+            outImage = image
+        }
+        if status == noErr && outImage == nil && outStatus == -1 {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
+        guard status == noErr, outStatus == noErr else {
+            Log.write("硬件解码这一帧失败 decode=\(status) callback=\(outStatus) 关键帧=\(isIDR)")
+            return .failed
+        }
+        guard let image = outImage else {
+            Log.write("硬件解码这一帧没出画面 关键帧=\(isIDR)")
+            return .noImage
+        }
+        pacer.push(image, limitedRange: limitedRange)
+        return .ok
+    }
+
+    private func decodeSoftware(_ data: Data, nals: [Range<Int>], isIDR: Bool, t0: Double) {
+        guard let soft else { return }
+        // OpenH264 吃 Annex-B。参数集只在解码器刚建好时补一次（每帧都补它会判坏帧，实测）。
+        var input = Data()
+        if softNeedsParams {
+            let hasParams = nals.contains { H264.type(data, $0) == 7 }
+            if !hasParams {
+                input.append(contentsOf: [0, 0, 0, 1]); input.append(sps)
+                input.append(contentsOf: [0, 0, 0, 1]); input.append(pps)
+            }
+            softNeedsParams = false
+        }
+        // 只送到这一帧最后一个画面 NAL 为止：有的电脑端会把"下一个关键帧的参数"粘在这一帧末尾，
+        // OpenH264 见到会把这一帧吞掉（实测每个关键帧前丢 1 帧）。参数前面已经处理过，这里不用送。
+        let lastVCL = nals.lastIndex { let t = H264.type(data, $0); return t == 1 || t == 5 } ?? (nals.count - 1)
+        for r in nals[...lastVCL] {
+            input.append(contentsOf: [0, 0, 0, 1])
+            input.append(data[r])
+        }
+        var out: Unmanaged<CVPixelBuffer>?
+        let result = input.withUnsafeBytes { raw -> Int32 in
+            auxh264_decode(soft, raw.bindMemory(to: UInt8.self).baseAddress, Int32(raw.count), streamHasB ? 0 : 1, &out)
+        }
+        if result < 0 {
+            softErrorStreak += 1
+            stats.add { $0.decodeErrors += 1 }
+            if softErrorStreak == 1 || softErrorStreak % 30 == 0 {
+                Log.write("软件解码出错 result=\(result) 连续=\(softErrorStreak)")
+            }
+            if softErrorStreak >= 30 {   // 连续 1 秒都在错：重建解码器，从下个关键帧重来
+                Log.write("软件解码连续出错，重建解码器")
+                if let s = self.soft { auxh264_destroy(s) }
+                self.soft = nil
+                makeSoftware()
+                softErrorStreak = 0
+                waitIDR = true
+            }
+            return
+        }
+        softErrorStreak = 0
+        if let image = out?.takeRetainedValue() {
+            pacer.push(image, limitedRange: limitedRange)
+            noteDecoded(t0)
+        }
+    }
+
+    private func noteDecoded(_ t0: Double) {
+        let ms = (CACurrentMediaTime() - t0) * 1000
+        stats.add {
+            $0.decoded += 1
+            $0.decodeMsSum += ms
+            $0.decodeMsMax = max($0.decodeMsMax, ms)
+        }
+    }
+
+    private func setInfo(_ backend: String) {
+        infoLock.lock(); _backend = backend; infoLock.unlock()
+    }
+}
+
+// MARK: - 图片（MJPEG）解码：兼容旧的电脑端
+// 本机硬件 JPEG 解码一直用不了，全靠 CPU：两个工人同时解，来不及时只解最新的。
+
+final class JPEGWorker {
+    let queue: DispatchQueue
+    private var pool: CVPixelBufferPool?
+    private var poolW = 0, poolH = 0
+    private var bgra: CVPixelBuffer?
+    private var transfer: VTPixelTransferSession?
+    private lazy var softwareContext = CIContext(options: [.useSoftwareRenderer: true])
+    private var failCount = 0
+
+    init(label: String) { queue = DispatchQueue(label: label, qos: .userInitiated) }
+
+    deinit { if let transfer { VTPixelTransferSessionInvalidate(transfer) } }
+
+    private func outputBuffer(_ w: Int, _ h: Int) -> CVPixelBuffer? {
+        if pool == nil || poolW != w || poolH != h {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                kCVPixelBufferWidthKey as String: NSNumber(value: w),
+                kCVPixelBufferHeightKey as String: NSNumber(value: h)
+            ]
+            var p: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                    [kCVPixelBufferPoolMinimumBufferCountKey as String: NSNumber(value: 8)] as CFDictionary,
+                                    attrs as CFDictionary, &p)
+            pool = p; poolW = w; poolH = h
+        }
+        var out: CVPixelBuffer?
+        if let pool, CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &out) == kCVReturnSuccess { return out }
+        CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, nil, &out)
+        return out
+    }
+
+    /// 只能在自己的 queue 上调用。返回一张新的 NV12（全范围）画面。
+    func convert(_ data: Data) -> CVPixelBuffer? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
+            failCount += 1
+            if failCount <= 3 || failCount % 90 == 0 { Log.write("图片解不开 bytes=\(data.count) 累计=\(failCount)") }
+            return nil
+        }
+        let w = image.width & ~1, h = image.height & ~1
+        guard w > 0, h > 0 else { return nil }
+        if bgra == nil || CVPixelBufferGetWidth(bgra!) != w || CVPixelBufferGetHeight(bgra!) != h {
+            var b: CVPixelBuffer?
+            CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, nil, &b)
+            bgra = b
+        }
+        guard let bgra, let out = outputBuffer(w, h) else { return nil }
+        CVPixelBufferLockBaseAddress(bgra, [])
+        if let base = CVPixelBufferGetBaseAddress(bgra),
+           let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                               bytesPerRow: CVPixelBufferGetBytesPerRow(bgra), space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) {
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        CVPixelBufferUnlockBaseAddress(bgra, [])
+        if transfer == nil { VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transfer) }
+        var st: OSStatus = -1
+        if let transfer { st = VTPixelTransferSessionTransferImage(transfer, from: bgra, to: out) }
+        if st != noErr {
+            softwareContext.render(CIImage(cvPixelBuffer: bgra), to: out,
+                                   bounds: CGRect(x: 0, y: 0, width: w, height: h), colorSpace: CGColorSpaceCreateDeviceRGB())
+        }
+        return out
+    }
+}
+
+final class JPEGDecoder {
+    private let pacer: Pacer
+    private let stats: Stats
+    private let workers = [JPEGWorker(label: "auxcam.jpeg.0"), JPEGWorker(label: "auxcam.jpeg.1")]
+    private let lock = NSLock()
+    private var busy = [false, false]
+    private var waiting: (Data, Int64)?
+    private var seqIn: Int64 = 0
+    private var lastOut: Int64 = 0
+    private var announced = false
+
+    init(pacer: Pacer, stats: Stats) {
+        self.pacer = pacer
+        self.stats = stats
+    }
+
+    /// 最近 2 秒内收到过图片 = 现在是图片模式
+    var isActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return CACurrentMediaTime() - lastFeedAt < 2
+    }
+    private var lastFeedAt: Double = 0
+
+    func feed(_ data: Data) {
+        lock.lock()
+        lastFeedAt = CACurrentMediaTime()
+        if !announced { announced = true; Log.write("收到图片（MJPEG）画面，用 CPU 两路解码") }
+        seqIn += 1
+        let job = (data, seqIn)
+        if let idle = busy.firstIndex(of: false) {
+            busy[idle] = true
+            lock.unlock()
+            run(idle, job)
+        } else {
+            waiting = job   // 两个工人都在忙：只留最新一张，旧的丢掉
+            lock.unlock()
+        }
+    }
+
+    private func run(_ index: Int, _ first: (Data, Int64)) {
+        let worker = workers[index]
+        worker.queue.async {
+            var job: (Data, Int64)? = first
+            while let current = job {
+                let (data, seq) = current
+                let t0 = CACurrentMediaTime()
+                let image = worker.convert(data)
+                self.lock.lock()
+                let fresh = seq > self.lastOut
+                if image != nil && fresh { self.lastOut = seq }
+                job = self.waiting
+                self.waiting = nil
+                if job == nil { self.busy[index] = false }
+                self.lock.unlock()
+                if let image, fresh {   // 两路并行，晚解完的旧图丢掉，保证顺序
+                    self.pacer.push(image, limitedRange: false)
+                    let ms = (CACurrentMediaTime() - t0) * 1000
+                    self.stats.add { $0.decoded += 1; $0.decodeMsSum += ms; $0.decodeMsMax = max($0.decodeMsMax, ms) }
+                } else if image == nil {
+                    self.stats.add { $0.decodeErrors += 1 }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 手机的网络地址
+
+enum Net {
+    /// 手机在局域网里的地址：en0 = WiFi，其它 en* = 插的有线网卡（通过转换器）
+    static func addresses() -> [(kind: String, ip: String)] {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return [] }
+        defer { freeifaddrs(list) }
+        var result: [(kind: String, ip: String)] = []
+        for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            guard let sa = p.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
+                  (p.pointee.ifa_flags & UInt32(IFF_UP)) != 0 else { continue }
+            let name = String(cString: p.pointee.ifa_name)
+            guard name.hasPrefix("en") else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: host)
+            if ip.hasPrefix("169.254.") { continue }   // 没拿到正常地址
+            result.append((name == "en0" ? "WiFi" : "有线", ip))
+        }
+        return result.sorted { $0.kind == "有线" && $1.kind != "有线" }   // 有线排前面（更稳）
+    }
+}
+
+// MARK: - 接收电脑数据（端口 28765，VCU1 协议，和以前完全一样）
+// 包 = 24 字节头 + 内容。头："VCU1" + 版本(1) + 类型(1) + flags(2) + 长度(4) + 序号(4) + 时间戳(8)，大端。
+// 类型：1 = 视频参数（AVCC） 2 = 视频帧（flags bit0 = 关键帧） 5 = 心跳 10 = 图片（整张 JPEG）
+// 8 秒收不到任何数据就当断开。新连接来了会顶掉旧连接。
+
+final class Receiver {
+    static let port: UInt16 = 28765
+
+    var onConfig: ((Data, Data) -> Void)?
+    var onVideo: ((Data) -> Void)?
+    var onJPEG: ((Data) -> Void)?
+    var onState: ((Bool, String) -> Void)?
+
+    private let stats: Stats
+    private let lock = NSLock()
+    private var generation = 0
+    private var clientFD: Int32 = -1
+    private var clientIP = ""
+
+    init(stats: Stats) { self.stats = stats }
+
+    /// 开始（或重新开始）监听。allowWiFi=false 时只接受 USB（本机 127.0.0.1）。
+    func start(allowWiFi: Bool) {
+        lock.lock()
+        generation += 1
+        let gen = generation
+        if !allowWiFi && clientFD >= 0 && clientIP != "127.0.0.1" {
+            shutdown(clientFD, SHUT_RDWR)   // 关掉 WiFi 时把正在用 WiFi 的连接断开
+        }
+        lock.unlock()
+        let t = Thread { [weak self] in self?.acceptLoop(gen, allowWiFi) }
+        t.name = "auxcam.accept"
+        t.qualityOfService = .userInitiated
+        t.start()
+    }
+
+    private func isCurrent(_ gen: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return gen == generation
+    }
+
+    private func makeListener(_ allowWiFi: Bool) -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return -1 }
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = Receiver.port.bigEndian
+        addr.sin_addr.s_addr = allowWiFi ? 0 : inet_addr("127.0.0.1")
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard ok == 0, listen(fd, 8) == 0 else {
+            close(fd)
+            return -1
+        }
+        return fd
+    }
+
+    private func acceptLoop(_ gen: Int, _ allowWiFi: Bool) {
+        var fd: Int32 = -1
+        for _ in 0..<100 {   // 上一个监听可能还没完全关掉，最多重试 10 秒
+            guard isCurrent(gen) else { return }
+            fd = makeListener(allowWiFi)
+            if fd >= 0 { break }
+            usleep(100_000)
+        }
+        guard fd >= 0 else {
+            Log.write("端口 28765 打不开 errno=\(errno)")
+            onState?(false, "端口打不开")
+            return
+        }
+        Log.write("开始等电脑连接：端口 28765（\(allowWiFi ? "USB + WiFi" : "只接受 USB")）")
+        defer { close(fd) }
+        while isCurrent(gen) {
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            guard poll(&pfd, 1, 500) > 0 else { continue }
+            var addr = sockaddr_in()
+            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let c = withUnsafeMutablePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &len) }
+            }
+            guard c >= 0 else { continue }
+            let ip = String(cString: inet_ntoa(addr.sin_addr))
+            lock.lock()
+            let old = clientFD
+            clientFD = c
+            clientIP = ip
+            lock.unlock()
+            if old >= 0 { shutdown(old, SHUT_RDWR) }   // 新连接顶掉旧连接
+            let t = Thread { [weak self] in self?.serve(c, ip) }
+            t.name = "auxcam.recv"
+            t.qualityOfService = .userInteractive
+            t.start()
+        }
+    }
+
+    private func recvAll(_ fd: Int32, _ p: UnsafeMutableRawPointer, _ n: Int) -> Bool {
+        var got = 0
+        while got < n {
+            let r = recv(fd, p + got, n - got, 0)
+            if r > 0 { got += r; continue }
+            if r < 0 && errno == EINTR { continue }
+            return false
+        }
+        return true
+    }
+
+    private func serve(_ fd: Int32, _ ip: String) {
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+        var rcvbuf: Int32 = 4 << 20
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: 8, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let peer = ip == "127.0.0.1" ? "USB" : "\(Receiver.linkKind(fd)) \(ip)"
+        Log.write("电脑连上了：\(peer)")
+        onState?(true, peer)
+
+        var header = [UInt8](repeating: 0, count: 24)
+        var reason = "电脑断开，或 8 秒没收到数据"
+        while true {
+            guard header.withUnsafeMutableBytes({ recvAll(fd, $0.baseAddress!, 24) }) else { break }
+            guard header[0] == 0x56, header[1] == 0x43, header[2] == 0x55, header[3] == 0x31, header[4] == 1 else {
+                reason = "数据格式不对（不是 VCU1）"
+                break
+            }
+            let type = header[5]   // 头里的 flags（关键帧标记）不用：直接看数据里有没有关键帧，更可靠
+            let len = Int(header[8]) << 24 | Int(header[9]) << 16 | Int(header[10]) << 8 | Int(header[11])
+            guard len >= 0, len <= 16 << 20 else { reason = "包太大 len=\(len)"; break }
+            var payload = Data(count: len)
+            if len > 0 {
+                guard payload.withUnsafeMutableBytes({ recvAll(fd, $0.baseAddress!, len) }) else { break }
+            }
+            stats.add { $0.recvBytes += 24 + len }
+            switch type {
+            case 1:
+                if let params = Receiver.parseAVCC(payload) { onConfig?(params.0, params.1) }
+            case 2:
+                stats.add { $0.recvFrames += 1 }
+                onVideo?(payload)
+            case 10:
+                stats.add { $0.recvFrames += 1 }
+                onJPEG?(payload)
+            default:
+                break   // 5 = 心跳；其它类型忽略
+            }
+        }
+        lock.lock()
+        let wasCurrent = clientFD == fd
+        if wasCurrent { clientFD = -1; clientIP = "" }
+        lock.unlock()
+        close(fd)
+        Log.write("电脑断开（\(peer)）：\(reason)")
+        if wasCurrent { onState?(false, "") }
+    }
+
+    /// 这条连接是从手机哪个网口进来的：WiFi 还是有线网卡
+    static func linkKind(_ fd: Int32) -> String {
+        var addr = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let ok = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        guard ok == 0 else { return "网络" }
+        let local = String(cString: inet_ntoa(addr.sin_addr))
+        return Net.addresses().first { $0.ip == local }?.kind ?? "网络"
+    }
+
+    /// AVCDecoderConfigurationRecord → (SPS, PPS)
+    static func parseAVCC(_ d: Data) -> (Data, Data)? {
+        let b = [UInt8](d)
+        guard b.count > 7, b[0] == 1 else { return nil }
+        var i = 5
+        var sps = Data(), pps = Data()
+        let numSPS = Int(b[i] & 0x1F); i += 1
+        for _ in 0..<numSPS {
+            guard i + 2 <= b.count else { return nil }
+            let l = Int(b[i]) << 8 | Int(b[i + 1]); i += 2
+            guard i + l <= b.count else { return nil }
+            if sps.isEmpty { sps = Data(b[i..<(i + l)]) }
+            i += l
+        }
+        guard i < b.count else { return nil }
+        let numPPS = Int(b[i] & 0x1F); i += 1
+        for _ in 0..<numPPS {
+            guard i + 2 <= b.count else { return nil }
+            let l = Int(b[i]) << 8 | Int(b[i + 1]); i += 2
+            guard i + l <= b.count else { return nil }
+            if pps.isEmpty { pps = Data(b[i..<(i + l)]) }
+            i += l
+        }
+        return sps.isEmpty || pps.isEmpty ? nil : (sps, pps)
+    }
+}
+
+// MARK: - 总控：把上面几块接起来，并给界面提供状态
+
+final class Engine: ObservableObject {
+    static let shared = Engine()
+
+    // 界面显示
+    @Published var connected = false
+    @Published var peer = ""
+    @Published var inFPS = 0.0
+    @Published var mbps = 0.0
+    @Published var decoderName = "等待画面"
+    @Published var decodeMs = 0.0
+    @Published var outFPS = 0.0
+    @Published var bufferTarget = 2
+    @Published var pluginWorking = false
+    @Published var pluginText = "—"
+    @Published var preview: CGImage?
+    @Published var phoneAddresses: [String] = []           // 例如 ["有线 192.168.1.50", "WiFi 192.168.1.23"]
+    @Published var keepAliveOK = true                      // 后台保活（静音循环播放）是否正常
+    @Published var phoneWarning: String?                   // 低电量模式 / 手机过热 / 存储快满 的提醒（没问题时为空）
+    @Published var alertMessage: String?                   // 需要马上让用户知道的错误（弹窗）
+    @Published var notifyAllowed = true                    // 通知权限（断流提醒靠它）
+
+    // 设置（会保存）
+    @Published var replaceOn = false
+    @Published var mirror = UserDefaults.standard.bool(forKey: "mirror")
+    @Published var rotation = UserDefaults.standard.integer(forKey: "rotation")
+    @Published var allowWiFi = UserDefaults.standard.bool(forKey: "allowWiFi")
+    @Published var decoderMode = UserDefaults.standard.integer(forKey: "decoderMode")
+
+    let stats = Stats()
+    private(set) lazy var pacer = Pacer(stats: stats)
+    private(set) lazy var video = VideoDecoder(pacer: pacer, stats: stats, mode: VideoDecoder.Mode(rawValue: decoderMode) ?? .auto)
+    private(set) lazy var jpeg = JPEGDecoder(pacer: pacer, stats: stats)
+    private(set) lazy var receiver = Receiver(stats: stats)
+
+    private var booted = false
+    private var keepAlivePlayer: AVAudioPlayer?
+    private var keepAliveFailures = 0                       // 静音连续几秒没在播
+    private var backgroundGrace: UIBackgroundTaskIdentifier = .invalid   // 向系统多要的后台时间（保活出问题时用来争取恢复时间）
+    private var ticks = 0
+    private var logAcc = Stats.Snapshot()
+    private var lastCPU = 0.0, lastWall = 0.0
+    private var appActive = true
+    // 断流提醒：直播中电脑画面断了，发一条带声音的通知（直播 App 在前台时也能看到）
+    private var lastFrameAt: Double?        // 最近一次有画面送给相机的时间（开机后的秒数，不受改手机时间影响）
+    private var outageAlerted = false       // 这次断流已经提醒过了
+    private var cameraInUse = false         // 相机正在被用（插件心跳 15 秒内更新过）
+    private var lastWarning: String?
+    private var lastPublishFail = 0
+    private var lastFreeMB = Int.max
+
+    func boot() {
+        guard !booted else { return }
+        booted = true
+        Log.write("========== AuxCam 启动 \(kAppVersion) ==========")
+        Log.write("设置：WiFi=\(allowWiFi) 解码方式=\(["自动", "软件", "硬件"][min(2, max(0, decoderMode))]) 镜像=\(mirror) 旋转=\(rotation)")
+        selfTest()
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, _ in
+            Log.write("通知权限：\(ok ? "已允许（断流时会提醒）" : "没允许（断流时没法提醒）")")
+        }
+        replaceOn = Engine.readActive()
+        auxcam_set_transform(mirror ? 1 : 0, Int32(rotation))
+        pacer.setMinimumBuffer(2)
+
+        receiver.onConfig = { [weak self] s, p in self?.video.setConfig(sps: s, pps: p) }
+        receiver.onVideo = { [weak self] d in self?.video.feed(d) }
+        receiver.onJPEG = { [weak self] d in self?.jpeg.feed(d) }
+        receiver.onState = { [weak self] ok, peer in
+            guard let self else { return }
+            self.pacer.setMinimumBuffer(peer.hasPrefix("WiFi") || peer.hasPrefix("网络") ? 3 : 2)   // USB、有线都很稳，WiFi 多排一张
+            DispatchQueue.main.async {
+                self.connected = ok
+                self.peer = peer
+            }
+        }
+        receiver.start(allowWiFi: allowWiFi)
+        if allowWiFi { Engine.askLocalNetworkPermission() }
+
+        keepAlive()
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.appActive = false
+            let playing = self.keepAlivePlayer?.isPlaying == true
+            Log.write("App 进入后台（保活\(playing ? "正常" : "没在播，先向系统多要一点后台时间，同时重试")）")
+            if !playing {
+                self.beginBackgroundGrace()
+                self.keepAlive()
+            }
+        }
+        nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.appActive = true
+            self?.endBackgroundGrace()
+            Log.write("App 回到前台")
+        }
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            let type = (n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).flatMap(AVAudioSession.InterruptionType.init)
+            Log.write("保活声音被打断 type=\(type == .began ? "开始" : "结束")")
+            if type == .ended { self?.keepAlive() }
+        }
+        // 系统的媒体服务重启了（媒体进程崩溃后被系统拉起）：原来的播放器已经失效，必须整个重建
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            Log.write("系统媒体服务重启了：重建保活播放器")
+            self.keepAlivePlayer?.stop()
+            self.keepAlivePlayer = nil
+            if !self.appActive { self.beginBackgroundGrace() }
+            self.keepAlive()
+        }
+
+        let ui = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(ui, forMode: .common)
+    }
+
+    /// 启动自检：测一下这台手机能不能建"硬件友好"的画面缓冲（建不了的话硬件解码也用不了）
+    private func selfTest() {
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]] as CFDictionary
+        let st = CVPixelBufferCreate(kCFAllocatorDefault, 1080, 1920, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, attrs, &pb)
+        Log.write("自检：IOSurface 画面缓冲 status=\(st)\(st == kCVReturnSuccess ? "（正常）" : "（建不了，硬件解码大概率也用不了）")")
+    }
+
+    // ── 用户操作 ──
+
+    func setReplace(_ on: Bool) {
+        let ok = Engine.writeActive(on)
+        replaceOn = Engine.readActive()          // 界面以文件里真实的状态为准，绝不"假装"已经打开
+        if ok {
+            Log.write(on ? "打开替换（相机画面换成电脑画面）" : "关闭替换（恢复真相机）")
+        } else {
+            Log.write("开关写入失败：想\(on ? "打开" : "关闭")替换，但 stream.cfg 没写进去")
+            alertMessage = on ? "替换没能打开：开关文件写不进去（手机存储可能满了）。现在相机还是真实画面，先别开播。"
+                              : "替换没能关闭：开关文件写不进去（手机存储可能满了）。"
+        }
+    }
+
+    func setMirror(_ on: Bool) {
+        mirror = on
+        UserDefaults.standard.set(on, forKey: "mirror")
+        auxcam_set_transform(mirror ? 1 : 0, Int32(rotation))
+        Log.write("镜像 \(on ? "开" : "关")")
+    }
+
+    func setRotation(_ degrees: Int) {
+        rotation = degrees
+        UserDefaults.standard.set(degrees, forKey: "rotation")
+        auxcam_set_transform(mirror ? 1 : 0, Int32(rotation))
+        Log.write("旋转 \(degrees)°")
+    }
+
+    func setWiFi(_ on: Bool) {
+        allowWiFi = on
+        UserDefaults.standard.set(on, forKey: "allowWiFi")
+        Log.write("WiFi 连接 \(on ? "允许" : "关闭")")
+        receiver.start(allowWiFi: on)
+        if on { Engine.askLocalNetworkPermission() }
+    }
+
+    func setDecoderMode(_ m: Int) {
+        decoderMode = m
+        UserDefaults.standard.set(m, forKey: "decoderMode")
+        video.setMode(VideoDecoder.Mode(rawValue: m) ?? .auto)
+    }
+
+    // ── 每秒一次：刷新界面，每 5 秒写一行状态日志 ──
+
+    private func tick() {
+        ticks += 1
+        let s = stats.take()
+        logAcc.merge(s)
+        inFPS = Double(s.recvFrames)
+        mbps = Double(s.recvBytes) * 8 / 1_000_000
+        outFPS = Double(s.published)
+        decoderName = currentDecoderName
+        if s.decoded > 0 { decodeMs = s.decodeMsSum / Double(s.decoded) }
+        bufferTarget = pacer.bufferCount
+        let addrs = Net.addresses().map { "\($0.kind) \($0.ip)" }
+        if addrs != phoneAddresses { phoneAddresses = addrs }
+        if s.published > 0 { lastFrameAt = CACurrentMediaTime() }
+        if ticks % 10 == 1 {
+            UNUserNotificationCenter.current().getNotificationSettings { st in
+                let allowed = st.authorizationStatus == .authorized || st.authorizationStatus == .provisional
+                DispatchQueue.main.async { if self.notifyAllowed != allowed { self.notifyAllowed = allowed } }
+            }
+        }
+        // 每秒核对一次开关文件：被删了、被别的东西改了，界面马上如实显示
+        let actual = Engine.readActive()
+        if actual != replaceOn {
+            Log.write("开关文件和界面不一致（文件里是 \(actual ? "开" : "关")），以文件为准")
+            replaceOn = actual
+        }
+        lastPublishFail = s.publishFail
+        updatePluginStatus()
+        checkKeepAlive()
+        checkOutage()
+        checkPhoneHealth()
+        if appActive, let latest = pacer.latest() {
+            preview = Engine.makePreview(latest.0, limited: latest.1)
+        }
+        if ticks % 5 == 0 { writeStatusLog() }
+    }
+
+    private var currentDecoderName: String {
+        jpeg.isActive ? "图片（CPU 两路解码）" : video.backend
+    }
+
+    private func writeStatusLog() {
+        let a = logAcc
+        logAcc = Stats.Snapshot()
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        let cpu = Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+            Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        let wall = CACurrentMediaTime()
+        let cpuText = lastWall > 0 ? String(format: "%.0f%%", (cpu - lastCPU) / (wall - lastWall) * 100) : "-"
+        lastCPU = cpu
+        lastWall = wall
+        let avg = a.decoded > 0 ? a.decodeMsSum / Double(a.decoded) : 0
+        let memMB = Int(os_proc_available_memory() / 1_048_576)
+        Log.write(String(format: "状态 连接=%@ 收=%.1f帧/秒 %.1fMbps 解码=%@ %.1f帧/秒 平均%.1fms 最慢%.0fms 错=%d 丢段=%d 出=%.1f帧/秒 缓冲=%d张 供不上=%d 丢旧=%d 写失败=%d CPU=%@ 剩余内存=%dMB 保活=%d 替换=%d 插件=%@",
+                         connected ? peer : "无", Double(a.recvFrames) / 5, Double(a.recvBytes) * 8 / 5_000_000,
+                         currentDecoderName, Double(a.decoded) / 5, avg, a.decodeMsMax, a.decodeErrors, a.gopDrops,
+                         Double(a.published) / 5, pacer.bufferCount, a.underflow, a.overflow, a.publishFail, cpuText, memMB,
+                         keepAlivePlayer?.isPlaying == true ? 1 : 0, replaceOn ? 1 : 0, pluginWorking ? "工作中" : (cameraInUse ? "相机开着没画面" : "没在用"))
+                  + " 低电量=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) 温度=\(ProcessInfo.processInfo.thermalState.rawValue)")
+    }
+
+    /// 插件每 150 个相机帧写一次心跳："camera=相机出了几帧 replaced=其中换成电脑画面的几帧"
+    private func updatePluginStatus() {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: Paths.pluginBeat)
+        let age = (attrs?[.modificationDate] as? Date).map { Date().timeIntervalSince($0) } ?? 9999
+        // 心跳是一行用空格隔开的 key=value
+        var replaced = 0
+        if let text = try? String(contentsOfFile: Paths.pluginBeat, encoding: .utf8) {
+            for token in text.split(whereSeparator: { $0 == " " || $0.isNewline }) where token.hasPrefix("replaced=") {
+                replaced = Int(token.dropFirst("replaced=".count)) ?? 0
+            }
+        }
+        let cameraOn = replaceOn && age < 15
+        cameraInUse = cameraOn
+        pluginWorking = cameraOn && replaced > 0
+        if !replaceOn {
+            pluginText = "替换已关闭，相机是真实画面"
+        } else if pluginWorking {
+            pluginText = "工作中：相机画面已换成电脑画面"
+        } else if cameraOn {
+            pluginText = "相机开着，还没收到电脑画面：相机现在是黑屏（不会露出真实画面）"
+        } else {
+            pluginText = "等待中：任何 App 打开相机后，会自动开始替换"
+        }
+    }
+
+    // ── 断流提醒 ──
+    // 相机正在用、替换开着，可是 3 秒没有新的电脑画面了：发一条带声音的通知。
+    // 之前有过画面 → 直播停在最后一张；从来没有 → 直播是黑屏。恢复后再通知一次。
+
+    private func checkOutage() {
+        guard replaceOn, cameraInUse else { outageAlerted = false; return }
+        let silent = lastFrameAt.map { CACurrentMediaTime() - $0 } ?? .infinity
+        if silent >= 3 && !outageAlerted {
+            outageAlerted = true
+            let hadFrames = lastFrameAt != nil
+            let body = hadFrames ? "直播画面现在停在最后一张。检查电脑推流软件和连接线 / 网络。"
+                                 : "直播现在是黑屏。请在电脑上开始推流。"
+            Log.write("断流提醒：\(hadFrames ? "电脑画面断了" : "还没收到电脑画面")")
+            Engine.notify(title: hadFrames ? "电脑画面断了" : "还没收到电脑画面", body: body)
+        } else if silent < 1 && outageAlerted {
+            outageAlerted = false
+            Log.write("断流提醒：电脑画面恢复了")
+            Engine.notify(title: "电脑画面恢复了", body: "直播画面已经恢复正常。")
+        }
+    }
+
+    static func freeSpaceMB() -> Int? {
+        let values = try? URL(fileURLWithPath: Paths.dcim).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage.map { Int($0 / 1_048_576) }
+    }
+
+    static func notify(title: String, body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "auxcam.outage", content: c, trigger: nil))
+    }
+
+    // ── 手机状态：低电量模式会让手机变慢，过热会降频，都可能让画面卡 ──
+
+    private func checkPhoneHealth() {
+        var items: [String] = []
+        if ProcessInfo.processInfo.isLowPowerModeEnabled { items.append("低电量模式开着（会让手机变慢），请到 设置 → 电池 关掉") }
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious: items.append("手机很热，可能会降速卡顿：拿掉手机壳、别边充边捂着，给手机散散热")
+        case .critical: items.append("手机过热，马上会明显卡顿：请尽快给手机降温")
+        default: break
+        }
+        if ticks % 10 == 1, let free = Engine.freeSpaceMB() { lastFreeMB = free }
+        if lastFreeMB < 1024 { items.append("手机存储只剩 \(lastFreeMB)MB，快满了：请删掉一些照片、视频") }
+        if lastPublishFail > 0 { items.append("电脑画面写不进去（每秒失败 \(lastPublishFail) 次）：手机存储可能满了") }
+        if !notifyAllowed { items.append("通知被关掉了：电脑画面断了也没法提醒你。请到 设置 → 通知 → AuxCam 打开") }
+        let w = items.isEmpty ? nil : items.joined(separator: "\n")
+        if w != lastWarning {
+            lastWarning = w
+            Log.write("手机状态：\(w ?? "正常")")
+        }
+        if w != phoneWarning { phoneWarning = w }
+    }
+
+    // ── 保活：循环播放静音，退到后台也继续收画面 ──
+    // 实测（旧日志约 98 小时后台）：静音一直在播，App 在后台就一直活着，一次都没被暂停过。
+    // 这里再加三道保险：每秒检查、连续 3 秒没播就整个重建、媒体服务重启后重建；
+    // 保活出问题且在后台时，向系统多要一段后台时间（约 30 秒），够恢复用。
+
+    /// 每秒检查一次静音是不是还在播
+    private func checkKeepAlive() {
+        let playing = keepAlivePlayer?.isPlaying == true
+        if playing {
+            if keepAliveFailures > 0 { Log.write("保活：恢复正常（之前断了 \(keepAliveFailures) 秒）") }
+            keepAliveFailures = 0
+            endBackgroundGrace()
+        } else {
+            keepAliveFailures += 1
+            if keepAliveFailures == 1 || keepAliveFailures % 10 == 0 {
+                Log.write("保活：静音没在播（第 \(keepAliveFailures) 秒），正在恢复\(appActive ? "" : "（App 在后台）")")
+            }
+            if !appActive { beginBackgroundGrace() }
+            if keepAliveFailures % 3 == 0 {      // 连着 3 秒都播不起来：把播放器整个重建
+                keepAlivePlayer?.stop()
+                keepAlivePlayer = nil
+            }
+            keepAlive()
+        }
+        let ok = keepAlivePlayer?.isPlaying == true
+        if ok != keepAliveOK { keepAliveOK = ok }
+    }
+
+    private func beginBackgroundGrace() {
+        guard backgroundGrace == .invalid else { return }
+        backgroundGrace = UIApplication.shared.beginBackgroundTask(withName: "auxcam.keepalive") { [weak self] in
+            Log.write("保活：系统给的额外后台时间用完了")
+            self?.endBackgroundGrace()
+        }
+    }
+
+    private func endBackgroundGrace() {
+        guard backgroundGrace != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundGrace)
+        backgroundGrace = .invalid
+    }
+
+    private func keepAlive() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+        } catch {
+            Log.write("保活：声音通道打不开 \(error.localizedDescription)")
+        }
+        if let p = keepAlivePlayer {
+            if !p.isPlaying { p.play() }
+            return
+        }
+        let rate = 8000
+        var wav = Data()
+        func u32(_ v: UInt32) { var x = v.littleEndian; withUnsafeBytes(of: &x) { wav.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { var x = v.littleEndian; withUnsafeBytes(of: &x) { wav.append(contentsOf: $0) } }
+        let dataLen = UInt32(rate * 2)
+        wav.append(contentsOf: Array("RIFF".utf8)); u32(36 + dataLen)
+        wav.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(UInt32(rate)); u32(UInt32(rate * 2)); u16(2); u16(16)
+        wav.append(contentsOf: Array("data".utf8)); u32(dataLen)
+        wav.append(Data(count: Int(dataLen)))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("silence.wav")
+        try? wav.write(to: url)
+        let player = try? AVAudioPlayer(contentsOf: url)
+        player?.numberOfLoops = -1
+        player?.volume = 0.01
+        keepAlivePlayer = player
+        Log.write("保活：静音播放 \(player?.play() == true ? "已开始" : "失败")")
+    }
+
+    // ── 小工具 ──
+
+    static func parseKV(_ text: String) -> [String: String] {
+        var d: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard let i = line.firstIndex(of: "=") else { continue }
+            d[line[..<i].trimmingCharacters(in: .whitespaces)] = line[line.index(after: i)...].trimmingCharacters(in: .whitespaces)
         }
         return d
     }
 
-    static func status() -> [String: String] {
-        if let t = try? String(contentsOf: statURL, encoding: .utf8), t.contains("kernel") { return parse(t) }
-        if let t = try? String(contentsOf: dcimStatURL, encoding: .utf8) { return parse(t) }
-        return [:]
+    static func readActive() -> Bool {
+        guard let t = try? String(contentsOfFile: Paths.streamCfg, encoding: .utf8) else { return false }
+        let v = (parseKV(t)["active"] ?? "").lowercased()
+        return v == "1" || v == "on" || v == "yes"
     }
 
-    static func esSize() -> Int64 {
-        let a = try? FileManager.default.attributesOfItem(atPath: esURL.path)
-        return (a?[.size] as? NSNumber)?.int64Value ?? -1
-    }
-
-    static func streamEnabled() -> Bool {
-        guard let t = try? String(contentsOf: streamCfgURL, encoding: .utf8) else { return false }
-        return t.components(separatedBy: .newlines).contains { line in
-            let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
-            guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces) == "active" else { return false }
-            let value = parts[1].trimmingCharacters(in: .whitespaces).lowercased()
-            return value == "1" || value == "on" || value == "yes"
+    /// 改 stream.cfg 的 active 那一行（插件每秒读一次），其它行原样保留
+    /// 写完会读回来核对，写不进去返回 false
+    @discardableResult
+    static func writeActive(_ on: Bool) -> Bool {
+        let existing = (try? String(contentsOfFile: Paths.streamCfg, encoding: .utf8)) ?? ""
+        var lines = existing.components(separatedBy: .newlines).filter {
+            !$0.isEmpty && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("active")
         }
-    }
-
-    static func vcamStamp() -> Int64 {
-        let a = try? FileManager.default.attributesOfItem(atPath: vcamURL.path)
-        let t = (a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
-        return Int64(t)
-    }
-
-    // 内核看门狗：内核没了，App 自己把它拉回来（不用电脑）
-    static func spawnCLI(_ args: [String]) {
-        var argv = args.map { strdup($0) }
-        argv.append(nil)
-        var pid: pid_t = 0
-        posix_spawn(&pid, args[0], nil, nil, &argv, nil)
-        for p in argv { free(p) }
-    }
-
-    static func reviveKernel() {
-        let fm = FileManager.default
-        let base = "/private/var/containers/Bundle/Application/"
-        var jb: String?
-        if let items = try? fm.contentsOfDirectory(atPath: base) {
-            for it in items where it.hasPrefix(".jbroot-") { jb = base + it; break }
+        lines.insert("active=\(on ? 1 : 0)", at: 0)
+        try? (lines.joined(separator: "\n") + "\n").write(toFile: Paths.streamCfg, atomically: true, encoding: .utf8)
+        let ok = readActive() == on
+        // 另一个虚拟相机插件（VCam）的开关始终保持关闭，免得两个插件抢画面
+        if let data = FileManager.default.contents(atPath: Paths.vcamPlist),
+           var p = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any],
+           (p["masterEnabled"] as? Bool ?? false) || (p["enabled"] as? Bool ?? false) {
+            p["masterEnabled"] = false
+            p["enabled"] = false
+            p["generation"] = (p["generation"] as? Int ?? 0) + 1
+            if let out = try? PropertyListSerialization.data(fromPropertyList: p, format: .xml, options: 0) {
+                try? out.write(to: URL(fileURLWithPath: Paths.vcamPlist), options: .atomic)
+                Log.write("已关闭另一个虚拟相机插件（VCam）的开关")
+            }
         }
-        guard let jb else { return }
-        let plist = jb + "/Library/LaunchDaemons/com.auxcam.agent.plist"
-        spawnCLI(["/usr/bin/launchctl", "bootstrap", "user/501", plist])
-        spawnCLI(["/usr/bin/launchctl", "kickstart", "-k", "user/501/com.auxcam.agent"])
+        return ok
     }
-}
 
-// PhotosPicker 的视频以文件方式导入，避免把整段视频读进 Data 占用大量内存。
-private struct PickedVideo: Transferable {
-    let url: URL
+    /// 苹果的"本地网络"权限：没触发过的话，WiFi 连进来可能被系统悄悄挡掉。
+    /// 往局域网发一个小广播包就会触发弹窗（只第一次弹，点"允许"）。
+    static func askLocalNetworkPermission() {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = Receiver.port.bigEndian
+        addr.sin_addr.s_addr = 0xFFFF_FFFF
+        let msg = Array("AuxCam".utf8)
+        let sent = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                sendto(fd, msg, msg.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        Log.write("本地网络权限：已触发（发送结果 \(sent)，<0 多半是还没允许）")
+    }
 
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(importedContentType: .movie) { received in
-            let source = received.file
-            let destination = Link.videoURL
-            let incoming = destination.appendingPathExtension("incoming")
-            return try await Task.detached(priority: .userInitiated) {
-                let fm = FileManager.default
-                try? fm.removeItem(at: incoming)
-                try fm.copyItem(at: source, to: incoming)
-                if fm.fileExists(atPath: destination.path) {
-                    _ = try fm.replaceItemAt(destination, withItemAt: incoming)
-                } else {
-                    try fm.moveItem(at: incoming, to: destination)
+    /// 把 NV12 画面缩小成预览图（纯 CPU，约 480 高，不碰 GPU）
+    static func makePreview(_ pb: CVPixelBuffer, limited: Bool) -> CGImage? {
+        guard CVPixelBufferGetPlaneCount(pb) >= 2,
+              CVPixelBufferLockBaseAddress(pb, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pb, 0)?.assumingMemoryBound(to: UInt8.self),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pb, 1)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
+        let step = max(1, max(w, h) / 480)
+        let ow = w / step, oh = h / step
+        guard ow > 0, oh > 0 else { return nil }
+        var rgba = [UInt8](repeating: 255, count: ow * oh * 4)
+        rgba.withUnsafeMutableBufferPointer { out in
+            for oy in 0..<oh {
+                let sy = oy * step
+                let yRow = yBase + sy * yStride, uvRow = uvBase + (sy / 2) * uvStride
+                for ox in 0..<ow {
+                    let sx = ox * step
+                    var y = Float(yRow[sx]), u = Float(uvRow[sx & ~1]) - 128, v = Float(uvRow[(sx & ~1) + 1]) - 128
+                    if limited { y = (y - 16) * 1.164; u *= 1.138; v *= 1.138 }
+                    let r = y + 1.5748 * v, g = y - 0.1873 * u - 0.4681 * v, b = y + 1.8556 * u
+                    let o = (oy * ow + ox) * 4
+                    out[o] = UInt8(max(0, min(255, r)))
+                    out[o + 1] = UInt8(max(0, min(255, g)))
+                    out[o + 2] = UInt8(max(0, min(255, b)))
                 }
-                return PickedVideo(url: destination)
-            }.value
+            }
         }
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        return CGImage(width: ow, height: oh, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: ow * 4,
+                       space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 }
 
-// ───────────────────────── 相机预览层 ─────────────────────────
-final class Cam: ObservableObject {
-    @Published var denied = false
-    @Published var diag = "启动中…"
-    @Published var sessionReady = false
-    @Published var position: AVCaptureDevice.Position = .front
-    private var _session: AVCaptureSession?
-    var session: AVCaptureSession? { _session }
-    private var lastFlip = Date.distantPast
-    private var busy = false
-    private let queue = DispatchQueue(label: "auxcam.cam", qos: .userInitiated)
+// MARK: - 界面
+// 一眼看懂：最上面一句话说清楚现在好不好；中间是电脑画面；三步检查，每步好了就打勾；一个大按钮；设置收在最下面。
 
-    private func log(_ s: String) {
-        DispatchQueue.main.async { self.diag = s }
-        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
-        if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-            let f = d.appendingPathComponent("diag.txt")
-            if let h = try? FileHandle(forWritingTo: f) {
-                h.seekToEndOfFile()
-                h.write(line.data(using: .utf8) ?? Data())
-                try? h.close()
-            } else {
-                try? line.write(to: f, atomically: true, encoding: .utf8)
+struct MainView: View {
+    @ObservedObject private var e = Engine.shared
+    @State private var showSettings: Bool
+    @State private var confirmStop = false
+    @State private var showCameraCheck = false
+
+    init(showSettings: Bool = false) {
+        _showSettings = State(initialValue: showSettings)
+    }
+
+    private enum Overall { case good, waitPC, waitCamera, slow, off }
+
+    private var overall: Overall {
+        if !e.replaceOn { return .off }
+        if !e.connected { return .waitPC }
+        if e.outFPS < 24 { return .slow }
+        if !e.pluginWorking { return .waitCamera }
+        return .good
+    }
+
+    private var banner: (title: String, detail: String, color: Color, icon: String) {
+        switch overall {
+        case .good:
+            return ("一切正常", "相机里显示的是电脑画面", .green, "checkmark.circle.fill")
+        case .waitPC:
+            return ("等待电脑连接",
+                    e.allowWiFi ? "插上 USB 线，或在电脑端填手机地址走网络" : "用 USB 线连电脑，然后在电脑上开始推流",
+                    .orange, "cable.connector")
+        case .slow:
+            return (e.outFPS > 0 ? "画面不够流畅" : "电脑已连上，还没有画面",
+                    e.outFPS > 0 ? String(format: "现在每秒只有 %.0f 张，看下面哪一步没打勾", e.outFPS) : "请在电脑上开始推流",
+                    .orange, "exclamationmark.triangle.fill")
+        case .waitCamera:
+            return ("画面已准备好", "打开相机（开播或预览），就会自动换成电脑画面", .blue, "camera.viewfinder")
+        case .off:
+            return ("替换已关闭", "现在相机是真实画面", .gray, "pause.circle.fill")
+        }
+    }
+
+    var body: some View {
+        ScrollView { content }
+            .background(Color(UIColor.systemGroupedBackground).ignoresSafeArea())
+            .onAppear { e.boot() }
+            .alert("确定恢复真相机吗？", isPresented: $confirmStop) {
+                Button("恢复真相机", role: .destructive) { e.setReplace(false) }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("如果正在直播，观众会马上看到手机摄像头的真实画面。")
+            }
+            .sheet(isPresented: $showCameraCheck) { CameraCheckView() }
+            .alert("出问题了", isPresented: Binding(get: { e.alertMessage != nil }, set: { if !$0 { e.alertMessage = nil } })) {
+                Button("知道了", role: .cancel) {}
+            } message: {
+                Text(e.alertMessage ?? "")
+            }
+    }
+
+    var content: some View {
+        VStack(spacing: 16) {
+            header
+            statusBanner
+            previewBox
+            checklist
+            if let w = e.phoneWarning { warningRow(w) }
+            keepAliveRow
+            mainButton
+            if e.replaceOn {
+                Text("替换开着时，手机上所有 App 的相机（拍照、扫码、视频通话）都会被换掉。不直播时记得停止替换。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, -8)
+            }
+            quickControls
+            cameraCheckButton
+            settings
+            Text("日志：DCIM/.dec.log  ·  \(kAppVersion)")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.top, 4)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    // ── 顶部 ──
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "video.fill")
+                .font(.title3)
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 9).fill(Color.teal))
+            Text("AuxCam").font(.title2.bold())
+            Spacer()
+            if e.connected {
+                Label(e.peer.hasPrefix("WiFi") ? "WiFi" : (e.peer.hasPrefix("有线") ? "有线" : (e.peer == "USB" ? "USB" : "网络")),
+                      systemImage: e.peer.hasPrefix("WiFi") ? "wifi" : (e.peer == "USB" ? "cable.connector" : "network"))
+                    .font(.footnote.bold())
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.green.opacity(0.15)))
+                    .foregroundStyle(.green)
             }
         }
     }
+
+    private var statusBanner: some View {
+        let b = banner
+        return HStack(spacing: 14) {
+            Image(systemName: b.icon)
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(b.color)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(b.title).font(.title3.bold())
+                Text(b.detail).font(.subheadline).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 18).fill(b.color.opacity(0.13)))
+    }
+
+    // ── 电脑画面预览 ──
+
+    private var previewBox: some View {
+        ZStack(alignment: .bottom) {
+            RoundedRectangle(cornerRadius: 16).fill(Color.black)
+            if let img = e.preview {
+                // 顺序必须和写给相机的一样：先顺时针旋转，再左右镜像（旋转 90°/270° 时顺序反了画面会上下颠倒）
+                // 转 90°/270° 时先在"横着的框"里缩放好，转过来正好竖着放得下，整张画面都看得到
+                let sideways = e.rotation == 90 || e.rotation == 270
+                Image(decorative: img, scale: 1)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: sideways ? 356 : 200, height: sideways ? 200 : 356)
+                    .rotationEffect(.degrees(Double(e.rotation)))
+                    .scaleEffect(x: e.mirror ? -1 : 1, y: 1)
+                    .frame(width: 200, height: 356)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "display").font(.system(size: 34))
+                    Text("电脑画面会显示在这里").font(.footnote)
+                }
+                .foregroundStyle(.gray)
+                .frame(maxHeight: .infinity)
+            }
+            Text(e.preview == nil ? "预览" : String(format: "电脑画面 · %.0f 帧/秒", e.outFPS))
+                .font(.caption.bold())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(Capsule().fill(.black.opacity(0.55)))
+                .padding(10)
+        }
+        .frame(width: 200, height: 356)
+    }
+
+    // ── 三步检查 ──
+
+    private var checklist: some View {
+        VStack(spacing: 0) {
+            step(1, done: e.connected,
+                 title: e.connected ? "电脑已连接" : "电脑没连接",
+                 detail: e.connected
+                    ? String(format: "%@ · 每秒收到 %.0f 张 · %.1f M", e.peer, e.inFPS, e.mbps)
+                    : (e.allowWiFi ? "USB 线、WiFi、有线网卡都可以" : "请插好 USB 线"))
+            Divider().padding(.leading, 52)
+            step(2, done: e.outFPS >= 24,
+                 title: e.outFPS >= 24 ? "画面解码正常"
+                    : (e.outFPS <= 0 ? "还没有画面"
+                       : (e.inFPS < 24 ? "电脑发得太少" : "解码跟不上")),
+                 detail: e.outFPS <= 0 ? "电脑开始推流后就会有"
+                    : (e.outFPS < 24 && e.inFPS < 24
+                       ? String(format: "电脑每秒只发了 %.0f 张，检查电脑端设置（应为 30 帧）", e.inFPS)
+                       : String(format: "%@ · 每张 %.0f 毫秒 · 每秒 %.0f 张", e.decoderName, e.decodeMs, e.outFPS)))
+            Divider().padding(.leading, 52)
+            step(3, done: e.pluginWorking,
+                 title: e.pluginWorking ? "相机已替换" : (e.replaceOn ? "等待打开相机" : "替换已关闭"),
+                 detail: e.pluginText)
+        }
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(UIColor.secondarySystemGroupedBackground)))
+    }
+
+    private func step(_ n: Int, done: Bool, title: String, detail: String) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(done ? Color.green : Color(UIColor.tertiarySystemFill)).frame(width: 28, height: 28)
+                if done {
+                    Image(systemName: "checkmark").font(.footnote.bold()).foregroundStyle(.white)
+                } else {
+                    Text("\(n)").font(.footnote.bold()).foregroundStyle(.secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.body.weight(.semibold))
+                Text(detail).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 12)
+    }
+
+    // ── 手机状态提醒（低电量模式 / 过热） ──
+
+    private func warningRow(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "thermometer.sun.fill").foregroundStyle(.orange)
+            Text(text).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.orange.opacity(0.15)))
+    }
+
+    // ── 开播前检查 ──
+
+    private var cameraCheckButton: some View {
+        Button { showCameraCheck = true } label: {
+            HStack {
+                Image(systemName: "camera.viewfinder")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("开播前检查").font(.body.weight(.semibold))
+                    Text("打开相机，看看直播 App 实际会拿到什么画面").font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.secondary)
+            }
+            .foregroundStyle(.primary)
+            .padding(14)
+            .background(RoundedRectangle(cornerRadius: 16).fill(Color(UIColor.secondarySystemGroupedBackground)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // ── 后台保活 ──
+
+    private var keepAliveRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: e.keepAliveOK ? "moon.zzz.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(e.keepAliveOK ? Color.green : Color.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(e.keepAliveOK ? "后台运行：正常" : "后台运行：正在恢复")
+                    .font(.subheadline.bold())
+                Text(e.keepAliveOK ? "切到别的 App、按 Home 键都会继续工作。不要在多任务里把 AuxCam 划掉"
+                                   : "正在自动恢复，几秒内没好的话请重新打开 AuxCam")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(UIColor.secondarySystemGroupedBackground)))
+    }
+
+    // ── 大按钮 ──
+
+    private var mainButton: some View {
+        Button {
+            if e.replaceOn { confirmStop = true } else { e.setReplace(true) }   // 停止要再确认一次，防止直播中误碰
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: e.replaceOn ? "stop.fill" : "play.fill")
+                Text(e.replaceOn ? "停止替换（恢复真相机）" : "开始替换相机画面")
+            }
+            .font(.title3.bold())
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .foregroundStyle(.white)
+            .background(RoundedRectangle(cornerRadius: 16).fill(e.replaceOn ? Color.red : Color.green))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // ── 镜像 / 旋转：常用，放主界面，点一下就生效 ──
+
+    private var quickControls: some View {
+        HStack(spacing: 12) {
+            quickButton(title: e.mirror ? "镜像：开" : "镜像：关",
+                        icon: "arrow.left.and.right.righttriangle.left.righttriangle.right",
+                        on: e.mirror) { e.setMirror(!e.mirror) }
+            quickButton(title: "旋转：\(e.rotation)°",
+                        icon: "rotate.right",
+                        on: e.rotation != 0) { e.setRotation((e.rotation + 90) % 360) }
+        }
+    }
+
+    private func quickButton(title: String, icon: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title2)
+                Text(title).font(.subheadline.bold())
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .foregroundStyle(on ? Color.white : Color.primary)
+            .background(RoundedRectangle(cornerRadius: 16).fill(on ? Color.teal : Color(UIColor.secondarySystemGroupedBackground)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // ── 设置 ──
+
+    private var settings: some View {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showSettings.toggle() }
+            } label: {
+                HStack {
+                    Image(systemName: "slider.horizontal.3")
+                    Text("设置").font(.body.weight(.semibold))
+                    Spacer()
+                    Text(settingsSummary).font(.caption).foregroundStyle(.secondary)
+                    Image(systemName: showSettings ? "chevron.up" : "chevron.down").font(.footnote)
+                }
+                .foregroundStyle(.primary)
+                .padding(14)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if showSettings {
+                Divider()
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle("允许网络连接（WiFi / 有线网卡）", isOn: Binding(get: { e.allowWiFi }, set: { e.setWiFi($0) }))
+                        if e.allowWiFi {
+                            if e.phoneAddresses.isEmpty {
+                                Text("手机还没连上网络（WiFi 或有线网卡）").font(.callout).foregroundStyle(.orange)
+                            } else {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("电脑端「手机 IP」填：").font(.caption).foregroundStyle(.secondary)
+                                    ForEach(e.phoneAddresses, id: \.self) { line in
+                                        let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+                                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                            Text(parts.first ?? "").font(.caption.bold()).foregroundStyle(.secondary)
+                                                .frame(width: 34, alignment: .leading)
+                                            Text(parts.count > 1 ? parts[1] : line)
+                                                .font(.title2.monospaced().bold())
+                                                .foregroundStyle(.blue)
+                                                .textSelection(.enabled)
+                                        }
+                                    }
+                                    Text("端口 28765（一般不用改）。有线和 WiFi 都有时，填有线那个更稳").font(.caption).foregroundStyle(.secondary)
+                                    Text("电脑一直连不上：到 设置 → 隐私与安全性 → 本地网络，把 AuxCam 打开").font(.caption).foregroundStyle(.secondary)
+                                }
+                                .padding(10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color.blue.opacity(0.08)))
+                            }
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("解码方式")
+                        Picker("解码方式", selection: Binding(get: { e.decoderMode }, set: { e.setDecoderMode($0) })) {
+                            Text("自动").tag(0)
+                            Text("软件").tag(1)
+                            Text("硬件").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        Text("一般选\"自动\"：硬件能用就用硬件，不能用自动换软件。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color(UIColor.secondarySystemGroupedBackground)))
+    }
+
+    private var settingsSummary: String {
+        e.allowWiFi ? "网络已开" : "仅 USB"
+    }
+}
+
+// MARK: - 开播前检查：在 App 里打开相机，看相机实际输出的画面
+// 相机画面经过插件替换后才到这里，和直播 App 拿到的是同一份：
+// 看到电脑画面 = 一切正常；看到黑屏 = 替换开着但电脑画面还没到；看到真实画面 = 替换没开或插件没生效。
+
+final class CameraCheck: ObservableObject {
+    let session = AVCaptureSession()
+    @Published var status = "正在打开相机…"
+    @Published var front = true
+    private let queue = DispatchQueue(label: "auxcam.cameracheck")
 
     func start() {
-        let st = AVCaptureDevice.authorizationStatus(for: .video)
-        switch st {
-        case .notDetermined:
-            log("权限未定，正在请求")
-            AVCaptureDevice.requestAccess(for: .video) { ok in
-                DispatchQueue.main.async { ok ? self.begin() : self.markDenied() }
+        AVCaptureDevice.requestAccess(for: .video) { ok in
+            guard ok else {
+                DispatchQueue.main.async { self.status = "没有相机权限：请到 设置 → AuxCam 打开相机" }
+                return
             }
-        case .authorized:
-            begin()
-        default:
-            markDenied()
+            self.configure()
         }
     }
 
     func flip() {
-        if Date().timeIntervalSince(lastFlip) < 2.5 { return }
-        lastFlip = Date()
-        position = position == .front ? .back : .front
-        begin(restart: true)
+        front.toggle()
+        configure()
     }
 
-    private func markDenied() {
-        denied = true
-        log("相机权限被拒")
+    private func configure() {
+        let position: AVCaptureDevice.Position = front ? .front : .back
+        queue.async {
+            self.session.beginConfiguration()
+            for input in self.session.inputs { self.session.removeInput(input) }
+            if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position),
+               let input = try? AVCaptureDeviceInput(device: device), self.session.canAddInput(input) {
+                self.session.addInput(input)
+            }
+            if self.session.canSetSessionPreset(.hd1920x1080) { self.session.sessionPreset = .hd1920x1080 }
+            self.session.commitConfiguration()
+            if !self.session.isRunning { self.session.startRunning() }
+            let running = self.session.isRunning
+            Log.write("开播前检查：打开\(position == .front ? "前" : "后")摄像头 running=\(running)")
+            DispatchQueue.main.async { self.status = running ? "" : "相机打不开（可能正被别的 App 使用）" }
+        }
     }
 
-    private func begin(restart: Bool = false) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            if self.busy { return }
-            self.busy = true
-            // 后台建 session（这里的同步 XPC 等待不卡主线程）
-            var s = self._session
-            if s == nil {
-                s = AVCaptureSession()
-                self._session = s
-                DispatchQueue.main.async { self.sessionReady = true }
-            }
-            guard let sess = s else { self.busy = false; return }
-            if restart {
-                sess.beginConfiguration()
-                for i in sess.inputs { sess.removeInput(i) }
-                sess.commitConfiguration()
-            }
-            guard restart || !sess.isRunning else { self.busy = false; return }
-            var dev: AVCaptureDevice? = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: self.position)
-            if dev == nil { dev = AVCaptureDevice.default(for: .video) }
-            guard let d = dev else { self.log("找不到相机"); self.busy = false; return }
-            do {
-                let input = try AVCaptureDeviceInput(device: d)
-                if sess.canAddInput(input) {
-                    sess.addInput(input)
-                } else {
-                    self.log("输入被占用，稍后自动重试")
-                    self.busy = false
-                    // 智能：10 秒后自动再试一次（相机进程可能正在重启）
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) {
-                        self.begin()
-                    }
-                    return
-                }
-            } catch {
-                self.log("建输入失败: \(error.localizedDescription)")
-                self.busy = false
-                return
-            }
-            if !sess.isRunning {
-                sess.sessionPreset = .high
-                sess.startRunning()
-            }
-            self.log("会话运行中=" + String(sess.isRunning))
-            self.busy = false
+    func stop() {
+        queue.async {
+            if self.session.isRunning { self.session.stopRunning() }
+            Log.write("开播前检查：关闭相机")
         }
     }
 }
 
-struct CamPreview: UIViewRepresentable {
-    let session: AVCaptureSession?
+private struct CameraPreview: UIViewRepresentable {
+    let session: AVCaptureSession
+    let front: Bool
 
-    final class V: UIView {
+    final class PreviewView: UIView {
         override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-        var pl: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+        var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
     }
 
-    func makeUIView(context: Context) -> V {
-        let v = V()
-        v.pl.session = session
-        v.pl.videoGravity = .resizeAspectFill
+    func makeUIView(context: Context) -> PreviewView {
+        let v = PreviewView()
+        v.previewLayer.session = session
+        v.previewLayer.videoGravity = .resizeAspect
+        v.backgroundColor = .black
         return v
     }
 
-    func updateUIView(_ uiView: V, context: Context) {
-        if let s = session, uiView.pl.session !== s {
-            uiView.pl.session = s
+    func updateUIView(_ v: PreviewView, context: Context) {
+        // 不做自动镜像：显示相机原样输出的画面（系统相机预览默认会把前摄像头左右翻过来，那样就看不准了）
+        if let c = v.previewLayer.connection, c.isVideoMirroringSupported {
+            c.automaticallyAdjustsVideoMirroring = false
+            c.isVideoMirrored = false
         }
     }
 }
 
-// ───────────────────────── 解码层（App 里解，画面贴公共画布） ─────────────────────────
-// App 解码 H264 → 把最新画面写进共享内存；插件读取它并替换相机帧。
-// MJPEG 的 CPU 解码工人（AUXJPEG2）：ImageIO 解 JPEG → BGRA → 系统像素转换成 NV12 全范围。
-// 每个工人有自己的缓冲和转换会话，只在自己的串行队列上用，所以多个工人可以同时解不同的图。
-// 实测这台机硬件 JPEG 解码一直 -12911，全靠 CPU：单线程 1080 宽只有 ~27 帧/秒，两个工人并行就能稳 30。
-final class JPEGCPUWorker {
-    let queue: DispatchQueue
-    private var nv: CVPixelBuffer?
-    private var bgra: CVPixelBuffer?
-    private var transfer: VTPixelTransferSession?
-    // 只在像素转换失败时才用的兜底：纯 CPU 软件渲染，lazy 保证平时不创建
-    private lazy var softwareContext = CIContext(options: [.useSoftwareRenderer: true])
-    private var failLogCount = 0
-
-    init(label: String) {
-        queue = DispatchQueue(label: label, qos: .userInitiated)
-    }
-
-    deinit {
-        if let transfer { VTPixelTransferSessionInvalidate(transfer) }
-    }
-
-    // 必须在 self.queue（或调用方保证独占）上调用。返回的缓冲属于这个工人，下次 convert 前有效。
-    func convert(_ data: Data) -> CVPixelBuffer? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let cgImage = CGImageSourceCreateImageAtIndex(
-                source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) else {
-            failLogCount += 1
-            if failLogCount <= 3 || failLogCount % 90 == 0 {
-                StreamDecoder.dlog("JPEG 解码失败 bytes=\(data.count) 累计=\(failLogCount)")
-            }
-            return nil
-        }
-        let width = cgImage.width
-        let height = cgImage.height
-        if nv == nil || bgra == nil ||
-            CVPixelBufferGetWidth(nv!) != width || CVPixelBufferGetHeight(nv!) != height {
-            var newNV: CVPixelBuffer?
-            var newBGRA: CVPixelBuffer?
-            // 属性传 nil：普通内存，不要 IOSurface（这台越狱机上带 IOSurface 属性每帧都创建失败）
-            let nvStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                               kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, nil, &newNV)
-            let bgStatus = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                               kCVPixelFormatType_32BGRA, nil, &newBGRA)
-            if nvStatus != kCVReturnSuccess || bgStatus != kCVReturnSuccess {
-                StreamDecoder.dlog("缓冲创建状态 NV12=\(nvStatus) BGRA=\(bgStatus) \(width)x\(height)")
-            }
-            nv = newNV
-            bgra = newBGRA
-        }
-        guard let buffer = nv, let bgra else { return nil }
-
-        // 第一步：JPEG 的像素画进 BGRA 缓冲（纯 CPU，不碰 GPU）
-        CVPixelBufferLockBaseAddress(bgra, [])
-        if let base = CVPixelBufferGetBaseAddress(bgra),
-           let ctx = CGContext(data: base, width: width, height: height, bitsPerComponent: 8,
-                               bytesPerRow: CVPixelBufferGetBytesPerRow(bgra),
-                               space: CGColorSpaceCreateDeviceRGB(),
-                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                   | CGBitmapInfo.byteOrder32Little.rawValue) {
-            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        CVPixelBufferUnlockBaseAddress(bgra, [])
-
-        // 第二步：BGRA → NV12 全范围（系统自带的像素转换服务）
-        if transfer == nil {
-            VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transfer)
-        }
-        var convertStatus: OSStatus = -1
-        if let transfer {
-            convertStatus = VTPixelTransferSessionTransferImage(transfer, from: bgra, to: buffer)
-        }
-        if convertStatus != noErr {
-            failLogCount += 1
-            if failLogCount <= 3 || failLogCount % 90 == 0 {
-                StreamDecoder.dlog("像素转换失败 status=\(convertStatus)，改用软件转换")
-            }
-            softwareContext.render(CIImage(cvPixelBuffer: bgra), to: buffer,
-                                   bounds: CGRect(x: 0, y: 0, width: width, height: height),
-                                   colorSpace: CGColorSpaceCreateDeviceRGB())
-        }
-        return buffer
-    }
-}
-
-final class StreamDecoder {
-    static let logPath = "/var/mobile/Media/DCIM/.dec.log"
-    private var softwareDecoder: UnsafeMutableRawPointer?
-    private var videoToolboxSession: VTDecompressionSession?
-    private var videoFormatDescription: CMVideoFormatDescription?
-    private var sps = Data()
-    private var pps = Data()
-    private var frameIndex: Int64 = 0
-    private let queue = DispatchQueue(label: "auxcam.dec", qos: .userInitiated)
-    private let outputLock = NSLock()
-    private var retainedFrame: CVPixelBuffer?
-    private var callbackCount = 0
-    private var lastCallbackStatus: OSStatus = noErr
-    private var waitingForKeyframe = true
-    private var decodeCallCount: Int64 = 0
-    private var activeDecodeCall: Int64 = 0
-    private var sessionGeneration: Int64 = 0
-    private var goldenTestStarted = false
-    private let goldenTestLock = NSLock()
-    // OpenH264 只在解码器初始化时补一次 SPS/PPS。
-    // 实测：每帧都补会让解码器判坏帧、永不吐图（ffmpeg 复现同样现象）。
-    private var openH264NeedsParameterSets = true
-    private var openH264ErrorStreak = 0
-    private var openH264ErrorTotal = 0
-    private var vtAttrVariant = 0
-    private var lastVTRetryAt: Double = 0   // AUXRETRY: 软解时每隔一会儿自动试着切回硬解
-    // 防重建（AUXNOTHRASH）：偶发的单帧 -12911 不再整条推倒重建解码器。
-    // 只有连续失败到阈值才重建；记住一个能用的属性方案，别每次从 0 重来；
-    // 硬解反复起不来（比如开直播时抖音占着硬件芯片）就退到软解稳住，不再每 10 秒反复横跳。
-    private var vtRejectStreak = 0            // 连续被拒的帧数
-    private var vtGoodVariant = -1            // 曾经成功出图的属性方案；-1=还没有
-    private var vtGiveUpCount = 0             // 从硬解整体退到软解的累计次数
-    private var vtRetryBackoff: Double = 30   // 软解→硬解的重试间隔（秒），会指数退避
-    private static let vtRejectRebuildThreshold = 8   // 连续被拒多少帧才重建
-    private static let vtMaxGiveUps = 4               // 退到软解这么多次后，本次会话不再试硬解
-    // 抖动缓冲（AUXPACER）：解码出来的画面先排队，再按固定 30 帧的节奏交给相机插件。
-    // 电脑/USB 送画面时快时慢，直接交出去会让相机里的画面一顿一顿；排一两帧的队就能抹平。
-    static let pacerEnabled = true
-    private let pacerLock = NSLock()
-    private var pacerQueue: [CVImageBuffer] = []
-    private var pacerPrimed = false
-    private var pacerHoldTicks = 0
-    private var pacerTimer: DispatchSourceTimer?
-    private var pacerTicks = 0
-    private var pacerUnderflow = 0
-    private var pacerOverflow = 0
-    private var pacerMaxDepth = 0
-    private let pacerTargetDepth = 2
-    // MJPEG 路径：系统硬件 JPEG 解码 + Core Image GPU 转 NV12（全范围）
-    // 注意：这里不再创建 GPU 的 CIContext —— 它在 App 一启动（成员初始化）时就去建 GPU 上下文，
-    // 这台越狱机上建不起来会空指针段错误，App 必闪退。改成：ImageIO 解 JPEG → BGRA 中转 → 系统像素转换成 NV12。
-    // CPU 解码工人：jpegMainWorker 只在 self.queue 上用（硬件还可能可用时的单线程路径）；
-    // 确认硬件不可用后改用 jpegWorkers 两个并行工人。
-    private let jpegMainWorker = JPEGCPUWorker(label: "auxcam.jpeg.main")
-    private let jpegWorkers = [JPEGCPUWorker(label: "auxcam.jpeg.0"), JPEGCPUWorker(label: "auxcam.jpeg.1")]
-    private var jpegWorkerBusy = [false, false]     // 受 jpegPendingLock 保护
-    private var jpegCPUOnly = false                 // 受 jpegPendingLock 保护：true=走并行 CPU 工人
-    private var jpegSeqIn: Int64 = 0                // 受 jpegPendingLock 保护：收到的帧序号
-    private var jpegQueueSeq: Int64 = 0             // 只在 self.queue 上用：当前单线程路径正在解的帧序号
-    private let jpegPublishLock = NSLock()
-    private var jpegLastPublishedSeq: Int64 = 0     // 受 jpegPublishLock 保护：并行解完的帧按序号发布，晚到的旧帧丢掉
-    private var jpegFrameCount: Int64 = 0           // 受 jpegPublishLock 保护
-    private var jpegEntered: Int64 = 0
-    // 硬件 JPEG 解码（VideoToolbox）：JPEG 直接解成 NV12，省掉 CPU 上的解码、BGRA 中转和颜色转换。
-    // 失败会自动退回下面原来的 ImageIO 路径，所以最坏情况也只是和现在一样。
-    private var jpegVTSession: VTDecompressionSession?
-    private var jpegVTFormat: CMVideoFormatDescription?
-    private var jpegVTWidth = 0
-    private var jpegVTHeight = 0
-    private var jpegVTFailStreak = 0
-    private var jpegVTDisabled = false
-    private var jpegVTDisabledAt: Double = 0   // 硬解被临时关掉的时刻：冷却一段时间后自动再试一次
-    private var jpegVTCooldown: Double = 15     // 冷却时长，连续失败会翻倍(上限 300 秒)
-    private var jpegVTRetrying = false          // 当前是冷却后的重试：失败 1 次就立刻退回 CPU
-    private var jpegVTEverWorked = false        // 本次运行硬件 JPEG 是否成功过
-    private var jpegVTGiveUps = 0
-    private var jpegVTPermanentlyOff = false    // 从没成功过且反复失败：本次运行不再试（实测这台机一直 -12911）
-    private var jpegVTCount: Int64 = 0
-    private let jpegVTLock = NSLock()
-    private var jpegVTOutput: CVPixelBuffer?
-    private var jpegVTStatus: OSStatus = noErr
-    // 背压：解码来不及时只保留最新一帧，旧帧直接丢，防止帧排队把内存撑爆被系统杀掉。
-    private let jpegPendingLock = NSLock()
-    private var jpegPending: (Data, Int64)?
-    private var jpegDraining = false
-    private let goldenDiffLock = NSLock()
-    private var goldenFormatFields: [String: String]?
-    private var goldenSampleFields: [String: String]?
-    private static var buildCount: Int = 0
-    private static var feedCount: Int = 0
-    private static let runID = String(UUID().uuidString.prefix(8))
-    // 背压（AUXBP-H264 v2）：收网络线程调 feed 后立刻返回，永不被解码拖住（电脑端不会被 TCP 反压）。
-    // ⚠️ H.264 的 P 帧依赖前一帧，绝不能"只留最新一帧"随便丢 —— 丢一帧参考链就断，
-    // 下一帧必然解码失败 → 一直黑到下一个关键帧（实测日志：关键帧间隔 30 秒+，整段没画面）。
-    // 所以改成有序队列：正常情况下一帧不丢；真积压超过上限才整段丢弃并跳到下一个关键帧（丢在 GOP 边界，解码不会坏）。
-    private let h264PendingLock = NSLock()
-    private var h264Pending: [(Data, Bool)] = []
-    private var h264Draining = false
-    private var h264SkipToIDR = false
-    private var h264Dropped = 0
-    private static let h264MaxPending = 20   // 约 0.66 秒（30fps）。足够吸收试硬解/建会话时那 100ms 左右的停顿
-
-    deinit {
-        if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
-        if let jpegVTSession { VTDecompressionSessionInvalidate(jpegVTSession) }
-        if let softwareDecoder { auxh264_destroy(softwareDecoder) }
-        pacerTimer?.cancel()
-    }
-    static func dlog(_ s: String) {
-        let line = String(format: "%.6f [%@] %@\n", Date().timeIntervalSince1970, runID, s)
-        if let h = FileHandle(forWritingAtPath: logPath) {
-            h.seekToEndOfFile()
-            h.write(line.data(using: .utf8) ?? Data())
-            try? h.close()
-        } else {
-            try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
-        }
-    }
-
-    // 解码帧在这里同步写入 App 与相机插件共享的画面文件。
-    static let frameCallback: VTDecompressionOutputCallback = { outputRefCon, sourceFrameRefCon, status, _, imageBuffer, _, _ in
-        guard let outputRefCon else { return }
-        let decoder = Unmanaged<StreamDecoder>.fromOpaque(outputRefCon).takeUnretainedValue()
-        let sourceFrameID = sourceFrameRefCon.map { Int64(Int(bitPattern: $0)) } ?? 0
-        decoder.publish(status: status, imageBuffer: imageBuffer, sourceFrameID: sourceFrameID)
-    }
-
-    func setConfig(sps: Data, pps: Data) {
-        clearPendingH264()   // 旧配置下排着的帧不能拿新 SPS/PPS 去解
-        queue.sync {
-            let changed = (sps != self.sps || pps != self.pps)
-            self.sps = sps
-            self.pps = pps
-            self.frameIndex = 0
-            if changed {
-                // 真正换了码流参数(新流/新分辨率)：给硬解一次全新机会，清掉之前的放弃/退避状态。
-                self.vtGiveUpCount = 0
-                self.vtRetryBackoff = 30
-                self.vtGoodVariant = -1
-                self.vtAttrVariant = 0
-                self.vtRejectStreak = 0
-            }
-            self.setWaitingForKeyframe(true)
-            self.resetPacer()
-            self.build()
-        }
-    }
-
-    // 用系统 AVAssetReader 提供的原生压缩 CMSampleBuffer 做一次独立基线。
-    // 这条路径不改 sample、不使用实时 session，也不把测试帧发布给相机插件。
-    // 收到首个 VCU1 配置后自动在 utility 队列运行一次，避免影响主线程和实时解码队列。
-    func testGoldenPath() {
-        let url = URL(fileURLWithPath: "/var/mobile/Media/DCIM/vcam.mp4")
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            StreamDecoder.dlog("golden skipped: vcam.mp4 not found")
-            return
-        }
-        goldenTestLock.lock()
-        guard !goldenTestStarted else {
-            goldenTestLock.unlock()
-            return
-        }
-        goldenTestStarted = true
-        goldenTestLock.unlock()
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.runGoldenPath(url: url)
-        }
-    }
-
-    private final class GoldenProbe {
-        private let lock = NSLock()
-        private var callbackCount = 0
-        private var callbackStatus: OSStatus?
-        private var gotImage = false
-        private var retainedImage: CVImageBuffer?
-
-        func record(status: OSStatus, imageBuffer: CVImageBuffer?) {
-            lock.lock()
-            callbackCount += 1
-            callbackStatus = status
-            gotImage = imageBuffer != nil
-            retainedImage = imageBuffer
-            lock.unlock()
-        }
-
-        func summary() -> String {
-            lock.lock()
-            defer { lock.unlock() }
-            return "callbacks=\(callbackCount) callbackStatus=\(callbackStatus.map { String($0) } ?? "none") image=\(gotImage)"
-        }
-    }
-
-    private static let goldenCallback: VTDecompressionOutputCallback = { outputRefCon, _, status, _, imageBuffer, _, _ in
-        guard let outputRefCon else { return }
-        let probe = Unmanaged<GoldenProbe>.fromOpaque(outputRefCon).takeUnretainedValue()
-        probe.record(status: status, imageBuffer: imageBuffer)
-        StreamDecoder.dlog("golden callback status=\(status) image=\(imageBuffer != nil)")
-    }
-
-    private func runGoldenPath(url: URL) {
-        StreamDecoder.dlog("golden begin path=\(url.path)")
-        var reader: AVAssetReader?
-        var decoderSession: VTDecompressionSession?
-        defer {
-            if let decoderSession { VTDecompressionSessionInvalidate(decoderSession) }
-            reader?.cancelReading()
-        }
-
-        do {
-            let asset = AVURLAsset(url: url)
-            guard let track = asset.tracks(withMediaType: .video).first else {
-                StreamDecoder.dlog("golden failed: no video track")
-                return
-            }
-            let trackFormats = track.formatDescriptions
-            if let firstFormat = trackFormats.first {
-                let format = firstFormat as! CMVideoFormatDescription
-                StreamDecoder.dlog("golden track format count=\(trackFormats.count) \(Self.formatSummary(format))")
-            } else {
-                StreamDecoder.dlog("golden track format descriptions count=\(trackFormats.count)")
-            }
-            let r = try AVAssetReader(asset: asset)
-            reader = r
-            // nil 表示读取 MP4 中原始压缩样本；不让 AVAssetReader 先解码/转码。
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            output.alwaysCopiesSampleData = false
-            guard r.canAdd(output) else {
-                StreamDecoder.dlog("golden failed: reader cannot add track output")
-                return
-            }
-            r.add(output)
-            guard r.startReading() else {
-                StreamDecoder.dlog("golden failed: startReading status=\(String(describing: r.status)) error=\(String(describing: r.error))")
-                return
-            }
-            guard let rawSample = output.copyNextSampleBuffer() else {
-                StreamDecoder.dlog("golden failed: no first sample readerStatus=\(String(describing: r.status)) error=\(String(describing: r.error))")
-                return
-            }
-            StreamDecoder.dlog("golden raw sample \(Self.sampleSummary(rawSample))")
-            guard let firstFormat = trackFormats.first else {
-                StreamDecoder.dlog("golden failed: track has no video format description")
-                return
-            }
-            let format = firstFormat as! CMVideoFormatDescription
-            var sample = rawSample
-            if CMSampleBufferGetFormatDescription(rawSample) == nil {
-                guard CMSampleBufferGetNumSamples(rawSample) == 1,
-                      let block = CMSampleBufferGetDataBuffer(rawSample) else {
-                    StreamDecoder.dlog("golden failed: raw sample cannot be rebuilt")
-                    return
-                }
-                var timing = CMSampleTimingInfo()
-                let timingStatus = CMSampleBufferGetSampleTimingInfo(rawSample, at: 0, timingInfoOut: &timing)
-                guard timingStatus == noErr else {
-                    StreamDecoder.dlog("golden failed: raw timing status=\(timingStatus)")
-                    return
-                }
-                var sampleSize = CMBlockBufferGetDataLength(block)
-                var rebuilt: CMSampleBuffer?
-                let rebuildStatus = CMSampleBufferCreateReady(
-                    allocator: kCFAllocatorDefault,
-                    dataBuffer: block,
-                    formatDescription: format,
-                    sampleCount: 1,
-                    sampleTimingEntryCount: 1,
-                    sampleTimingArray: &timing,
-                    sampleSizeEntryCount: 1,
-                    sampleSizeArray: &sampleSize,
-                    sampleBufferOut: &rebuilt)
-                guard rebuildStatus == noErr, let rebuilt else {
-                    StreamDecoder.dlog("golden failed: rebuild status=\(rebuildStatus)")
-                    return
-                }
-                sample = rebuilt
-                StreamDecoder.dlog("golden sample rebuilt from native block")
-            }
-
-            StreamDecoder.dlog("golden format \(Self.formatSummary(format))")
-            StreamDecoder.dlog("golden sample \(Self.sampleSummary(sample))")
-            goldenDiffLock.lock()
-            goldenFormatFields = Self.formatFields(format)
-            goldenSampleFields = Self.sampleFields(sample)
-            goldenDiffLock.unlock()
-            let probe = GoldenProbe()
-            var callback = VTDecompressionOutputCallbackRecord(
-                decompressionOutputCallback: StreamDecoder.goldenCallback,
-                decompressionOutputRefCon: Unmanaged.passUnretained(probe).toOpaque())
-            let imageAttributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
-            ]
-            let createStatus = VTDecompressionSessionCreate(
-                allocator: kCFAllocatorDefault, formatDescription: format,
-                decoderSpecification: nil, imageBufferAttributes: imageAttributes as CFDictionary,
-                outputCallback: &callback, decompressionSessionOut: &decoderSession)
-            guard createStatus == noErr, let session = decoderSession else {
-                StreamDecoder.dlog("golden create failed status=\(createStatus) session=\(decoderSession != nil)")
-                return
-            }
-            VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-            var hardwareValue: CFTypeRef?
-            let hardwareStatus = VTSessionCopyProperty(
-                session,
-                key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-                allocator: kCFAllocatorDefault,
-                valueOut: &hardwareValue)
-            StreamDecoder.dlog("golden session hardwareStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
-
-            var info = VTDecodeInfoFlags()
-            StreamDecoder.dlog("golden DecodeFrame begin sample=\(Self.sampleSummary(sample))")
-            let decodeStatus = VTDecompressionSessionDecodeFrame(
-                session, sampleBuffer: sample, flags: [], frameRefcon: nil, infoFlagsOut: &info)
-            StreamDecoder.dlog("golden DecodeFrame returned status=\(decodeStatus) info=\(info.rawValue)")
-            let waitStatus = VTDecompressionSessionWaitForAsynchronousFrames(session)
-            StreamDecoder.dlog("golden result create=\(createStatus) decode=\(decodeStatus) wait=\(waitStatus) \(probe.summary())")
-        } catch {
-            StreamDecoder.dlog("golden failed: \(error.localizedDescription)")
-        }
-    }
-
-    private static func formatSummary(_ format: CMVideoFormatDescription) -> String {
-        formatFields(format).keys.sorted().map { "\($0)=\(formatFields(format)[$0] ?? "nil")" }.joined(separator: " ")
-    }
-
-    private static func formatFields(_ format: CMVideoFormatDescription) -> [String: String] {
-        let dimensions = CMVideoFormatDescriptionGetDimensions(format)
-        var parameterSetPointer: UnsafePointer<UInt8>?
-        var parameterSetSize = 0
-        var parameterSetCount = 0
-        var nalUnitHeaderLength: Int32 = 0
-        let parameterSetStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            format, parameterSetIndex: 0,
-            parameterSetPointerOut: &parameterSetPointer,
-            parameterSetSizeOut: &parameterSetSize,
-            parameterSetCountOut: &parameterSetCount,
-            nalUnitHeaderLengthOut: &nalUnitHeaderLength)
-        let subtype = CMFormatDescriptionGetMediaSubType(format)
-        return [
-            "subtype": "0x\(String(subtype, radix: 16))",
-            "dimensions": "\(dimensions.width)x\(dimensions.height)",
-            "parameterSetStatus": String(parameterSetStatus),
-            "parameterSetCount": String(parameterSetCount),
-            "firstParameterSetSize": String(parameterSetSize),
-            "nalUnitHeaderLength": String(nalUnitHeaderLength),
-        ]
-    }
-
-    private static func sampleSummary(_ sample: CMSampleBuffer) -> String {
-        sampleFields(sample).keys.sorted().map { "\($0)=\(sampleFields(sample)[$0] ?? "nil")" }.joined(separator: " ")
-    }
-
-    private static func sampleFields(_ sample: CMSampleBuffer) -> [String: String] {
-        let sampleCount = CMSampleBufferGetNumSamples(sample)
-        let sampleSize = sampleCount > 0 ? CMSampleBufferGetSampleSize(sample, at: 0) : 0
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
-        let attachmentsText = attachments.map { String(describing: $0) } ?? "nil"
-        var blockText = "none"
-        if let block = CMSampleBufferGetDataBuffer(sample) {
-            let length = CMBlockBufferGetDataLength(block)
-            var lengthAtOffset = 0
-            var totalLength = 0
-            var dataPointer: UnsafeMutablePointer<Int8>?
-            let pointerStatus = CMBlockBufferGetDataPointer(
-                block, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset,
-                totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-            let isReady = pointerStatus == noErr && dataPointer != nil
-            blockText = "len:\(length)|ptrStatus:\(pointerStatus)|contiguousAtZero:\(lengthAtOffset)|total:\(totalLength)|ready:\(isReady)"
-        }
-        var sampleTiming = CMSampleTimingInfo()
-        let timingStatus = sampleCount > 0 ? CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &sampleTiming) : -1
-        return [
-            "sampleCount": String(sampleCount),
-            "sampleSize[0]": String(sampleSize),
-            "block": blockText,
-            "bufferPTS": String(describing: CMSampleBufferGetPresentationTimeStamp(sample)),
-            "bufferDTS": String(describing: CMSampleBufferGetDecodeTimeStamp(sample)),
-            "bufferDuration": String(describing: CMSampleBufferGetDuration(sample)),
-            "timingStatus": String(timingStatus),
-            "timing.duration": String(describing: sampleTiming.duration),
-            "timing.pts": String(describing: sampleTiming.presentationTimeStamp),
-            "timing.dts": String(describing: sampleTiming.decodeTimeStamp),
-            "attachments": attachmentsText,
-        ]
-    }
-
-    private static func fieldDiff(reference: [String: String], candidate: [String: String]) -> String {
-        let keys = Set(reference.keys).union(candidate.keys).sorted()
-        let differences = keys.compactMap { key -> String? in
-            let left = reference[key] ?? "<missing>"
-            let right = candidate[key] ?? "<missing>"
-            guard left != right else { return nil }
-            return "\(key){golden=\(left),manual=\(right)}"
-        }
-        return differences.isEmpty ? "no differences" : differences.joined(separator: " ")
-    }
-
-    private func logGoldenDiff(kind: String, candidate: [String: String]) {
-        goldenDiffLock.lock()
-        let reference = kind == "format" ? goldenFormatFields : goldenSampleFields
-        goldenDiffLock.unlock()
-        guard let reference else {
-            StreamDecoder.dlog("golden diff \(kind): baseline not ready")
-            return
-        }
-        StreamDecoder.dlog("golden diff \(kind): \(Self.fieldDiff(reference: reference, candidate: candidate))")
-    }
-
-    func feed(_ raw: Data, keyframe: Bool) {
-        // 关键：这里不用 queue.sync 等解码完成 —— 收网络线程立刻返回，解码慢也不卡收包。
-        // 电脑端的 keyframe 标志可能不准，只认数据里真正的 IDR(类型 5)，免得把 P 帧当关键帧、误丢它前面的帧。
-        let isIDR = Self.containsIDR(raw)
-        var droppedNow = 0
-        h264PendingLock.lock()
-        if isIDR {
-            // 关键帧之前排着的旧帧可以安全丢掉（关键帧不依赖它们）。只在已经积压时丢，平时照常按顺序解。
-            if h264Pending.count >= 2 { droppedNow = h264Pending.count; h264Pending.removeAll() }
-            h264SkipToIDR = false
-            h264Pending.append((raw, keyframe))
-        } else if h264SkipToIDR {
-            droppedNow = 1                  // 正在等关键帧：这一段的 P 帧解了也是坏的
-        } else if h264Pending.count >= Self.h264MaxPending {
-            // 解码持续跟不上：整段丢弃，直接跳到下一个关键帧，避免延迟越积越大
-            droppedNow = h264Pending.count + 1
-            h264Pending.removeAll()
-            h264SkipToIDR = true
-        } else {
-            h264Pending.append((raw, keyframe))
-        }
-        h264Dropped += droppedNow
-        let totalDropped = h264Dropped
-        let alreadyDraining = h264Draining
-        if !alreadyDraining && !h264Pending.isEmpty { h264Draining = true }
-        let shouldStart = !alreadyDraining && !h264Pending.isEmpty
-        h264PendingLock.unlock()
-        if droppedNow > 0 && (totalDropped <= droppedNow || totalDropped % 300 < droppedNow) {
-            StreamDecoder.dlog("解码积压，丢弃 \(droppedNow) 帧(累计 \(totalDropped))，从下一个关键帧继续")
-        }
-        if shouldStart { queue.async { [weak self] in self?.drainH264() } }
-    }
-
-    private func drainH264() {
-        while true {
-            h264PendingLock.lock()
-            guard !h264Pending.isEmpty else {
-                h264Draining = false
-                h264PendingLock.unlock()
-                return
-            }
-            let next = h264Pending.removeFirst()
-            h264PendingLock.unlock()
-            autoreleasepool { decode(next.0, keyframe: next.1) }
-        }
-    }
-
-    private func clearPendingH264() {
-        h264PendingLock.lock()
-        h264Pending.removeAll()
-        h264SkipToIDR = false
-        h264PendingLock.unlock()
-    }
-
-    // 快速判断这包里有没有 IDR(类型 5) 切片
-    private static func containsIDR(_ data: Data) -> Bool {
-        for range in splitAnnexBRanges(data) where range.lowerBound < data.count {
-            if data[range.lowerBound] & 0x1F == 5 { return true }
-        }
-        return false
-    }
-
-    private func setWaitingForKeyframe(_ value: Bool) {
-        outputLock.lock()
-        waitingForKeyframe = value
-        outputLock.unlock()
-    }
-
-    private func isWaitingForKeyframe() -> Bool {
-        outputLock.lock()
-        let value = waitingForKeyframe
-        outputLock.unlock()
-        return value
-    }
-
-    private func callbackStatus() -> OSStatus {
-        outputLock.lock()
-        let value = lastCallbackStatus
-        outputLock.unlock()
-        return value
-    }
-
-    private func resetPacer() {
-        pacerLock.lock()
-        pacerQueue.removeAll()
-        pacerPrimed = false
-        pacerHoldTicks = 0
-        pacerLock.unlock()
-    }
-
-    private func pacerEnqueue(_ buffer: CVImageBuffer) {
-        pacerLock.lock()
-        pacerQueue.append(buffer)
-        if pacerQueue.count > pacerMaxDepth { pacerMaxDepth = pacerQueue.count }
-        let needTimer = pacerTimer == nil
-        pacerLock.unlock()
-        if needTimer { startPacer() }
-    }
-
-    private func startPacer() {
-        pacerLock.lock()
-        if pacerTimer != nil {
-            pacerLock.unlock()
-            return
-        }
-        let timer = DispatchSource.makeTimerSource(
-            flags: .strict,
-            queue: DispatchQueue(label: "auxcam.pacer", qos: .userInteractive))
-        timer.schedule(deadline: .now(), repeating: .nanoseconds(33_333_333), leeway: .milliseconds(1))
-        timer.setEventHandler { [weak self] in
-            self?.pacerTick()
-        }
-        pacerTimer = timer
-        pacerLock.unlock()
-        timer.resume()
-    }
-
-    // 每 1/30 秒走一次：队列里攒够 2 张才开始放，每次放 1 张；来得太快就丢最旧的，来得太慢就让相机重复上一张。
-    private func pacerTick() {
-        var frame: CVImageBuffer?
-        pacerLock.lock()
-        pacerTicks += 1
-        if pacerQueue.isEmpty {
-            pacerUnderflow += 1
-            pacerPrimed = false
-            pacerHoldTicks = 0
-        } else {
-            if !pacerPrimed && pacerQueue.count >= pacerTargetDepth { pacerPrimed = true }
-            // 低帧率源(或电脑刚停推)时可能一直凑不够 2 张，旧逻辑会把这 1 张永远扣着不放。
-            // 等满 3 拍(约 100ms)还凑不齐，就直接放出去。
-            if !pacerPrimed {
-                pacerHoldTicks += 1
-                if pacerHoldTicks >= 3 { pacerPrimed = true }
-            }
-            if pacerPrimed {
-                pacerHoldTicks = 0
-                while pacerQueue.count > pacerTargetDepth + 1 {
-                    pacerQueue.removeFirst()
-                    pacerOverflow += 1
-                }
-                frame = pacerQueue.removeFirst()
-            }
-        }
-        let ticks = pacerTicks
-        let under = pacerUnderflow
-        let over = pacerOverflow
-        let maxDepth = pacerMaxDepth
-        let depth = pacerQueue.count
-        if ticks % 90 == 0 { pacerMaxDepth = depth }
-        pacerLock.unlock()
-        if let frame {
-            let result = auxcam_publish_shared_frame(frame)
-            if result != 1 && ticks % 90 == 0 {
-                StreamDecoder.dlog("shared frame publish failed result=\(result) errno=\(errno)")
-            }
-        }
-        if ticks % 90 == 0 {
-            StreamDecoder.dlog("抖动缓冲 ticks=\(ticks) 队列=\(depth) 最大=\(maxDepth) 空=\(under) 溢出=\(over)")
-        }
-    }
-
-    private func publish(status: OSStatus, imageBuffer: CVImageBuffer?, sourceFrameID: Int64) {
-        outputLock.lock()
-        callbackCount += 1
-        let count = callbackCount
-        lastCallbackStatus = status
-        let activeCall = activeDecodeCall
-        if status != noErr { waitingForKeyframe = true }
-        guard status == noErr, let imageBuffer else {
-            outputLock.unlock()
-            if count <= 3 || count % 90 == 0 {
-                StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=\(status)")
-            }
-            return
-        }
-        retainedFrame = imageBuffer
-        outputLock.unlock()
-
-        StreamPictureInPicture.shared.enqueue(imageBuffer)
-
-        if StreamDecoder.pacerEnabled {
-            pacerEnqueue(imageBuffer)
-            if count <= 3 || count % 90 == 0 {
-                StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=0 paced=queued")
-            }
-            return
-        }
-
-        let publishResult = auxcam_publish_shared_frame(imageBuffer)
-        if publishResult != 1 {
-            if count <= 3 || count % 90 == 0 {
-                StreamDecoder.dlog("shared frame publish failed result=\(publishResult) errno=\(errno)")
-            }
-            return
-        }
-        if count <= 3 || count % 90 == 0 {
-            StreamDecoder.dlog("callback #\(count) sourceFrame=\(sourceFrameID) activeCall=\(activeCall) status=0 sharedFrame=ok")
-        }
-    }
-
-    private func build() {
-        guard sps.count > 3, pps.count > 3 else {
-            StreamDecoder.dlog("decoder waiting for SPS/PPS")
-            return
-        }
-        if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
-        videoToolboxSession = nil
-        videoFormatDescription = nil
-        if let softwareDecoder { auxh264_destroy(softwareDecoder) }
-        softwareDecoder = nil
-        StreamDecoder.buildCount += 1
-
-        let formatStatus = sps.withUnsafeBytes { spsBytes -> OSStatus in
-            pps.withUnsafeBytes { ppsBytes -> OSStatus in
-                guard let spsPointer = spsBytes.bindMemory(to: UInt8.self).baseAddress,
-                      let ppsPointer = ppsBytes.bindMemory(to: UInt8.self).baseAddress else {
-                    return -1
-                }
-                let pointers = [spsPointer, ppsPointer]
-                var sizes = [sps.count, pps.count]
-                var format: CMVideoFormatDescription?
-                let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
-                    parameterSetPointers: pointers,
-                    parameterSetSizes: &sizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &format)
-                guard status == noErr, let format else { return status }
-                videoFormatDescription = format
-                var callback = VTDecompressionOutputCallbackRecord(
-                    decompressionOutputCallback: StreamDecoder.frameCallback,
-                    decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-                let dimensions = CMVideoFormatDescriptionGetDimensions(format)
-                // 输出缓冲属性有 3 种写法，按 vtAttrVariant 依次尝试（0 最完整，2 完全交给系统）。
-                // 实测第 0 种在这台机器上第一帧就报 -12911，所以失败时自动换下一种再试。
-                var imageAttributes: [String: Any]? = [
-                    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                    kCVPixelBufferWidthKey as String: NSNumber(value: Int(dimensions.width)),
-                    kCVPixelBufferHeightKey as String: NSNumber(value: Int(dimensions.height)),
-                    kCVPixelBufferOpenGLESCompatibilityKey as String: kCFBooleanTrue as Any,
-                    kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-                ]
-                if vtAttrVariant == 1 {
-                    imageAttributes = [
-                        kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-                    ]
-                } else if vtAttrVariant >= 2 {
-                    imageAttributes = nil
-                }
-                StreamDecoder.dlog("VideoToolbox 输出属性方案 \(vtAttrVariant)")
-                var session: VTDecompressionSession?
-                let createStatus = VTDecompressionSessionCreate(
-                    allocator: kCFAllocatorDefault,
-                    formatDescription: format,
-                    decoderSpecification: nil,
-                    imageBufferAttributes: imageAttributes.map { $0 as CFDictionary },
-                    outputCallback: &callback,
-                    decompressionSessionOut: &session)
-                guard createStatus == noErr, let session else { return createStatus }
-                videoToolboxSession = session
-                VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-                var hardwareValue: CFTypeRef?
-                let hardwareStatus = VTSessionCopyProperty(
-                    session,
-                    key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-                    allocator: kCFAllocatorDefault,
-                    valueOut: &hardwareValue)
-                StreamDecoder.dlog("VideoToolbox session ready hardwareRequested=default propertyStatus=\(hardwareStatus) hardware=\(String(describing: hardwareValue))")
-                return noErr
-            }
-        }
-
-        if videoToolboxSession == nil {
-            softwareDecoder = auxh264_create()
-            openH264NeedsParameterSets = true
-            StreamDecoder.dlog("VideoToolbox unavailable status=\(formatStatus); OpenH264 fallback=\(softwareDecoder != nil)")
-        } else {
-            StreamDecoder.dlog("VideoToolbox hardware session ready generation=\(StreamDecoder.buildCount)")
-        }
-    }
-
-    private func decode(_ raw: Data, keyframe: Bool) {
-        StreamDecoder.feedCount += 1
-        let nalRanges = Self.splitAnnexBRanges(raw)
-        let types = nalRanges.compactMap { range -> UInt8? in
-            guard range.lowerBound < raw.count else { return nil }
-            return raw[range.lowerBound] & 0x1F
-        }
-        let hasIDR = types.contains(5)
-        let inputCount = StreamDecoder.feedCount
-        if inputCount <= 3 || inputCount % 90 == 0 {
-            let typeList = types.prefix(8).map { String($0) }.joined(separator: ",")
-            StreamDecoder.dlog("decode input #\(inputCount) bytes=\(raw.count) nals=\(typeList) idr=\(hasIDR) keyframe=\(keyframe) waiting=\(isWaitingForKeyframe())")
-        }
-        guard types.contains(where: { $0 == 1 || $0 == 5 }) else { return }
-        if keyframe != hasIDR {
-            StreamDecoder.dlog("keyframe flag mismatch flag=\(keyframe) IDR=\(hasIDR)")
-        }
-        if isWaitingForKeyframe() && !hasIDR { return }
-        if hasIDR { setWaitingForKeyframe(false) }
-
-        // 在软解、遇到关键帧时才考虑切回硬解：间隔指数退避(30→60→…→240s)，
-        // 反复起不来(例如开直播时抖音占着硬件芯片)累计到上限就彻底不试了，稳在软解，避免无休止重建。
-        if videoToolboxSession == nil && softwareDecoder != nil && hasIDR
-            && vtGiveUpCount < StreamDecoder.vtMaxGiveUps {
-            let retryNow = CFAbsoluteTimeGetCurrent()
-            if retryNow - lastVTRetryAt > vtRetryBackoff {
-                lastVTRetryAt = retryNow
-                vtRetryBackoff = min(vtRetryBackoff * 2, 240)
-                vtAttrVariant = max(0, vtGoodVariant)   // 从上次能用的方案起，别每次从 0 重来
-                StreamDecoder.dlog("硬解重试(第\(vtGiveUpCount + 1)次机会，下次最早\(Int(vtRetryBackoff))s 后)")
-                build()
-            }
-        }
-
-        if videoToolboxSession != nil {
-            let slices = nalRanges.filter { range in
-                guard range.lowerBound < raw.count else { return false }
-                let type = raw[range.lowerBound] & 0x1F
-                return type == 1 || type == 5
-            }
-            if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) {
-                vtRejectStreak = 0              // 出图成功：清零连续失败，并记住这个能用的方案
-                vtGoodVariant = vtAttrVariant
-                return
-            }
-            vtRejectStreak += 1
-            if vtGoodVariant < 0 {
-                // 启动期：还没有任何能用的输出属性方案。本机实测"方案0"第一帧必被拒(-12911)，
-                // 必须在这一个关键帧上立刻把剩下的方案依次试一遍，秒级出图——
-                // 绝不能像稳态那样慢慢等(否则关键帧 2 秒才一个，凑够阈值要十几秒，画面一直黑)。
-                if hasIDR {
-                    while vtAttrVariant < 2 {
-                        vtAttrVariant += 1
-                        StreamDecoder.dlog("启动期换输出属性方案 \(vtAttrVariant) 立即重试本帧")
-                        build()
-                        guard videoToolboxSession != nil else { break }
-                        if decodeVideoToolbox(raw, slices: slices, isKeyframe: hasIDR) {
-                            vtRejectStreak = 0
-                            vtGoodVariant = vtAttrVariant
-                            return
-                        }
-                    }
-                    // 本帧上三种方案都没出图 → 落到下面退软解
-                } else {
-                    setWaitingForKeyframe(true)   // 启动期非关键帧：等关键帧再定方案
-                    return
-                }
-            } else {
-                // 稳态：本来有能用的方案，现在突然被拒(多半是开直播被抖音抢了硬件芯片)。
-                // 耐心丢帧、等关键帧重同步，连续失败到阈值才换方案重建一次，避免反复横跳。
-                if vtRejectStreak < StreamDecoder.vtRejectRebuildThreshold {
-                    setWaitingForKeyframe(true)
-                    return
-                }
-                StreamDecoder.dlog("VideoToolbox 连续被拒 \(vtRejectStreak) 帧")
-                vtRejectStreak = 0
-                if vtAttrVariant < 2 {
-                    vtAttrVariant += 1
-                    StreamDecoder.dlog("换输出属性方案 \(vtAttrVariant) 重建 VideoToolbox")
-                    build()
-                    setWaitingForKeyframe(true)     // 新会话从下个关键帧开始，别拿旧 P 帧硬喂
-                    return
-                }
-            }
-            // 三种方案都不行：退到软解稳住，本帧若是关键帧就立刻用软解出图。
-            StreamDecoder.dlog("VideoToolbox 三种方案都不行，退到软解 OpenH264")
-            if let videoToolboxSession { VTDecompressionSessionInvalidate(videoToolboxSession) }
-            videoToolboxSession = nil
-            videoFormatDescription = nil
-            vtGiveUpCount += 1
-            vtGoodVariant = -1
-            vtAttrVariant = 0
-            lastVTRetryAt = CFAbsoluteTimeGetCurrent()   // 退避计时从现在起
-            softwareDecoder = auxh264_create()
-            openH264NeedsParameterSets = true
-            if hasIDR {
-                setWaitingForKeyframe(false)
-            } else {
-                setWaitingForKeyframe(true)
-                return
-            }
-        }
-        decodeOpenH264(raw, types: types, hasIDR: hasIDR)
-    }
-
-    private func decodeVideoToolbox(_ raw: Data, slices: [Range<Int>], isKeyframe: Bool) -> Bool {
-        guard let session = videoToolboxSession, let format = videoFormatDescription, !slices.isEmpty else {
-            StreamDecoder.dlog("VideoToolbox input unavailable session=\(videoToolboxSession != nil) format=\(videoFormatDescription != nil) slices=\(slices.count)")
-            return false
-        }
-        var accessUnit = Data()
-        for range in slices {
-            guard range.count > 0, range.count <= Int(UInt32.max) else { return false }
-            var length = UInt32(range.count).bigEndian
-            withUnsafeBytes(of: &length) { accessUnit.append(contentsOf: $0) }
-            accessUnit.append(contentsOf: raw[range])
-        }
-        guard !accessUnit.isEmpty, let memory = malloc(accessUnit.count) else { return false }
-        let destination = memory.assumingMemoryBound(to: UInt8.self)
-        let copied = accessUnit.withUnsafeBytes { bytes -> Bool in
-            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return false }
-            destination.update(from: base, count: bytes.count)
-            return true
-        }
-        guard copied else { free(memory); return false }
-        var block: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: memory,
-            blockLength: accessUnit.count,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: accessUnit.count,
-            flags: 0,
-            blockBufferOut: &block)
-        guard blockStatus == noErr, let block else {
-            free(memory)
-            StreamDecoder.dlog("VideoToolbox block buffer failed status=\(blockStatus)")
-            return false
-        }
-
-        var sample: CMSampleBuffer?
-        let presentationTime = CMTime(value: frameIndex + 1, timescale: 30)
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: presentationTime,
-            decodeTimeStamp: presentationTime)
-        frameIndex += 1
-        var sampleSize = accessUnit.count
-        let sampleStatus = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: block,
-            formatDescription: format,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: &sampleSize,
-            sampleBufferOut: &sample)
-        guard let sample else { StreamDecoder.dlog("VideoToolbox sample buffer failed status=\(sampleStatus)"); return false }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
-           CFArrayGetCount(attachments) > 0,
-           let item = CFArrayGetValueAtIndex(attachments, 0) {
-            let attachment = unsafeBitCast(item, to: CFMutableDictionary.self)
-            CFDictionarySetValue(
-                attachment,
-                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
-                Unmanaged.passUnretained(isKeyframe ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
-        }
-
-        if frameIndex == 1 {
-            StreamDecoder.dlog("VideoToolbox manual format \(Self.formatSummary(format))")
-            StreamDecoder.dlog("VideoToolbox manual sample \(Self.sampleSummary(sample))")
-            logGoldenDiff(kind: "format", candidate: Self.formatFields(format))
-            logGoldenDiff(kind: "sample", candidate: Self.sampleFields(sample))
-        }
-
-        outputLock.lock()
-        let callbackBefore = callbackCount
-        lastCallbackStatus = noErr
-        activeDecodeCall = decodeCallCount + 1
-        outputLock.unlock()
-        var info = VTDecodeInfoFlags()
-        let decodeStatus = VTDecompressionSessionDecodeFrame(
-            session,
-            sampleBuffer: sample,
-            flags: [],
-            frameRefcon: nil,
-            infoFlagsOut: &info)
-        outputLock.lock()
-        let callbackResult = lastCallbackStatus
-        let callbackReceived = callbackCount > callbackBefore
-        activeDecodeCall = 0
-        outputLock.unlock()
-        decodeCallCount += 1
-        if decodeCallCount <= 3 || decodeCallCount % 90 == 0 {
-            StreamDecoder.dlog("VideoToolbox frame #\(decodeCallCount) decode=\(decodeStatus) callback=\(callbackResult) gotFrame=\(callbackReceived) info=\(info.rawValue)")
-        }
-        return decodeStatus == noErr && callbackReceived && callbackResult == noErr
-    }
-
-    private func decodeOpenH264(_ raw: Data, types: [UInt8], hasIDR: Bool) {
-        if softwareDecoder == nil {
-            softwareDecoder = auxh264_create()
-            openH264NeedsParameterSets = true
-        }
-        guard let softwareDecoder else {
-            StreamDecoder.dlog("OpenH264 fallback could not initialize")
-            return
-        }
-        var accessUnit = Data()
-        // 只在解码器刚创建时补一次 SPS/PPS；重复补会让解码器判坏帧（实测）
-        if openH264NeedsParameterSets, hasIDR {
-            if !types.contains(7), !sps.isEmpty {
-                accessUnit.append(contentsOf: [0, 0, 0, 1]); accessUnit.append(sps)
-            }
-            if !types.contains(8), !pps.isEmpty {
-                accessUnit.append(contentsOf: [0, 0, 0, 1]); accessUnit.append(pps)
-            }
-            openH264NeedsParameterSets = false
-            StreamDecoder.dlog("OpenH264 注入参数集 sps=\(sps.count) pps=\(pps.count)")
-        }
-        accessUnit.append(raw)
-        guard accessUnit.count <= Int(Int32.max) else { return }
-        var unmanagedImage: Unmanaged<CVPixelBuffer>?
-        let result = accessUnit.withUnsafeBytes { bytes -> Int32 in
-            guard let base = bytes.bindMemory(to: UInt8.self).baseAddress else { return -1 }
-            return auxh264_decode(softwareDecoder, base, Int32(bytes.count), &unmanagedImage)
-        }
-        decodeCallCount += 1
-        if decodeCallCount <= 3 || decodeCallCount % 90 == 0 {
-            StreamDecoder.dlog("OpenH264 decode #\(decodeCallCount) result=\(result) output=\(unmanagedImage != nil) idr=\(hasIDR)")
-        }
-        if result < 0 {
-            // 旧逻辑：失败一次就 setWaitingForKeyframe(true)，把之后所有帧丢到下一个关键帧为止。
-            // 实测关键帧间隔 30 秒+ → 一次小错就整段黑屏。OpenH264 开了错误隐藏(ERROR_CON_SLICE_COPY)，
-            // 继续喂后面的帧它能自己恢复，所以这里只记数，不再等关键帧。
-            openH264ErrorStreak += 1
-            openH264ErrorTotal += 1
-            if openH264ErrorStreak <= 3 || openH264ErrorTotal % 90 == 0 {
-                StreamDecoder.dlog("OpenH264 failed result=\(result) bytes=\(accessUnit.count) idr=\(hasIDR) 连续=\(openH264ErrorStreak) 累计=\(openH264ErrorTotal)")
-            }
-            return
-        }
-        if openH264ErrorStreak > 0 {
-            StreamDecoder.dlog("OpenH264 恢复出图(之前连续失败 \(openH264ErrorStreak) 帧)")
-            openH264ErrorStreak = 0
-        }
-        if hasIDR { setWaitingForKeyframe(false) }
-        if let image = unmanagedImage?.takeRetainedValue() {
-            frameIndex += 1
-            publish(status: noErr, imageBuffer: image, sourceFrameID: frameIndex)
-            if frameIndex <= 3 || frameIndex % 90 == 0 {
-                StreamDecoder.dlog("OpenH264 frame #\(frameIndex) \(CVPixelBufferGetWidth(image))x\(CVPixelBufferGetHeight(image)) input=\(accessUnit.count)")
-            }
-        }
-    }
-    // MARK: - MJPEG 硬件解码（VideoToolbox）
-    static let jpegHWCallback: VTDecompressionOutputCallback = { outputRefCon, _, status, _, imageBuffer, _, _ in
-        guard let outputRefCon else { return }
-        let decoder = Unmanaged<StreamDecoder>.fromOpaque(outputRefCon).takeUnretainedValue()
-        decoder.jpegVTLock.lock()
-        decoder.jpegVTStatus = status
-        decoder.jpegVTOutput = (status == noErr) ? imageBuffer : nil
-        decoder.jpegVTLock.unlock()
-    }
-
-    private func ensureJPEGHWSession(width: Int, height: Int) -> VTDecompressionSession? {
-        if let session = jpegVTSession, jpegVTWidth == width, jpegVTHeight == height { return session }
-        if let session = jpegVTSession { VTDecompressionSessionInvalidate(session) }
-        jpegVTSession = nil
-        jpegVTFormat = nil
-        var format: CMVideoFormatDescription?
-        let formatStatus = CMVideoFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            codecType: kCMVideoCodecType_JPEG,
-            width: Int32(width),
-            height: Int32(height),
-            extensions: nil,
-            formatDescriptionOut: &format)
-        guard formatStatus == noErr, let format else {
-            StreamDecoder.dlog("JPEG硬解: 格式描述创建失败 status=\(formatStatus)")
-            return nil
-        }
-        var callback = VTDecompressionOutputCallbackRecord(
-            decompressionOutputCallback: StreamDecoder.jpegHWCallback,
-            decompressionOutputRefCon: Unmanaged.passUnretained(self).toOpaque())
-        let imageAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-        ]
-        var session: VTDecompressionSession?
-        let createStatus = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            formatDescription: format,
-            decoderSpecification: nil,
-            imageBufferAttributes: imageAttributes as CFDictionary,
-            outputCallback: &callback,
-            decompressionSessionOut: &session)
-        guard createStatus == noErr, let session else {
-            StreamDecoder.dlog("JPEG硬解: 会话创建失败 status=\(createStatus)")
-            return nil
-        }
-        VTSessionSetProperty(session, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        var hardwareValue: CFTypeRef?
-        let hardwareStatus = VTSessionCopyProperty(
-            session,
-            key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-            allocator: kCFAllocatorDefault,
-            valueOut: &hardwareValue)
-        StreamDecoder.dlog("JPEG硬解: 会话就绪 \(width)x\(height) hardware=\(String(describing: hardwareValue)) propStatus=\(hardwareStatus)")
-        jpegVTSession = session
-        jpegVTFormat = format
-        jpegVTWidth = width
-        jpegVTHeight = height
-        return session
-    }
-
-    // 成功解码并发布到共享画面返回 true；任何一步失败返回 false（调用方会退回 CPU 路径）。
-    private func decodeJPEGHardware(_ data: Data, width: Int, height: Int) -> Bool {
-        guard let session = ensureJPEGHWSession(width: width, height: height),
-              let format = jpegVTFormat else {
-            noteJPEGHWFailure("会话不可用")
-            return false
-        }
-        guard let memory = malloc(data.count) else { return false }
-        let copied = data.withUnsafeBytes { bytes -> Bool in
-            guard let base = bytes.baseAddress else { return false }
-            memcpy(memory, base, bytes.count)
-            return true
-        }
-        guard copied else { free(memory); return false }
-        var block: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: memory,
-            blockLength: data.count,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: data.count,
-            flags: 0,
-            blockBufferOut: &block)
-        guard blockStatus == noErr, let block else {
-            free(memory)
-            noteJPEGHWFailure("block buffer status=\(blockStatus)")
-            return false
-        }
-        jpegVTCount += 1
-        var sample: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMTime(value: jpegVTCount, timescale: 30),
-            decodeTimeStamp: .invalid)
-        var sampleSize = data.count
-        let sampleStatus = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: block,
-            formatDescription: format,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: &sampleSize,
-            sampleBufferOut: &sample)
-        guard let sample else {
-            noteJPEGHWFailure("sample buffer status=\(sampleStatus)")
-            return false
-        }
-        jpegVTLock.lock()
-        jpegVTOutput = nil
-        jpegVTStatus = noErr
-        jpegVTLock.unlock()
-        var info = VTDecodeInfoFlags()
-        let decodeStatus = VTDecompressionSessionDecodeFrame(
-            session,
-            sampleBuffer: sample,
-            flags: [],
-            frameRefcon: nil,
-            infoFlagsOut: &info)
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
-        jpegVTLock.lock()
-        let output = jpegVTOutput
-        let callbackStatus = jpegVTStatus
-        jpegVTLock.unlock()
-        guard decodeStatus == noErr, callbackStatus == noErr, let output else {
-            noteJPEGHWFailure("decode=\(decodeStatus) callback=\(callbackStatus) gotFrame=\(output != nil)")
-            return false
-        }
-        // 共享画面和相机插件都按"NV12 全范围"处理，格式不对就别发布，退回 CPU 路径
-        let pixelFormat = CVPixelBufferGetPixelFormatType(output)
-        guard pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
-            noteJPEGHWFailure("输出格式不是 420f: \(pixelFormat)")
-            return false
-        }
-        jpegVTFailStreak = 0
-        jpegVTRetrying = false
-        jpegVTEverWorked = true
-        jpegVTCooldown = 15
-        publishJPEG(output, seq: jpegQueueSeq, kind: "硬解", bytes: data.count)
-        return true
-    }
-
-    private func noteJPEGHWFailure(_ reason: String) {
-        jpegVTFailStreak += 1
-        StreamDecoder.dlog("JPEG硬解失败(连续\(jpegVTFailStreak)次): \(reason)")
-        if let session = jpegVTSession, jpegVTFailStreak >= 1 {
-            VTDecompressionSessionInvalidate(session)
-            jpegVTSession = nil
-            jpegVTFormat = nil
-        }
-        // 冷却后的重试只给 1 次机会（原来每次重试都要连败 3 次，约 0.1 秒，画面会顿一下）
-        if jpegVTFailStreak >= 3 || jpegVTRetrying {
-            jpegVTDisabled = true
-            jpegVTRetrying = false
-            jpegVTDisabledAt = CFAbsoluteTimeGetCurrent()
-            if !jpegVTEverWorked {
-                jpegVTGiveUps += 1
-                jpegVTCooldown = min(jpegVTCooldown * 2, 300)   // 15→30→60…，别每 15 秒顿一次
-            }
-            // 本次运行从没成功过、一上来就连败：这台机硬件 JPEG 不可用（所有历史日志里一次都没成功过），
-            // 直接固定走 CPU，并切到两个工人并行解，不再反复试（每次试失败都会让画面顿 0.1 秒）。
-            if !jpegVTEverWorked && jpegVTGiveUps >= 1 {
-                jpegVTPermanentlyOff = true
-                jpegPendingLock.lock()
-                jpegCPUOnly = true
-                jpegPendingLock.unlock()
-                StreamDecoder.dlog("JPEG硬解: 本机硬件 JPEG 解码不可用，本次运行固定走 CPU，切换为 \(jpegWorkers.count) 线程并行解码")
-            } else {
-                StreamDecoder.dlog("JPEG硬解: 连续失败，暂时改用 CPU 路径（ImageIO），\(Int(jpegVTCooldown)) 秒后再试硬件")
-            }
-        }
-    }
-
-    // MARK: - MJPEG 路径（CPU 回退：ImageIO 解码 + 系统像素转换）
-    func feedJPEG(_ data: Data) {
-        // JPEG 每张独立，丢旧帧不会坏画面：永远只留最新一帧，防止排队把内存撑爆、延迟越积越大。
-        jpegPendingLock.lock()
-        jpegSeqIn += 1
-        jpegPending = (data, jpegSeqIn)
-        var startWorker = -1
-        var startMain = false
-        if jpegCPUOnly {
-            // 并行模式：有空闲工人就叫一个起来取这帧；都在忙就放着，谁先忙完谁来取
-            if let idle = jpegWorkerBusy.firstIndex(of: false) {
-                jpegWorkerBusy[idle] = true
-                startWorker = idle
-            }
-        } else if !jpegDraining {
-            jpegDraining = true
-            startMain = true
-        }
-        jpegPendingLock.unlock()
-        if startMain {
-            queue.async { [weak self] in self?.drainJPEG() }
-        } else if startWorker >= 0 {
-            let worker = jpegWorkers[startWorker]
-            worker.queue.async { [weak self] in self?.drainJPEGWorker(startWorker) }
-        }
-    }
-
-    // 单线程路径（硬件 JPEG 还可能可用时）：在 self.queue 上跑
-    private func drainJPEG() {
-        while true {
-            jpegPendingLock.lock()
-            guard !jpegCPUOnly, let next = jpegPending else {
-                jpegDraining = false
-                let handOff = jpegCPUOnly && jpegPending != nil
-                var idle = -1
-                if handOff, let i = jpegWorkerBusy.firstIndex(of: false) {
-                    jpegWorkerBusy[i] = true
-                    idle = i
-                }
-                jpegPendingLock.unlock()
-                // 刚切到并行模式、还有帧没人取：交给并行工人
-                if idle >= 0 {
-                    jpegWorkers[idle].queue.async { [weak self] in self?.drainJPEGWorker(idle) }
-                }
-                return
-            }
-            jpegPending = nil
-            jpegPendingLock.unlock()
-            jpegQueueSeq = next.1
-            autoreleasepool { decodeJPEG(next.0) }
-        }
-    }
-
-    // 并行路径：每个工人在自己的队列上跑，各用各的缓冲
-    private func drainJPEGWorker(_ index: Int) {
-        let worker = jpegWorkers[index]
-        while true {
-            jpegPendingLock.lock()
-            guard let next = jpegPending else {
-                jpegWorkerBusy[index] = false
-                jpegPendingLock.unlock()
-                return
-            }
-            jpegPending = nil
-            jpegPendingLock.unlock()
-            autoreleasepool {
-                if let buffer = worker.convert(next.0) {
-                    publishJPEG(buffer, seq: next.1, kind: "CPU并行", bytes: next.0.count)
-                }
-            }
-        }
-    }
-
-    // 按帧序号发布：两个工人并行时，晚解完的旧帧直接丢，画面不会倒退
-    private func publishJPEG(_ buffer: CVPixelBuffer, seq: Int64, kind: String, bytes: Int) {
-        jpegPublishLock.lock()
-        defer { jpegPublishLock.unlock() }
-        guard seq > jpegLastPublishedSeq else { return }
-        let published = auxcam_publish_shared_frame(buffer)
-        if published == 1 {
-            jpegLastPublishedSeq = seq
-            jpegFrameCount += 1
-            if jpegFrameCount <= 3 || jpegFrameCount % 90 == 0 {
-                StreamDecoder.dlog("MJPEG 帧(\(kind)) #\(jpegFrameCount) 收到序号=\(seq) \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) bytes=\(bytes)")
-            }
-        } else if jpegFrameCount <= 3 || seq % 90 == 0 {
-            StreamDecoder.dlog("MJPEG 发布失败(\(kind)) rc=\(published)")
-        }
-    }
-
-    private func decodeJPEG(_ data: Data) {
-        jpegEntered += 1
-        if jpegEntered <= 3 || jpegEntered % 150 == 0 {
-            jpegPublishLock.lock(); let publishedSoFar = jpegFrameCount; jpegPublishLock.unlock()
-            StreamDecoder.dlog("decodeJPEG 进入 #\(jpegEntered) bytes=\(data.count) 已发布=\(publishedSoFar)")
-        }
-        // 硬解被临时关掉后，冷却 15 秒自动再试一次：避免偶发的一帧失败把整场都压到 CPU 上。
-        if jpegVTDisabled, !jpegVTPermanentlyOff, CFAbsoluteTimeGetCurrent() - jpegVTDisabledAt > jpegVTCooldown {
-            jpegVTDisabled = false
-            jpegVTRetrying = true
-            jpegVTFailStreak = 0
-            StreamDecoder.dlog("JPEG硬解: 冷却结束，重新尝试硬件解码")
-        }
-        // 先试硬件解码：只读 JPEG 头部拿宽高，不解码像素
-        if !jpegVTDisabled,
-           let probe = CGImageSourceCreateWithData(data as CFData, nil),
-           let props = CGImageSourceCopyPropertiesAtIndex(probe, 0, nil) as? [CFString: Any],
-           let probeWidth = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-           let probeHeight = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
-           probeWidth > 0, probeHeight > 0,
-           decodeJPEGHardware(data, width: probeWidth, height: probeHeight) {
-            return
-        }
-        // CPU 路径（单线程，硬件还可能可用的阶段）：和并行工人用同一份转换代码
-        if let buffer = jpegMainWorker.convert(data) {
-            publishJPEG(buffer, seq: jpegQueueSeq, kind: "CPU", bytes: data.count)
-        }
-    }
-
-    private static func splitAnnexBRanges(_ data: Data) -> [Range<Int>] {
-        data.withUnsafeBytes { rawBuffer in
-            guard let bytes = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return [] }
-            let count = rawBuffer.count
-            var starts: [(start: Int, payload: Int)] = []
-            var i = 0
-            while i + 3 <= count {
-                if i + 4 <= count,
-                   bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 0, bytes[i + 3] == 1 {
-                    starts.append((i, i + 4))
-                    i += 4
-                } else if bytes[i] == 0, bytes[i + 1] == 0, bytes[i + 2] == 1 {
-                    starts.append((i, i + 3))
-                    i += 3
-                } else {
-                    i += 1
-                }
-            }
-            guard !starts.isEmpty else { return count == 0 ? [] : [0..<count] }
-
-            var result: [Range<Int>] = []
-            for index in starts.indices {
-                let payloadStart = starts[index].payload
-                var end = index + 1 < starts.count ? starts[index + 1].start : count
-                while end > payloadStart && bytes[end - 1] == 0 { end -= 1 }
-                if end > payloadStart { result.append(payloadStart..<end) }
-            }
-            return result
-        }
-    }
-}
-
-// ───────────────────────── Wi-Fi/HLS 拉流层 ─────────────────────────
-// AVPlayer 负责网络视频解码；这里每次只取最新一帧，把 共享画面交给相机插件。
-// 这样 Wi-Fi 模式不需要再走容易出错的手工 VideoToolbox 解码路径。
-final class HLSFrameSource: ObservableObject {
-    @Published private(set) var frameCount: Int64 = 0
-    @Published private(set) var fps: Double = 0
-    @Published private(set) var status = "待机"
-
-    private let queue = DispatchQueue(label: "auxcam.hls.frames", qos: .userInitiated)
-    private var player: AVPlayer?
-    private var output: AVPlayerItemVideoOutput?
-    private var timer: DispatchSourceTimer?
-    private var retainedFrame: CVPixelBuffer?
-    private var deliveredFrames: Int64 = 0
-    private var reportFrames: Int64 = 0
-    private var lastReport = Date()
-    private var statusObservation: NSKeyValueObservation?
-    private var notificationTokens: [NSObjectProtocol] = []
-
-    deinit {
-        timer?.cancel()
-    }
-
-    func start(url: URL) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.stopOnQueue()
-            self.setStatus("正在连接电脑")
-
-            let item = AVPlayerItem(url: url)
-            // 短缓冲优先降低延迟；网络抖动时由播放器自动恢复。
-            item.preferredForwardBufferDuration = 0.25
-            let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            ]
-            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
-            item.add(output)
-
-            let player = AVPlayer(playerItem: item)
-            player.isMuted = true
-            player.automaticallyWaitsToMinimizeStalling = false
-            self.player = player
-            self.output = output
-            self.statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-                let value: String
-                switch item.status {
-                case .readyToPlay: value = "已连接，等待画面"
-                case .failed: value = "拉流失败：\(item.error?.localizedDescription ?? "未知错误")"
-                default: value = "正在连接电脑"
-                }
-                self?.setStatus(value)
-            }
-            self.notificationTokens.append(NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemPlaybackStalled, object: item, queue: nil) { [weak self] _ in
-                    guard let self else { return }
-                    self.setStatus("网络卡顿，正在恢复")
-                    self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) {
-                        self.player?.play()
-                    }
-                })
-
-            let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(33), leeway: .milliseconds(2))
-            timer.setEventHandler { [weak self] in self?.copyLatestFrame() }
-            self.timer = timer
-            timer.resume()
-            player.play()
-        }
-    }
-
-    func stop() {
-        queue.async { [weak self] in self?.stopOnQueue() }
-    }
-
-    private func setStatus(_ value: String) {
-        DispatchQueue.main.async { self.status = value }
-    }
-
-    private func stopOnQueue() {
-        timer?.setEventHandler {}
-        timer?.cancel()
-        timer = nil
-        statusObservation?.invalidate()
-        statusObservation = nil
-        notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
-        notificationTokens.removeAll()
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
-        player = nil
-        output = nil
-        retainedFrame = nil
-        deliveredFrames = 0
-        reportFrames = 0
-        lastReport = Date()
-        DispatchQueue.main.async {
-            self.frameCount = 0
-            self.fps = 0
-            self.status = "待机"
-        }
-    }
-
-    private func copyLatestFrame() {
-        guard let output else { return }
-        let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
-        guard output.hasNewPixelBuffer(forItemTime: itemTime),
-              let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else { return }
-
-        retainedFrame = pixelBuffer
-        guard auxcam_publish_shared_frame(pixelBuffer) == 1 else {
-            setStatus("发布相机画面失败")
-            return
-        }
-
-        deliveredFrames += 1
-        let now = Date()
-        if now.timeIntervalSince(lastReport) >= 1 {
-            let elapsed = now.timeIntervalSince(lastReport)
-            let rate = Double(deliveredFrames - reportFrames) / elapsed
-            let currentFrameCount = deliveredFrames
-            reportFrames = deliveredFrames
-            lastReport = now
-            DispatchQueue.main.async {
-                self.frameCount = currentFrameCount
-                self.fps = rate
-                self.status = rate > 0 ? "电脑画面已接入" : "等待电脑画面"
-            }
-        }
-    }
-}
-
-// ───────────────────────── VCU1 接收层（接万相桌面端） ─────────────────────────
-// 万相电脑端通过数据线(usbmux)连 iPhone 的 28765 端口，包格式：
-//   24 字节头: "VCU1" + 版本(1B) + 类型(1B) + flags(2B BE) + 长度(4B BE) + 序号(4B BE) + 时间戳(8B BE 微秒)
-//   类型: 1=视频配置(AVCC SPS/PPS) 2=视频帧(H264 NALU, flags bit0=关键帧) 3=音频配置 4=音频帧(ADTS) 5=心跳(每秒)
-final class VCU1Receiver: ObservableObject {
-    @Published var status = "等待电脑连接"
-    @Published var fps = 0.0
-    @Published var alive = false
-
-    static let listenPort: UInt16 = 28765
-    static let outPath = "/var/mobile/Media/DCIM/stream.h264"
-    let decoder = StreamDecoder()
-    private var listenFd: Int32 = -1
-    private var shouldRun = false
-    private var frameCount: Int32 = 0
-    private var lastCountAt = Date()
-    private var totalVideoBytes: Int64 = 0
-    private let lock = NSLock()
-    private let maxFile: Int64 = 8 * 1024 * 1024
-    private var sps: Data = Data()
-    private var pps: Data = Data()
-    private var ringHandle: FileHandle?
-    private var ringSize: Int64 = 0
-    private var ringNeedsKeyframe = false
-    private var jpegSeen = 0
-    // 到包间隔统计（AUXGAP）：看电脑/USB 送画面是否均匀
-    private var gapLastAt: Double = 0
-    private var gapMax: Double = 0
-    private var gapOver50 = 0
-    private var gapUnder15 = 0
-    private var gapCount = 0
-
-    func start() {
-        if shouldRun { return }
-        shouldRun = true
-        lock.lock()
-        sps = Data(); pps = Data(); totalVideoBytes = 0; frameCount = 0
-        lock.unlock()
-        DispatchQueue.global(qos: .userInitiated).async { self.serve() }
-    }
-
-    func stop() {
-        shouldRun = false
-        if listenFd >= 0 { close(listenFd); listenFd = -1 }
-        DispatchQueue.main.async { self.status = "已停止"; self.alive = false }
-    }
-
-    private func serve() {
-        listenFd = socket(AF_INET, SOCK_STREAM, 0)
-        guard listenFd >= 0 else {
-            DispatchQueue.main.async { self.status = "开监听失败" }
-            slog("socket failed")
-            return
-        }
-        var on: Int32 = 1
-        setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = VCU1Receiver.listenPort.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let b = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(listenFd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        if b != 0 {
-            DispatchQueue.main.async { self.status = "端口被占" }
-            slog("bind failed errno=\(errno)")
-            close(listenFd); listenFd = -1
-            return
-        }
-        listen(listenFd, 128)
-        slog("listening 28765")
-        DispatchQueue.main.async { self.status = "已开门(28765)，等电脑连" }
-        while shouldRun {
-            var caddr = sockaddr_in()
-            var clen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let cfd = withUnsafeMutablePointer(to: &caddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    accept(listenFd, $0, &clen)
-                }
-            }
-            guard cfd >= 0 else { break }
-            // 读超时 5 秒：对端不送数据就别占着连接（防重连风暴拖死）
-            var tv = timeval(tv_sec: 5, tv_usec: 0)
-            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-            DispatchQueue.main.async { self.status = "电脑已连上，收画面中"; self.alive = true }
-            handleConnection(cfd)
-            close(cfd)
-            if shouldRun {
-                DispatchQueue.main.async { self.status = "断开，等电脑重连"; self.alive = false }
-            }
-        }
-    }
-
-    private func readFull(_ fd: Int32, _ n: Int) -> Data? {
-        var buf = Data()
-        var tmp = [UInt8](repeating: 0, count: n)
-        while buf.count < n {
-            let r = read(fd, &tmp, n - buf.count)
-            if r <= 0 { return nil }
-            buf.append(tmp, count: r)
-        }
-        return buf
-    }
-
-    // 诊断日志（写到 DCIM，电脑随时能拉）
-    private func slog(_ s: String) {
-        let line = "\(Int(Date().timeIntervalSince1970)) \(s)\n"
-        let path = "/var/mobile/Media/DCIM/.vcu1.log"
-        if let h = FileHandle(forWritingAtPath: path) {
-            h.seekToEndOfFile()
-            h.write(line.data(using: .utf8) ?? Data())
-            try? h.close()
-        } else {
-            try? line.write(toFile: path, atomically: true, encoding: .utf8)
-        }
-    }
-
-    private func handleConnection(_ fd: Int32) {
-        var lastHb = Date()
-        slog("conn accepted")
-        while shouldRun {
-            guard let head = readFull(fd, 24) else { slog("conn closed by peer"); return }
-            let magic = String(bytes: head[0..<4], encoding: .ascii) ?? ""
-            guard magic == "VCU1" else { slog("bad magic: " + magic); return }
-            let version = Int(head[4])
-            let type = Int(head[5])
-            let flags = Int(head[6]) << 8 | Int(head[7])
-            let len = Int(head[8]) << 24 | Int(head[9]) << 16 | Int(head[10]) << 8 | Int(head[11])
-            guard version == 1, len >= 0, len <= 4 * 1024 * 1024 else {
-                slog("bad ver/len: v=\(version) len=\(len)"); return
-            }
-            let payload = len > 0 ? (readFull(fd, len) ?? Data()) : Data()
-            if len > 0 && payload.count < len { slog("payload short"); return }
-            switch type {
-            case 1:
-                parseAVCC(payload)
-                decoder.setConfig(sps: sps, pps: pps)
-                slog("type1 config, sps=\(sps.count) pps=\(pps.count)")
-            case 2:
-                // 先把最新帧送进 VideoToolbox 并发布共享画面，兼容环形文件写入放后面。
-                let gapNow = CFAbsoluteTimeGetCurrent()
-                if gapLastAt > 0 {
-                    let gapMs = (gapNow - gapLastAt) * 1000
-                    gapCount += 1
-                    if gapMs > gapMax { gapMax = gapMs }
-                    if gapMs > 50 { gapOver50 += 1 }
-                    if gapMs < 15 { gapUnder15 += 1 }
-                    if gapCount >= 90 {
-                        slog("到包间隔 近90帧: 最大=\(Int(gapMax))ms 超过50ms=\(gapOver50)次 小于15ms=\(gapUnder15)次")
-                        gapMax = 0
-                        gapOver50 = 0
-                        gapUnder15 = 0
-                        gapCount = 0
-                    }
-                }
-                gapLastAt = gapNow
-                decoder.feed(payload, keyframe: (flags & 1) != 0)
-                countFrame(payload.count)
-                if (flags & 1) != 0 { slog("type2 KEYFRAME len=\(payload.count)") }
-            case 10:
-                // MJPEG 帧：系统硬件 JPEG 解码 → 共享画面（最稳路径）
-                jpegSeen += 1
-                if jpegSeen <= 3 || jpegSeen % 150 == 0 { slog("type10 JPEG #\(jpegSeen) len=\(payload.count)") }
-                decoder.feedJPEG(payload)
-                countFrame(payload.count)
-            case 5: lastHb = Date()
-            default: break
-            }
-            if Date().timeIntervalSince(lastHb) > 8 { slog("heartbeat timeout"); return }
-        }
-    }
-
-    // type1: AVCC 配置（AVCDecoderConfigurationRecord）→ 提出 SPS/PPS
-    private func parseAVCC(_ d: Data) {
-        guard d.count > 7, d[0] == 1 else { return }
-        var i = 5
-        let numSPS = Int(d[i] & 0x1F); i += 1
-        var s = Data(); var p = Data()
-        for _ in 0..<numSPS where i + 2 <= d.count {
-            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
-            guard i + l <= d.count else { return }
-            s = d.subdata(in: i..<(i + l)); i += l
-        }
-        guard i < d.count else { return }
-        let numPPS = Int(d[i] & 0x1F); i += 1
-        for _ in 0..<numPPS where i + 2 <= d.count {
-            let l = Int(d[i]) << 8 | Int(d[i + 1]); i += 2
-            guard i + l <= d.count else { return }
-            p = d.subdata(in: i..<(i + l)); i += l
-        }
-        if !s.isEmpty && !p.isEmpty {
-            lock.lock(); sps = s; pps = p; lock.unlock()
-        }
-    }
-
-    private static let startCode = Data([0, 0, 0, 1])
-
-    // type2: H264 NALU → 转 Annex-B 追加写 stream.h264（8MB 环形缓存）
-    private func appendVideo(_ d: Data, keyframe: Bool) {
-        var nalu = d
-        let sc4 = Data([UInt8(0), UInt8(0), UInt8(0), UInt8(1)])
-        let sc3 = Data([UInt8(0), UInt8(0), UInt8(1)])
-        if nalu.starts(with: sc4) { nalu = nalu.subdata(in: 4..<nalu.count) }
-        else if nalu.starts(with: sc3) { nalu = nalu.subdata(in: 3..<nalu.count) }
-        guard !nalu.isEmpty else { return }
-
-        let fm = FileManager.default
-        if ringHandle == nil {
-            if !fm.fileExists(atPath: VCU1Receiver.outPath) {
-                fm.createFile(atPath: VCU1Receiver.outPath, contents: nil)
-            }
-            ringHandle = FileHandle(forWritingAtPath: VCU1Receiver.outPath)
-            if let attributes = try? fm.attributesOfItem(atPath: VCU1Receiver.outPath) {
-                ringSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-            }
-            try? ringHandle?.seekToEnd()
-        }
-        guard let fh = ringHandle else { return }
-
-        var head = Data()
-        if keyframe {
-            lock.lock()
-            let s = sps, p = pps
-            lock.unlock()
-            if !s.isEmpty && !p.isEmpty {
-                head.append(VCU1Receiver.startCode); head.append(s)
-                head.append(VCU1Receiver.startCode); head.append(p)
-            }
-        }
-        head.append(VCU1Receiver.startCode)
-        head.append(nalu)
-
-        if ringNeedsKeyframe && !keyframe { return }
-        if ringSize + Int64(head.count) > maxFile {
-            try? fh.truncate(atOffset: 0)
-            try? fh.seek(toOffset: 0)
-            ringSize = 0
-            ringNeedsKeyframe = true
-            // 环形缓存从完整 GOP 起步，避免绕回后以 P 帧开头。
-            if !keyframe { return }
-        }
-        try? fh.write(contentsOf: head)
-        ringSize += Int64(head.count)
-        if keyframe { ringNeedsKeyframe = false }
-    }
-
-    func videoByteCount() -> Int64 {
-        lock.lock(); defer { lock.unlock() }
-        return totalVideoBytes
-    }
-
-    private func countFrame(_ payloadBytes: Int) {
-        lock.lock()
-        frameCount += 1
-        totalVideoBytes += Int64(payloadBytes)
-        let now = Date()
-        var measuredFPS: Double?
-        if now.timeIntervalSince(lastCountAt) >= 1 {
-            let f = Double(frameCount) / now.timeIntervalSince(lastCountAt)
-            frameCount = 0
-            lastCountAt = now
-            measuredFPS = f
-        }
-        lock.unlock()
-        if let measuredFPS {
-            DispatchQueue.main.async { self.fps = measuredFPS }
-        }
-    }
-}
-
-// ───────────────────────── 主界面 ─────────────────────────
-// 直播状态机（跟万相一样四态，自动走）
-enum LiveState: String {
-    case idle = "未启用"
-    case starting = "正在启动 USB"
-    case live = "已开启"
-    case broken = "断流重连中"
-
-    var color: Color {
-        switch self {
-        case .idle: return .secondary
-        case .starting: return .orange
-        case .live: return .green
-        case .broken: return .red
-        }
-    }
-}
-
-struct PB: View {
-    let title: String
-    let icon: String
-    var color: Color
-    let action: () -> Void
-
-    init(_ t: String, _ i: String, _ c: Color = Color(red: 0.20, green: 0.72, blue: 0.62), action: @escaping () -> Void) {
-        title = t; icon = i; color = c; self.action = action
-    }
+struct CameraCheckView: View {
+    @StateObject private var cam = CameraCheck()
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: icon).font(.body)
-                Text(title).font(.footnote.bold())
-            }
-            .frame(maxWidth: .infinity, minHeight: 60)
-            .background(color)
-            .foregroundStyle(.white)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-        }
-    }
-}
-
-private final class StreamPictureInPicture: NSObject, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
-    static let shared = StreamPictureInPicture()
-    private let lock = NSLock()
-    private var displayLayer: AVSampleBufferDisplayLayer?
-    private var controller: AVPictureInPictureController?
-    private var pendingImage: CVImageBuffer?
-    private var enqueueScheduled = false
-    private var paused = false
-    private var frameNumber: Int64 = 0
-    private var formatDescription: CMVideoFormatDescription?
-
-    func attach(_ layer: AVSampleBufferDisplayLayer) {
-        DispatchQueue.main.async {
-            guard self.displayLayer !== layer else { return }
-            self.displayLayer = layer
-            layer.videoGravity = .resizeAspect
-            var timebase: CMTimebase?
-            if CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
-                                               sourceClock: CMClockGetHostTimeClock(),
-                                               timebaseOut: &timebase) == noErr,
-               let timebase {
-                CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
-                CMTimebaseSetRate(timebase, rate: 1.0)
-                layer.controlTimebase = timebase
-            }
-            guard AVPictureInPictureController.isPictureInPictureSupported() else {
-                StreamDecoder.dlog("PiP not supported on this device")
-                return
-            }
-            let source = AVPictureInPictureController.ContentSource(
-                sampleBufferDisplayLayer: layer, playbackDelegate: self)
-            let pip = AVPictureInPictureController(contentSource: source)
-            pip.delegate = self
-            pip.canStartPictureInPictureAutomaticallyFromInline = false   // 不要一退后台就自动弹画中画
-            self.controller = pip
-            StreamDecoder.dlog("PiP ready")
-        }
-    }
-
-    func start() {
-        DispatchQueue.main.async {
-            guard let controller = self.controller else {
-                StreamDecoder.dlog("PiP start ignored: preview not ready")
-                return
-            }
-            if controller.isPictureInPicturePossible {
-                controller.startPictureInPicture()
-            } else {
-                StreamDecoder.dlog("PiP start ignored: not possible yet")
-            }
-        }
-    }
-
-    func enqueue(_ image: CVImageBuffer) {
-        lock.lock()
-        guard !paused else { lock.unlock(); return }
-        pendingImage = image
-        let shouldSchedule = !enqueueScheduled
-        if shouldSchedule { enqueueScheduled = true }
-        lock.unlock()
-        if shouldSchedule { DispatchQueue.main.async { self.displayPendingFrame() } }
-    }
-
-    private func displayPendingFrame() {
-        lock.lock()
-        let image = pendingImage
-        pendingImage = nil
-        enqueueScheduled = false
-        let paused = self.paused
-        lock.unlock()
-        guard !paused, let image, let layer = displayLayer, layer.isReadyForMoreMediaData else { return }
-
-        if let currentFormat = formatDescription {
-            let dimensions = CMVideoFormatDescriptionGetDimensions(currentFormat)
-            if dimensions.width != Int32(CVPixelBufferGetWidth(image)) || dimensions.height != Int32(CVPixelBufferGetHeight(image)) {
-                formatDescription = nil
-            }
-        }
-        if formatDescription == nil {
-            var newFormat: CMVideoFormatDescription?
-            guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
-                                                               imageBuffer: image,
-                                                               formatDescriptionOut: &newFormat) == noErr,
-                  let newFormat else { return }
-            formatDescription = newFormat
-        }
-        let pts = CMClockGetTime(CMClockGetHostTimeClock())
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
-                                        presentationTimeStamp: pts,
-                                        decodeTimeStamp: .invalid)
-        var sampleBuffer: CMSampleBuffer?
-        guard let formatDescription else { return }
-        let status = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
-                                                               imageBuffer: image,
-                                                               formatDescription: formatDescription,
-                                                               sampleTiming: &timing,
-                                                               sampleBufferOut: &sampleBuffer)
-        guard status == noErr, let sampleBuffer else { return }
-        layer.enqueue(sampleBuffer)
-        frameNumber += 1
-        if frameNumber == 1 { StreamDecoder.dlog("PiP first frame queued") }
-    }
-
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {
-        lock.lock(); paused = !playing; lock.unlock()
-        pictureInPictureController.invalidatePlaybackState()
-    }
-
-    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
-        CMTimeRange(start: .zero, duration: .positiveInfinity)
-    }
-
-    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return paused
-    }
-
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}
-
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion: @escaping () -> Void) {
-        completion()
-    }
-
-    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
-        true
-    }
-
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
-        StreamDecoder.dlog("PiP failed: \(error.localizedDescription)")
-    }
-
-    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-        StreamDecoder.dlog("PiP started")
-    }
-}
-
-private final class StreamPiPView: UIView {
-    override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
-    var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
-}
-
-private struct StreamPiPPreview: UIViewRepresentable {
-    func makeUIView(context: Context) -> StreamPiPView {
-        let view = StreamPiPView()
-        view.backgroundColor = .black
-        StreamPictureInPicture.shared.attach(view.displayLayer)
-        return view
-    }
-
-    func updateUIView(_ view: StreamPiPView, context: Context) {
-        StreamPictureInPicture.shared.attach(view.displayLayer)
-    }
-}
-struct ContentView: View {
-    @StateObject private var cam = Cam()
-    @StateObject private var vcu = VCU1Receiver()
-    @StateObject private var hlsSource = HLSFrameSource()
-    @State private var st: [String: String] = [:]
-    @State private var state: LiveState = .idle
-    @State private var picker: PhotosPickerItem?
-    @State private var pickerRequest = false
-    @State private var hint = ""
-    @State private var fakeCameraOn = false
-    @State private var keepAlivePlayer: AVAudioPlayer?
-    @State private var tickCount = 0
-    @State private var usingStreamSource = false
-    @State private var usingHLSSource = false
-    @State private var hasPickedVideo = false
-    @State private var cameraCommandAt = Date.distantPast
-    @State private var deadCount = 0
-    @State private var revived = false
-    @State private var mirrorOn = false
-    @State private var recordOn = false
-    @State private var aiOn = true
-    @State private var floatLastCmdID = ""
-    @State private var rotation = 0   // 0/90/180/270，顺时针
-    private static let floatStartTS = Int(Date().timeIntervalSince1970)
-    private static var floatTimer: DispatchSourceTimer?
-    private static var didBoot = false   // onAppear 可能多次触发：保证 boot() 只真正执行一次（否则会叠加 1 秒定时器）
-    @State private var showDiag = false
-    @AppStorage("pcIP") private var pcIP = "192.168.31.141"
-    @AppStorage("streamURL") private var streamURL = ""
-    @AppStorage("netMode") private var netMode = false   // false=USB直连 true=局域网
-    @AppStorage("wasLive") private var wasLive = false   // 上次退出时是否在直播（重开自动恢复）
-
-    // 心跳（判断电脑画面是否真的在流进手机）
-    @State private var lastES: Int64 = -1
-    @State private var lastTick: Date = Date()
-    @State private var kbps: Double = 0
-    @State private var stuckCount = 0
-    @State private var retryCount = 0
-
-    private var kernelOK: Bool { (st["kernel"] ?? "") == "运行中" }
-    private var playingFake: Bool { (st["playing"] ?? "正常相机") != "正常相机" }
-    private var cameraOutputText: String {
-        guard fakeCameraOn else { return st["playing"] ?? "正常相机" }
-        return usingStreamSource ? "电脑实时流" : "素材视频"
-    }
-    private var builtURL: String {
-        streamURL.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    private var streamURLBinding: Binding<String> {
-        Binding(get: { streamURL }, set: { streamURL = $0 })
-    }
-
-    private var sigText: String {
-        if usingHLSSource {
-            return hlsSource.fps > 0 ? "Wi-Fi · \(Int(hlsSource.fps)) 帧/秒" : hlsSource.status
-        }
-        if kbps <= 0 { return "—" }
-        if kbps > 800 { return "好 · \(String(format: "%.1f", kbps / 1000))M" }
-        if kbps > 200 { return "中 · \(Int(kbps))K" }
-        return "差 · \(Int(kbps))K"
-    }
-
-    private var sigColor: Color {
-        if usingHLSSource {
-            if hlsSource.fps >= 24 { return .green }
-            return hlsSource.fps > 0 ? .orange : .secondary
-        }
-        if kbps <= 0 { return .secondary }
-        if kbps > 800 { return .green }
-        if kbps > 200 { return .orange }
-        return .red
-    }
-
-    var body: some View {
-        VStack(spacing: 10) {
-            header
-            preview
-            statusLine
-            infoRow
-            panel
-            if !hint.isEmpty {
-                Text(hint)
-                    .font(.caption2)
-                    .foregroundStyle(hint.contains("失败") ? Color.red : Color.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            sigRow
-            bigButton
-        }
-        .padding(.horizontal, 12)
-        .padding(.bottom, 8)
-        .background(Color(UIColor.systemGroupedBackground))
-        .photosPicker(isPresented: $pickerRequest, selection: $picker, matching: .videos)
-        .onChange(of: picker) { _, item in
-            guard let item else { return }
-            Task { @MainActor in
-                hint = "正在导入相册视频…"
-                do {
-                    guard let video = try await item.loadTransferable(type: PickedVideo.self) else {
-                        hint = "无法读取所选视频，请重试"
-                        return
-                    }
-                    try setStreamMode(false)
-                    hlsSource.stop()
-                    netMode = false
-                    usingStreamSource = false
-                    usingHLSSource = false
-                    hasPickedVideo = true
-                    lastES = -1; lastTick = Date(); kbps = 0
-                    Link.send(["cmd": "setvideo", "path": video.url.path])
-                    fakeCameraOn = true
-                    cameraCommandAt = Date()
-                    hint = "视频已导入，正在切换画面"
-                } catch {
-                    hint = "视频导入失败，请重试"
-                }
-            }
-        }
-        .onAppear { boot() }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
-            StreamDecoder.dlog("生命周期: 进入后台")
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
-            StreamDecoder.dlog("生命周期: 回到前台")
-        }
-        .sheet(isPresented: $showDiag) { diagSheet }
-    }
-
-    // ── 区块 ──
-    private var header: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "video.fill").font(.footnote).foregroundStyle(.teal)
-            Text("AuxCam").font(.subheadline.bold())
-            Text("USB 直推").font(.caption2).foregroundStyle(.secondary)
-            Spacer()
-            Circle().fill(kernelOK ? .green : .orange).frame(width: 8, height: 8)
-            Text(kernelOK ? "内核在线" : "内核唤醒中").font(.caption2).foregroundStyle(.secondary)
-        }
-    }
-
-    private var preview: some View {
-        ZStack {
-            Color.black
-            if fakeCameraOn {
-                StreamPiPPreview()
-                VStack(spacing: 10) {
-                    HStack {
-                        Spacer()
-                        Button { StreamPictureInPicture.shared.start() } label: {
-                            Label("悬浮", systemImage: "pip")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 10).padding(.vertical, 7)
-                                .background(.black.opacity(0.55))
-                                .clipShape(Capsule())
-                        }
-                    }
-                    Spacer()
-                    VStack(spacing: 5) {
-                        Image(systemName: usingStreamSource ? "cable.connector" : "play.rectangle.fill")
-                            .font(.title3)
-                        Text(usingStreamSource ? "电脑实时流" : "素材视频")
-                            .font(.caption.bold())
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 7)
-                    .background(.black.opacity(0.55))
-                    .clipShape(Capsule())
-                }
-                .foregroundStyle(.white)
-                .padding(9)
-            } else if cam.denied {
-                VStack(spacing: 8) {
-                    Image(systemName: "video.slash").font(.largeTitle)
-                    Text(cam.diag).font(.footnote)
-                    Button("重试") { cam.start() }.font(.footnote).buttonStyle(.bordered)
-                }
-                .foregroundStyle(.white)
-            } else {
-                CamPreview(session: cam.session)
-                    .id(cam.sessionReady)   // session 后台建好后重建视图挂上去
-                VStack {
-                    HStack {
-                        Spacer()
-                        Button { cam.flip() } label: {
-                            Image(systemName: "arrow.triangle.2.circlepath.camera")
-                                .font(.title3)
-                                .padding(9)
-                                .background(.black.opacity(0.55))
-                                .clipShape(Circle())
-                        }
-                        .foregroundStyle(.white)
-                    }
-                    Spacer()
-                    HStack(spacing: 6) {
-                        Circle().fill(state.color).frame(width: 7, height: 7)
-                        Text(state.rawValue).font(.caption).bold()
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(.black.opacity(0.55))
-                    .clipShape(Capsule())
-                    .foregroundStyle(.white)
-                }
-                .padding(8)
-            }
-        }
-        .frame(height: 300)
-        .clipShape(RoundedRectangle(cornerRadius: 16))
-    }
-
-    private var statusLine: some View {
-        HStack(spacing: 4) {
-            Text("画面：\(cameraOutputText)").font(.footnote).bold()
-            Spacer()
-            Text(sigText).font(.caption2).bold().foregroundStyle(sigColor)
-        }
-    }
-
-    private var infoRow: some View {
-        HStack(spacing: 8) {
-            Circle().fill(vcu.alive ? Color.green : Color.orange).frame(width: 10, height: 10)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(vcu.alive ? "已连上电脑" : "等待电脑连接（请插好 USB）").font(.footnote).bold()
-                Text("源：" + vcu.status).font(.caption2).foregroundStyle(.secondary)
-            }
-            Spacer()
-            if vcu.fps > 0 {
-                Text(String(format: "%.0f 帧/秒", vcu.fps)).font(.footnote).bold().foregroundStyle(.green)
-            }
-        }
-        .padding(10)
-        .background(Color(UIColor.secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var panel: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-            PB("放视频", "play.rectangle.fill", fakeCameraOn ? Color(red: 0.55, green: 0.35, blue: 0.75) : Color(red: 0.20, green: 0.72, blue: 0.62)) {
-                vcamControl(true)
-            }
-            PB("切回相机", "camera.fill", Color(red: 0.90, green: 0.55, blue: 0.15)) {
-                vcamControl(false)
-            }
-            PB("镜像", "arrow.left.arrow.right", mirrorOn ? .teal : Color(red: 0.35, green: 0.55, blue: 0.75)) { tapMirror() }
-            PB("旋转" + (rotation == 0 ? "" : " \(rotation)°"), "rotate.right", rotation == 0 ? Color(red: 0.35, green: 0.55, blue: 0.75) : .teal) { tapRotate() }
-        }
-    }
-
-    private var sigRow: some View {
-        HStack {
-            Label(sigText, systemImage: "waveform.path.ecg")
-                .font(.caption2).bold().foregroundStyle(sigColor)
-            Spacer()
-            Button { showDiag = true } label: {
-                Text("实时分析").font(.caption2).bold()
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Capsule().fill(.teal.opacity(0.15)))
-                    .foregroundStyle(.teal)
-            }
-        }
-    }
-
-    private var bigButton: some View {
-        Button { toggleLive() } label: {
-            Text(bigTitle)
-                .font(.title3.bold())
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 13)
-        }
-        .buttonStyle(.borderedProminent)
-        .tint(bigTint)
-    }
-
-    private var tabBar: some View {
-        HStack {
-            tab("相机", "camera.fill", true)
-            tab("相册", "photo.on.rectangle") { pickerRequest = true }
-            tab("创作灵感", "sparkles") { hint = "灵感：电脑 OBS 推 rtmp://电脑IP:1935/live/auxcam，手机自动接上" }
-            tab("内录", "record.circle", recordOn) { tapRecord() }
-        }
-        .padding(.vertical, 6)
-    }
-
-    private func tab(_ t: String, _ i: String, _ on: Bool = false, _ act: (() -> Void)? = nil) -> some View {
-        Button(action: { act?() }) {
-            VStack(spacing: 2) {
-                Image(systemName: i).font(.footnote)
-                Text(t).font(.caption2)
-            }
-            .foregroundStyle(on ? Color.teal : Color.secondary)
-            .frame(maxWidth: .infinity)
-        }
-    }
-
-    private var diagSheet: some View {
         NavigationStack {
-            VStack(alignment: .leading, spacing: 10) {
-                diagRow("内核", kernelOK ? "运行中" : "未连接")
-                diagRow("注入", st["inject"] ?? "-")
-                diagRow("画面", st["playing"] ?? "-")
-                diagRow("流", st["stream"] ?? "-")
-                diagRow("素材", st["video"] ?? "-")
-                diagRow("直播状态", state.rawValue)
-                diagRow("实时码率", sigText)
-                diagRow("重连次数", "\(retryCount)")
-                if !hint.isEmpty { Text(hint).font(.caption).foregroundStyle(.green) }
-                Spacer()
-            }
-            .padding()
-            .navigationTitle("实时分析")
-            .navigationBarTitleDisplayMode(.inline)
+            CameraCheckContent(cam: cam) { CameraPreview(session: cam.session, front: cam.front) }
+                .navigationTitle("开播前检查")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
         }
+        .onAppear { cam.start() }
+        .onDisappear { cam.stop() }
     }
+}
 
-    private func diagRow(_ k: String, _ v: String) -> some View {
-        HStack {
-            Text(k).font(.caption).foregroundStyle(.secondary)
-            Spacer()
-            Text(v).font(.caption).bold()
-        }
-    }
+/// 开播前检查页的内容（相机预览 + 说明 + 换摄像头按钮）
+struct CameraCheckContent<Preview: View>: View {
+    @ObservedObject var cam: CameraCheck
+    @ViewBuilder var preview: () -> Preview
 
-    // ── 智能核心：开机自检 + 每秒心跳 + 自动重连 ──
-    private func boot() {
-        // onAppear 可能多次触发（切后台回来、视图重建），只允许第一次真正启动，
-        // 否则每次都会再建一个 1 秒定时器，tick() 叠加运行越跑越卡。
-        if ContentView.didBoot { return }
-        ContentView.didBoot = true
-        // 老版本保存的是电脑 IP；首次升级时把它带到新的完整直播地址设置里。
-        if UserDefaults.standard.object(forKey: "streamURL") == nil {
-            streamURL = "http://\(pcIP):8899/obs/live.m3u8"
-        }
-        usingStreamSource = Link.streamEnabled()
-        fakeCameraOn = usingStreamSource
-        // 重活全扔后台，主线程只发指令（不然启动超时会被系统掐死）
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.cam.start()   // 一打开就唤醒相机进程，内核跟着自动注入
-            DispatchQueue.main.async { self.keepAliveAudio() }   // 保留静音播放器，退后台也继续收画面
-        }
-        vcu.start()   // 开门 28765，等万相电脑端连
-        if fakeCameraOn { vcamControl(true) }
-        Link.send(["cmd": "hello", "mode": netMode ? "stream" : "file", "url": builtURL])
-        if wasLive {
-            // 上次退出时在直播：自动恢复，不用人再点
-            wasLive = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { startLive() }
-        }
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in tick() }
-        // 悬浮窗通信单独用 GCD 定时器（界面滑动、后台时也照常跑）
-        if ContentView.floatTimer == nil {
-            let t = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
-            t.schedule(deadline: .now() + 1, repeating: 0.5)
-            t.setEventHandler { floatSync() }
-            t.resume()
-            ContentView.floatTimer = t
-        }
-    }
-
-    // 后台保活：循环播静音，iOS 才不会挂起我们（退后台照样收电脑画面）
-    private func keepAliveAudio() {
-        let session = AVAudioSession.sharedInstance()
-        // mixWithOthers：不抢别的 App（比如相机）的声音通道，也不容易被它们打断
-        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-        try? session.setActive(true)
-        // 播放器已经建好：被打断了就重新播，不用重建
-        if let existing = keepAlivePlayer {
-            if !existing.isPlaying { existing.play() }
-            return
-        }
-        let rate: Int32 = 8000
-        let seconds = 1
-        let dataLen = rate * Int32(seconds) * 2
-        var wav = Data()
-        wav.append("RIFF".data(using: .ascii)!)
-        var n = UInt32(36 + dataLen)
-        withUnsafeBytes(of: &n) { wav.append(contentsOf: $0) }
-        wav.append("WAVE".data(using: .ascii)!)
-        wav.append("fmt ".data(using: .ascii)!)
-        n = 16; withUnsafeBytes(of: &n) { wav.append(contentsOf: $0) }
-        var audioFormat = UInt16(1); withUnsafeBytes(of: &audioFormat) { wav.append(contentsOf: $0) }
-        var channels = UInt16(1); withUnsafeBytes(of: &channels) { wav.append(contentsOf: $0) }
-        var sampleRate = UInt32(rate); withUnsafeBytes(of: &sampleRate) { wav.append(contentsOf: $0) }
-        var byteRate = UInt32(rate * 1 * 2); withUnsafeBytes(of: &byteRate) { wav.append(contentsOf: $0) }
-        var blockAlign = UInt16(2); withUnsafeBytes(of: &blockAlign) { wav.append(contentsOf: $0) }
-        var bits = UInt16(16); withUnsafeBytes(of: &bits) { wav.append(contentsOf: $0) }
-        wav.append("data".data(using: .ascii)!)
-        var dataChunkLen = UInt32(dataLen)   // 原来这里误用了 n（=16），音频长度写错了
-        withUnsafeBytes(of: &dataChunkLen) { wav.append(contentsOf: $0) }
-        wav.append(Data(count: Int(dataLen)))   // 全零 = 静音
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("silence.wav")
-        try? wav.write(to: url)
-        let player = try? AVAudioPlayer(contentsOf: url)
-        if player == nil { StreamDecoder.dlog("保活: 静音播放器创建失败") }
-        player?.numberOfLoops = -1
-        player?.volume = 0.01
-        keepAlivePlayer = player
-        let ok = player?.play() ?? false
-        StreamDecoder.dlog("保活: 静音播放器启动 play=\(ok)")
-    }
-
-    // AUXFLOAT：和系统级悬浮窗（SpringBoard 里的小圆球）互通：每秒写状态、读指令
-    private func floatSync() {
-        let live = fakeCameraOn ? 1 : 0
-        let now = Int(Date().timeIntervalSince1970)
-        let text = "visible=1\nlive=\(live)\nack=\(floatLastCmdID)\nts=\(now)\n"
-        try? text.write(toFile: "/var/mobile/Media/DCIM/.auxcam-float.state", atomically: true, encoding: .utf8)
-        guard let t = try? String(contentsOfFile: "/var/mobile/Media/DCIM/.auxcam-float.cmd", encoding: .utf8) else { return }
-        let d = Link.parse(t)
-        guard let id = d["id"], id != floatLastCmdID else { return }
-        floatLastCmdID = id
-        // 只执行 App 启动之后发的指令，旧指令不理
-        let ts = Int(d["ts"] ?? "0") ?? 0
-        if ts < ContentView.floatStartTS - 1 { return }
-        StreamDecoder.dlog("悬浮窗指令: \(d["cmd"] ?? "?") id=\(id)")
-        switch d["cmd"] ?? "" {
-        case "fakeon": vcamControl(true)
-        case "fakeoff": vcamControl(false)
-        case "mirror": tapMirror()
-        case "rotate": tapRotate()
-        default: break
-        }
-    }
-
-    private func tick() {
-        // 保活看门狗：静音播放器被系统打断（比如相机抢了声音通道）就立刻重新播
-        if keepAlivePlayer != nil, keepAlivePlayer?.isPlaying != true {
-            StreamDecoder.dlog("保活: 播放器被打断，重新播放")
-            keepAliveAudio()
-        }
-        // 每 5 秒记一行：App 还活着、剩余内存多少（下次出问题能看日志判断是不是被系统杀的）
-        tickCount += 1
-        if tickCount % 5 == 0 {
-            let availMB = Int(os_proc_available_memory() / 1_048_576)
-            StreamDecoder.dlog("心跳 t=\(tickCount) 剩余内存=\(availMB)MB 保活=\(keepAlivePlayer?.isPlaying == true)")
-        }
-        st = Link.status()
-        if Date().timeIntervalSince(cameraCommandAt) > 2 && !usingStreamSource {
-            fakeCameraOn = playingFake
-        }
-        if kernelOK {
-            deadCount = 0
-        } else {
-            deadCount += 1
-            if deadCount == 5 && !revived {
-                revived = true
-                DispatchQueue.global(qos: .utility).async { Link.reviveKernel() }
-            }
-        }
-        // 心跳：电脑画面每秒都在往手机里写数据 = 直连活着
-        let now = Date()
-        let previousBytes = lastES
-        let cur = usingHLSSource ? hlsSource.frameCount : (usingStreamSource ? vcu.videoByteCount() : Link.vcamStamp())
-        let progressing = previousBytes >= 0 && cur > previousBytes
-        if now.timeIntervalSince(lastTick) > 0.7, cur >= 0, lastES >= 0 {   // 原来写反了(恒为负)，码率一直显示 0
-            let dt = now.timeIntervalSince(lastTick)
-            kbps = max(0, Double(cur - lastES) * 8.0 / dt / 1000.0)
-        }
-        lastES = cur
-        lastTick = now
-
-        guard state == .starting || state == .live || state == .broken else { return }
-        if fakeCameraOn && cur > 0 {
-            if progressing || st["stream"] == "帧模式" || st["stream"] == "文件模式" {
-                state = .live
-                stuckCount = 0
-            } else {
-                stuckCount += 1
-                if stuckCount >= 8 {
-                    stuckCount = 0
-                    state = .broken
-                    autoRetry()
+    var body: some View {
+            VStack(spacing: 12) {
+                ZStack {
+                    Color.black
+                    preview()
+                    if !cam.status.isEmpty {
+                        Text(cam.status).foregroundStyle(.white).padding()
+                    }
                 }
-            }
-        } else if cur <= 0 || (!fakeCameraOn && state == .live) {
-            stuckCount += 1
-            if stuckCount >= 8 {   // 8 秒没动静 = 断了，自己重连
-                stuckCount = 0
-                state = .broken
-                autoRetry()
-            }
-        }
-    }
+                .frame(maxWidth: .infinity)
+                .frame(height: 420)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
 
-    private func autoRetry() {
-        if retryCount >= 3 {
-            // 连不上：自动换一条路（直连 ↔ 局域网/文件模式）
-            retryCount = 0
-            netMode.toggle()
-            hint = "已自动切换为" + (netMode ? "局域网" : "USB直连")
-            if fakeCameraOn { vcamControl(true) }
-        } else {
-            retryCount += 1
-        }
-        startLive()
-    }
-
-    private func startLive() {
-        state = .starting
-        stuckCount = 0
-        Link.send(["cmd": "start", "mode": netMode ? "stream" : "file", "url": builtURL])
-    }
-
-    private func stopLive() {
-        state = .idle
-        stuckCount = 0
-        retryCount = 0
-        Link.send(["cmd": "stop"])
-    }
-
-    private var bigTitle: String {
-        switch state {
-        case .idle: return "开始视频直播"
-        case .starting: return netMode ? "正在连接局域网…" : "正在启动 USB…"
-        case .live: return netMode ? "停止局域网接收" : "停止直连"
-        case .broken: return "断流重连中…"
-        }
-    }
-
-    private var bigTint: Color {
-        switch state {
-        case .idle: return .green
-        case .starting, .broken: return .orange
-        case .live: return .red
-        }
-    }
-
-    private func toggleLive() {
-        switch state {
-        case .idle, .broken:
-            retryCount = 0
-            startLive()
-            wasLive = true
-        case .starting, .live:
-            stopLive()
-            wasLive = false
-        }
-    }
-
-    private func tapDirect() {
-        netMode = false
-        hasPickedVideo = false
-        hint = "USB直连：电脑画面走数据线"
-        if state == .live || state == .starting { startLive() } else {
-            Link.send(["cmd": "mode", "mode": "file", "url": builtURL])
-        }
-        if fakeCameraOn { vcamControl(true) }
-    }
-
-    private func tapNetwork() {
-        netMode = true
-        hasPickedVideo = false
-        hint = "局域网：电脑需开启 OBS 或其他直播软件，地址为 \(builtURL)"
-        if state == .live || state == .starting { startLive() } else {
-            Link.send(["cmd": "mode", "mode": "stream", "url": builtURL])
-        }
-        if fakeCameraOn { vcamControl(true) }
-    }
-
-    private func tapMirror() {
-        mirrorOn.toggle()
-        auxcam_set_transform(mirrorOn ? 1 : 0, Int32(rotation))
-        StreamDecoder.dlog("镜像 \(mirrorOn ? "开" : "关") 旋转=\(rotation)")
-        hint = mirrorOn ? "镜像已开" : "镜像已关"
-    }
-
-    private func tapRotate() {
-        rotation = (rotation + 90) % 360
-        auxcam_set_transform(mirrorOn ? 1 : 0, Int32(rotation))
-        StreamDecoder.dlog("旋转 \(rotation)° 镜像=\(mirrorOn)")
-        hint = "已旋转 \(rotation)°"
-    }
-
-    private func tapRecord() {
-        recordOn.toggle()
-        Link.send(["cmd": recordOn ? "record_on" : "record_off"])
-        hint = recordOn ? "内录已开（自动存档电脑画面）" : "内录已关"
-    }
-
-    private func tapReset() {
-        state = .idle
-        stuckCount = 0
-        retryCount = 0
-        wasLive = false
-        mirrorOn = false
-        recordOn = false
-        rotation = 0
-        auxcam_set_transform(0, 0)
-        vcamControl(false)   // 真正切回真镜头
-        Link.send(["cmd": "reset"])
-    }
-
-    private func setStreamMode(_ enabled: Bool) throws {
-        let url = Link.streamCfgURL
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        var lines = existing.components(separatedBy: .newlines).filter { !$0.isEmpty }
-        let activeLine = "active=\(enabled ? 1 : 0)"
-        if let index = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("active=") }) {
-            lines[index] = activeLine
-        } else {
-            lines.insert(activeLine, at: 0)
-        }
-        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
-    }
-
-    // USB 直连用 VCU1 解码帧；局域网用 AVPlayer 拉 HLS 并发布共享画面；相册仍走文件模式。
-    private func vcamControl(_ on: Bool) {
-        let path = "/var/mobile/Media/DCIM/vcam.mp4"
-        let plistPath = "/var/mobile/Media/DCIM/vcam.plist"
-        let useUSBStream = on && !netMode && !hasPickedVideo
-        let useHLS = on && netMode
-        let useStream = useUSBStream || useHLS
-        if useHLS {
-            let scheme = URL(string: builtURL)?.scheme?.lowercased()
-            guard scheme == "http" || scheme == "https" else {
-                hint = "请先填写完整的电脑直播地址（http://...）"
-                return
-            }
-        }
-        if on && !useStream && !FileManager.default.fileExists(atPath: path) {
-            fakeCameraOn = false
-            hint = "没有可播放视频，请先选视频或推送素材"
-            return
-        }
-        var p: [String: Any] = [
-            "masterEnabled": false, "enabled": false,
-            "flipHorizontal": false, "flipVertical": false,
-            "rotation": 0,
-            "sourcePath": path,
-            "generation": 1,
-        ]
-        if let d = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
-           let loaded = try? PropertyListSerialization.propertyList(from: d, options: [], format: nil) as? [String: Any] {
-            p = loaded
-        }
-        p["masterEnabled"] = on && !useStream
-        p["enabled"] = on && !useStream
-        p["generation"] = (p["generation"] as? Int ?? 0) + 1
-        p["sourcePath"] = path
-        do {
-            let data = try PropertyListSerialization.data(fromPropertyList: p, format: .xml, options: 0)
-            if useStream {
-                try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
-                try setStreamMode(true)
-                if useHLS, let url = URL(string: builtURL) {
-                    hlsSource.start(url: url)
-                } else {
-                    hlsSource.stop()
+                VStack(alignment: .leading, spacing: 8) {
+                    explain("checkmark.circle.fill", .green, "看到电脑画面", "一切正常，开播吧")
+                    explain("moon.fill", .gray, "看到黑屏", "替换开着，但电脑画面还没到：在电脑上开始推流")
+                    explain("exclamationmark.triangle.fill", .red, "看到你自己 / 真实画面", "替换没打开，或插件没生效：先别开播")
+                    Text("文字左右反了就点主界面的\"镜像\"，方向不对就点\"旋转\"。直播中不要打开这个页面。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
-            } else {
-                hlsSource.stop()
-                try setStreamMode(false)
-                try data.write(to: URL(fileURLWithPath: plistPath), options: .atomic)
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color(UIColor.secondarySystemGroupedBackground)))
+
+                Button { cam.flip() } label: {
+                    Label(cam.front ? "现在是前摄像头（点这里换后摄像头）" : "现在是后摄像头（点这里换前摄像头）",
+                          systemImage: "arrow.triangle.2.circlepath.camera")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                Spacer(minLength: 0)
             }
-            let activeStreamSource = useStream
-            if usingStreamSource != activeStreamSource || usingHLSSource != useHLS {
-                lastES = -1; lastTick = Date(); kbps = 0
+            .padding(16)
+    }
+
+    private func explain(_ icon: String, _ color: Color, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.subheadline.bold())
+                Text(detail).font(.caption).foregroundStyle(.secondary)
             }
-            fakeCameraOn = on
-            usingStreamSource = activeStreamSource
-            usingHLSSource = useHLS
-            cameraCommandAt = Date()
-            if !on {
-                hint = "已切回真镜头"
-            } else if useHLS {
-                hint = "正在连接电脑画面：\(builtURL)"
-            } else if useUSBStream {
-                hint = vcu.alive ? "电脑实时流已启用" : "实时流已启用，等待电脑推流"
-            } else {
-                hint = "已切换：相机放视频"
-            }
-        } catch {
-            hint = "切换失败，请检查 AuxCam 文件权限"
         }
     }
 }

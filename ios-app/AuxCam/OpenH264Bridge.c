@@ -1,3 +1,4 @@
+// AuxCam 手机端 C 部分：OpenH264 软件解码 + 写共享内存（相机插件从共享内存读画面）。
 #include "OpenH264Bridge.h"
 #include "AuxCamSharedFrame.h"
 #include "codec_api.h"
@@ -11,39 +12,177 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// ───────────────────────── 软件解码 ─────────────────────────
+
 typedef struct {
     ISVCDecoder *api;
+    CVPixelBufferPoolRef pool;   // 输出画面的缓冲池（重复使用，不每帧申请 3MB 新内存）
+    int poolW, poolH;
 } AuxH264Decoder;
 
-static const char *kSharedFramePath = "/var/mobile/Media/DCIM/.frame.ring";
-static pthread_mutex_t gPublishMutex = PTHREAD_MUTEX_INITIALIZER;
-static int gSharedFrameFD = -1;
-static void *gSharedFrameMap = MAP_FAILED;
-static size_t gSharedFrameMapBytes = 0;
-
-static size_t sharedFrameFileBytes(void) {
-    return sizeof(AuxSharedFrameHeader) +
-        (size_t)AUX_SHARED_FRAME_SLOT_COUNT * AUX_SHARED_FRAME_SLOT_CAPACITY;
+static void setNumber(CFMutableDictionaryRef dict, CFStringRef key, int32_t value) {
+    CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
+    if (number) {
+        CFDictionarySetValue(dict, key, number);
+        CFRelease(number);
+    }
 }
 
-static int32_t ensureSharedFrameMap(void) {
-    if (gSharedFrameMap != MAP_FAILED) return 0;
-    const size_t bytes = sharedFrameFileBytes();
+// 注意：不带 IOSurface 属性。这台越狱机上带 IOSurface 属性创建缓冲会失败。
+static CVPixelBufferRef makeOutputBuffer(AuxH264Decoder *d, int width, int height) {
+    if (d->pool == NULL || d->poolW != width || d->poolH != height) {
+        if (d->pool) { CVPixelBufferPoolRelease(d->pool); d->pool = NULL; }
+        CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFMutableDictionaryRef poolAttrs = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (attrs && poolAttrs) {
+            setNumber(attrs, kCVPixelBufferPixelFormatTypeKey, (int32_t)kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+            setNumber(attrs, kCVPixelBufferWidthKey, width);
+            setNumber(attrs, kCVPixelBufferHeightKey, height);
+            setNumber(poolAttrs, kCVPixelBufferPoolMinimumBufferCountKey, 10);
+            CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs, attrs, &d->pool);
+        }
+        if (attrs) CFRelease(attrs);
+        if (poolAttrs) CFRelease(poolAttrs);
+        d->poolW = width;
+        d->poolH = height;
+    }
+    CVPixelBufferRef buffer = NULL;
+    if (d->pool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, d->pool, &buffer) == kCVReturnSuccess && buffer) {
+        return buffer;
+    }
+    buffer = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height,
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, NULL, &buffer);
+    return buffer;
+}
+
+void *auxh264_create(void) {
+    AuxH264Decoder *d = (AuxH264Decoder *)calloc(1, sizeof(AuxH264Decoder));
+    if (d == NULL) return NULL;
+    if (WelsCreateDecoder(&d->api) != 0 || d->api == NULL) {
+        free(d);
+        return NULL;
+    }
+    // 单线程（0）：OpenH264 的多线程解码实测会把画面解错，哪怕关键帧也错。
+    int32_t threads = 0;
+    (*d->api)->SetOption(d->api, DECODER_OPTION_NUM_OF_THREADS, &threads);
+    SDecodingParam param;
+    memset(&param, 0, sizeof(param));
+    param.uiTargetDqLayer = UCHAR_MAX;
+    param.eEcActiveIdc = ERROR_CON_SLICE_COPY;   // 码流有小错时自动修补，不黑屏
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
+    if ((*d->api)->Initialize(d->api, &param) != 0) {
+        WelsDestroyDecoder(d->api);
+        free(d);
+        return NULL;
+    }
+    return d;
+}
+
+void auxh264_destroy(void *opaque) {
+    AuxH264Decoder *d = (AuxH264Decoder *)opaque;
+    if (d == NULL) return;
+    if (d->api) {
+        (*d->api)->Uninitialize(d->api);
+        WelsDestroyDecoder(d->api);
+    }
+    if (d->pool) CVPixelBufferPoolRelease(d->pool);
+    free(d);
+}
+
+int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length, int32_t lowDelay,
+                       CVPixelBufferRef *outputBuffer) {
+    if (outputBuffer) *outputBuffer = NULL;
+    AuxH264Decoder *d = (AuxH264Decoder *)opaque;
+    if (d == NULL || d->api == NULL || bytes == NULL || length <= 0 || outputBuffer == NULL) return -1;
+
+    SBufferInfo info;
+    unsigned char *planes[3] = { NULL, NULL, NULL };
+    memset(&info, 0, sizeof(info));
+    DECODING_STATE state = (*d->api)->DecodeFrameNoDelay(d->api, bytes, length, planes, &info);
+    // 开了错误修补：就算报了小错，只要吐出了画面就照样用；既报错又没画面才算失败。
+    if (state != dsErrorFree && info.iBufferStatus != 1) return -2;
+    if (info.iBufferStatus != 1 && lowDelay) {
+        // High / Main 档次的视频，OpenH264 会为"可能的重排序"把刚解好的画面扣住一帧（实测：每帧都晚一帧出，
+        // 第一张关键帧要等第二帧来了才出）。没有 B 帧时根本不需要重排，用官方的 FlushFrame 立刻放出来。
+        // FlushFrame 只在"流结束"标记打开时才放画面；下一次送数据时解码器会自己把这个标记清掉，不影响后续解码。
+        int32_t eos = 1;
+        (*d->api)->SetOption(d->api, DECODER_OPTION_END_OF_STREAM, &eos);
+        memset(&info, 0, sizeof(info));
+        planes[0] = planes[1] = planes[2] = NULL;
+        (*d->api)->FlushFrame(d->api, planes, &info);
+        eos = 0;
+        (*d->api)->SetOption(d->api, DECODER_OPTION_END_OF_STREAM, &eos);
+    }
+    if (info.iBufferStatus != 1) return 0;
+
+    const int width = info.UsrData.sSystemBuffer.iWidth;
+    const int height = info.UsrData.sSystemBuffer.iHeight;
+    const int yStride = info.UsrData.sSystemBuffer.iStride[0];
+    const int uvStride = info.UsrData.sSystemBuffer.iStride[1];
+    const uint8_t *ySrc = info.pDst[0], *uSrc = info.pDst[1], *vSrc = info.pDst[2];
+    if (width <= 0 || height <= 0 || (width & 1) || (height & 1) || width > 4096 || height > 4096 ||
+        yStride < width || uvStride < width / 2 || !ySrc || !uSrc || !vSrc) return -3;
+
+    CVPixelBufferRef buffer = makeOutputBuffer(d, width, height);
+    if (buffer == NULL) return -4;
+    if (CVPixelBufferLockBaseAddress(buffer, 0) != kCVReturnSuccess) {
+        CVPixelBufferRelease(buffer);
+        return -5;
+    }
+    uint8_t *yDst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buffer, 0);
+    uint8_t *uvDst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buffer, 1);
+    const size_t yDstStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0);
+    const size_t uvDstStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1);
+    if (!yDst || !uvDst || yDstStride < (size_t)width || uvDstStride < (size_t)width) {
+        CVPixelBufferUnlockBaseAddress(buffer, 0);
+        CVPixelBufferRelease(buffer);
+        return -6;
+    }
+    for (int row = 0; row < height; row++) {
+        memcpy(yDst + (size_t)row * yDstStride, ySrc + (size_t)row * (size_t)yStride, (size_t)width);
+    }
+    const int halfW = width / 2;
+    for (int row = 0; row < height / 2; row++) {
+        uint8_t *uv = uvDst + (size_t)row * uvDstStride;
+        const uint8_t *u = uSrc + (size_t)row * (size_t)uvStride;
+        const uint8_t *v = vSrc + (size_t)row * (size_t)uvStride;
+        for (int col = 0; col < halfW; col++) {
+            uv[2 * col] = u[col];
+            uv[2 * col + 1] = v[col];
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, 0);
+    *outputBuffer = buffer;
+    return 1;
+}
+
+// ───────────────────────── 共享内存（给相机插件） ─────────────────────────
+// 格式见 AuxCamSharedFrame.h，必须和插件 tweak-stream 保持一致。
+
+#ifndef AUX_SHARED_FRAME_PATH
+#define AUX_SHARED_FRAME_PATH "/var/mobile/Media/DCIM/.frame.ring"   // 电脑上测试时可以换路径
+#endif
+static const char *kSharedFramePath = AUX_SHARED_FRAME_PATH;
+static pthread_mutex_t gPublishMutex = PTHREAD_MUTEX_INITIALIZER;
+static void *gMap = MAP_FAILED;
+
+static int32_t ensureSharedMap(void) {
+    if (gMap != MAP_FAILED) return 0;
+    const size_t bytes = sizeof(AuxSharedFrameHeader) +
+        (size_t)AUX_SHARED_FRAME_SLOT_COUNT * AUX_SHARED_FRAME_SLOT_CAPACITY;
     int fd = open(kSharedFramePath, O_CREAT | O_RDWR, 0666);
     if (fd < 0) return -10;
     (void)fchmod(fd, 0666);
     struct stat st;
     if (fstat(fd, &st) != 0 || (size_t)st.st_size < bytes) {
-        if (ftruncate(fd, (off_t)bytes) != 0) {
-            close(fd);
-            return -11;
-        }
+        if (ftruncate(fd, (off_t)bytes) != 0) { close(fd); return -11; }
     }
     void *map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) {
-        close(fd);
-        return -12;
-    }
+    close(fd);   // 映射建好后文件句柄可以关掉，映射依然有效
+    if (map == MAP_FAILED) return -12;
     AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)map;
     if (__atomic_load_n(&header->magic, __ATOMIC_ACQUIRE) != AUX_SHARED_FRAME_MAGIC ||
         header->version != AUX_SHARED_FRAME_VERSION) {
@@ -51,116 +190,13 @@ static int32_t ensureSharedFrameMap(void) {
         header->version = AUX_SHARED_FRAME_VERSION;
         __atomic_store_n(&header->magic, AUX_SHARED_FRAME_MAGIC, __ATOMIC_RELEASE);
     }
-    gSharedFrameFD = fd;
-    gSharedFrameMap = map;
-    gSharedFrameMapBytes = bytes;
+    gMap = map;
     return 0;
 }
 
-static int32_t makeDecoder(AuxH264Decoder *decoder) {
-    if (WelsCreateDecoder(&decoder->api) != 0 || decoder->api == NULL) return -1;
-    SDecodingParam parameters;
-    memset(&parameters, 0, sizeof(parameters));
-    parameters.uiTargetDqLayer = UCHAR_MAX;
-    parameters.eEcActiveIdc = ERROR_CON_SLICE_COPY;
-    parameters.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-    if ((*decoder->api)->Initialize(decoder->api, &parameters) != 0) {
-        WelsDestroyDecoder(decoder->api);
-        decoder->api = NULL;
-        return -2;
-    }
-    return 0;
-}
-
-void *auxh264_create(void) {
-    AuxH264Decoder *decoder = (AuxH264Decoder *)calloc(1, sizeof(AuxH264Decoder));
-    if (decoder == NULL) return NULL;
-    if (makeDecoder(decoder) != 0) {
-        free(decoder);
-        return NULL;
-    }
-    return decoder;
-}
-
-void auxh264_destroy(void *opaque) {
-    AuxH264Decoder *decoder = (AuxH264Decoder *)opaque;
-    if (decoder == NULL) return;
-    if (decoder->api != NULL) {
-        (*decoder->api)->Uninitialize(decoder->api);
-        WelsDestroyDecoder(decoder->api);
-    }
-    free(decoder);
-}
-
-int32_t auxh264_decode(void *opaque, const uint8_t *bytes, int32_t length,
-                       CVPixelBufferRef _Nullable * _Nonnull outputBuffer) {
-    if (outputBuffer != NULL) *outputBuffer = NULL;
-    AuxH264Decoder *decoder = (AuxH264Decoder *)opaque;
-    if (decoder == NULL || decoder->api == NULL || bytes == NULL || length <= 0 || outputBuffer == NULL) return -1;
-
-    SBufferInfo info;
-    unsigned char *planes[3] = { NULL, NULL, NULL };
-    memset(&info, 0, sizeof(info));
-    DECODING_STATE state = (*decoder->api)->DecodeFrameNoDelay(
-        decoder->api, bytes, length, planes, &info);
-    // 开了错误隐藏后，丢参考/码流小错时 OpenH264 仍会吐出一张"修补过"的画面(iBufferStatus==1)。
-    // 旧逻辑只要 state 不是完全无错就整帧扔掉并报错，导致一次小错就一直黑到下个关键帧。
-    // 现在：有画面就照样输出；只有既报错又没画面才算失败。
-    if (state != dsErrorFree && info.iBufferStatus != 1) return -2;
-    if (info.iBufferStatus != 1) return 0;
-
-    const int width = info.UsrData.sSystemBuffer.iWidth;
-    const int height = info.UsrData.sSystemBuffer.iHeight;
-    const int yStride = info.UsrData.sSystemBuffer.iStride[0];
-    const int uvStride = info.UsrData.sSystemBuffer.iStride[1];
-    const uint8_t *ySrc = info.pDst[0];
-    const uint8_t *uSrc = info.pDst[1];
-    const uint8_t *vSrc = info.pDst[2];
-    if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
-        yStride < width || uvStride < width / 2 || ySrc == NULL || uSrc == NULL || vSrc == NULL) return -3;
-
-    CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn createStatus = CVPixelBufferCreate(
-        kCFAllocatorDefault, (size_t)width, (size_t)height,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, NULL, &pixelBuffer);
-    if (createStatus != kCVReturnSuccess || pixelBuffer == NULL) {
-        if (pixelBuffer != NULL) CVPixelBufferRelease(pixelBuffer);
-        return -2000 - (int32_t)createStatus;
-    }
-    CVReturn lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-    if (lockStatus != kCVReturnSuccess) {
-        CVPixelBufferRelease(pixelBuffer);
-        return -6;
-    }
-    uint8_t *yDst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
-    uint8_t *uvDst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
-    size_t yDstStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-    size_t uvDstStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
-    if (yDst == NULL || uvDst == NULL || yDstStride < (size_t)width || uvDstStride < (size_t)width) {
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-        CVPixelBufferRelease(pixelBuffer);
-        return -7;
-    }
-    for (int row = 0; row < height; row++) {
-        memcpy(yDst + (size_t)row * yDstStride, ySrc + (size_t)row * (size_t)yStride, (size_t)width);
-    }
-    for (int row = 0; row < height / 2; row++) {
-        uint8_t *uv = uvDst + (size_t)row * uvDstStride;
-        const uint8_t *u = uSrc + (size_t)row * (size_t)uvStride;
-        const uint8_t *v = vSrc + (size_t)row * (size_t)uvStride;
-        for (int col = 0; col < width / 2; col++) {
-            uv[col * 2] = u[col];
-            uv[col * 2 + 1] = v[col];
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-    *outputBuffer = pixelBuffer;
-    return 1;
-}
-
-// AUXXFORM：镜像 / 旋转（发布到共享内存前对画面做变换）
+// 镜像 / 旋转
 static volatile int gMirror = 0;
-static volatile int gRotate = 0;   // 0 / 90 / 180 / 270（顺时针）
+static volatile int gRotate = 0;
 
 void auxcam_set_transform(int32_t mirror, int32_t rotate) {
     int r = ((rotate % 360) + 360) % 360;
@@ -168,34 +204,50 @@ void auxcam_set_transform(int32_t mirror, int32_t rotate) {
     gMirror = mirror ? 1 : 0;
 }
 
-#define AUX_XFORM_PLANE(NAME, T) \
-static void NAME(const uint8_t *src, size_t sStride, int sw, int sh, uint8_t *dst, size_t dStride, int rot, int mirror) { \
-    int W = (rot == 90 || rot == 270) ? sh : sw; \
-    int H = (rot == 90 || rot == 270) ? sw : sh; \
-    for (int dy = 0; dy < H; dy++) { \
-        T *drow = (T *)(dst + (size_t)dy * dStride); \
-        for (int dx = 0; dx < W; dx++) { \
-            int mx = mirror ? (W - 1 - dx) : dx; \
-            int sx, sy; \
-            switch (rot) { \
-                case 90:  sx = dy;          sy = sh - 1 - mx; break; \
-                case 180: sx = sw - 1 - mx; sy = sh - 1 - dy; break; \
-                case 270: sx = sw - 1 - dy; sy = mx;          break; \
-                default:  sx = mx;          sy = dy;          break; \
-            } \
-            drow[dx] = ((const T *)(src + (size_t)sy * sStride))[sx]; \
-        } \
-    } \
+// 旋转 / 镜像一个平面。bpp = 每个点几个字节：Y 平面 1 个，UV 平面 2 个（U、V 成对搬，不会拆开）。
+// 按字节搬，不做 2 字节强制转换，不依赖内存对齐。
+static void xformPlane(const uint8_t *src, size_t sStride, int sw, int sh, uint8_t *dst, size_t dStride,
+                       int rot, int mirror, int bpp) {
+    int W = (rot == 90 || rot == 270) ? sh : sw;
+    int H = (rot == 90 || rot == 270) ? sw : sh;
+    for (int dy = 0; dy < H; dy++) {
+        uint8_t *drow = dst + (size_t)dy * dStride;
+        for (int dx = 0; dx < W; dx++) {
+            int mx = mirror ? (W - 1 - dx) : dx;
+            int sx, sy;
+            switch (rot) {
+                case 90:  sx = dy;          sy = sh - 1 - mx; break;
+                case 180: sx = sw - 1 - mx; sy = sh - 1 - dy; break;
+                case 270: sx = sw - 1 - dy; sy = mx;          break;
+                default:  sx = mx;          sy = dy;          break;
+            }
+            const uint8_t *s = src + (size_t)sy * sStride + (size_t)sx * (size_t)bpp;
+            uint8_t *d = drow + (size_t)dx * (size_t)bpp;
+            d[0] = s[0];
+            if (bpp == 2) d[1] = s[1];
+        }
+    }
 }
-AUX_XFORM_PLANE(auxXformPlane8, uint8_t)
-AUX_XFORM_PLANE(auxXformPlane16, uint16_t)
 
-int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
+// 窄范围 → 全范围的查表（Y: 16~235 → 0~255；UV: 16~240 → 0~255，以 128 为中心）
+static uint8_t gLumaLUT[256], gChromaLUT[256];
+static pthread_once_t gLUTOnce = PTHREAD_ONCE_INIT;
+static void buildLUT(void) {
+    for (int i = 0; i < 256; i++) {
+        int y = ((i - 16) * 255 + 109) / 219;
+        int c = ((i - 128) * 255) / 224 + 128;
+        gLumaLUT[i] = (uint8_t)(y < 0 ? 0 : (y > 255 ? 255 : y));
+        gChromaLUT[i] = (uint8_t)(c < 0 ? 0 : (c > 255 ? 255 : c));
+    }
+}
+static void applyLUT(uint8_t *p, size_t n, const uint8_t *lut) {
+    for (size_t i = 0; i < n; i++) p[i] = lut[p[i]];
+}
+
+int32_t auxcam_publish_frame(CVPixelBufferRef frame, int32_t limitedRange) {
     if (frame == NULL || !CVPixelBufferIsPlanar(frame) || CVPixelBufferGetPlaneCount(frame) < 2) return -1;
     const size_t width = CVPixelBufferGetWidth(frame);
     const size_t height = CVPixelBufferGetHeight(frame);
-    // 宽、高各放宽到 4096（原来高度卡在 2160，竖屏素材如 1080×2274 会被拒收 → 手机没画面）。
-    // 真正的内存上限由下面的 slot 容量判断兜底（宽×高×1.5 ≤ 16MB），不会越界。
     if (width == 0 || height == 0 || (width & 1) || (height & 1) ||
         width > 4096 || height > 4096 || width * height * 3 / 2 > AUX_SHARED_FRAME_SLOT_CAPACITY) return -2;
     if (CVPixelBufferLockBaseAddress(frame, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -3;
@@ -203,28 +255,29 @@ int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
     const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(frame, 1);
     const size_t srcYStride = CVPixelBufferGetBytesPerRowOfPlane(frame, 0);
     const size_t srcUVStride = CVPixelBufferGetBytesPerRowOfPlane(frame, 1);
-    if (srcY == NULL || srcUV == NULL || srcYStride < width || srcUVStride < width) {
+    if (!srcY || !srcUV || srcYStride < width || srcUVStride < width) {
         CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
         return -4;
     }
+    if (limitedRange) pthread_once(&gLUTOnce, buildLUT);
 
     pthread_mutex_lock(&gPublishMutex);
-    int32_t mapResult = ensureSharedFrameMap();
+    int32_t mapResult = ensureSharedMap();
     if (mapResult != 0) {
         pthread_mutex_unlock(&gPublishMutex);
         CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
         return mapResult;
     }
-    AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)gSharedFrameMap;
+    AuxSharedFrameHeader *header = (AuxSharedFrameHeader *)gMap;
+    // 选一个不是"当前画面"的槽来写（插件可能正在读当前那张）
     uint32_t active = __atomic_load_n(&header->activeSlot, __ATOMIC_ACQUIRE);
     if (active >= AUX_SHARED_FRAME_SLOT_COUNT) active = 0;
     uint32_t target = AUX_SHARED_FRAME_SLOT_COUNT;
     for (uint32_t i = 0; i < AUX_SHARED_FRAME_SLOT_COUNT; i++) {
         if (i == active) continue;
-        AuxSharedFrameSlot *slot = &header->slots[i];
-        uint32_t stateValue = __atomic_load_n(&slot->state, __ATOMIC_ACQUIRE);
-        if (stateValue != AUX_SHARED_SLOT_FREE && stateValue != AUX_SHARED_SLOT_READY) continue;
-        if (__atomic_compare_exchange_n(&slot->state, &stateValue, AUX_SHARED_SLOT_WRITING,
+        uint32_t state = __atomic_load_n(&header->slots[i].state, __ATOMIC_ACQUIRE);
+        if (state != AUX_SHARED_SLOT_FREE && state != AUX_SHARED_SLOT_READY) continue;
+        if (__atomic_compare_exchange_n(&header->slots[i].state, &state, AUX_SHARED_SLOT_WRITING,
                                         false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             target = i;
             break;
@@ -237,40 +290,27 @@ int32_t auxcam_publish_shared_frame(CVPixelBufferRef frame) {
     }
 
     AuxSharedFrameSlot *slot = &header->slots[target];
-    uint8_t *dst = (uint8_t *)gSharedFrameMap + sizeof(*header) +
-        (size_t)target * AUX_SHARED_FRAME_SLOT_CAPACITY;
-    const int xRot = gRotate;
-    const int xMirror = gMirror;
-    if (xRot != 0 || xMirror) {
-        const size_t outW = (xRot == 90 || xRot == 270) ? height : width;
-        const size_t outH = (xRot == 90 || xRot == 270) ? width : height;
-        auxXformPlane8(srcY, srcYStride, (int)width, (int)height, dst, outW, xRot, xMirror);
-        auxXformPlane16(srcUV, srcUVStride, (int)(width / 2), (int)(height / 2),
-                        dst + outW * outH, outW, xRot, xMirror);
-        slot->width = (uint32_t)outW;
-        slot->height = (uint32_t)outH;
-        slot->yStride = (uint32_t)outW;
-        slot->uvStride = (uint32_t)outW;
-        slot->frameBytes = (uint32_t)(outW * outH * 3 / 2);
-        __atomic_store_n(&slot->state, AUX_SHARED_SLOT_READY, __ATOMIC_RELEASE);
-        __atomic_store_n(&header->activeSlot, target, __ATOMIC_RELEASE);
-        __atomic_add_fetch(&header->sequence, 1, __ATOMIC_ACQ_REL);
-        pthread_mutex_unlock(&gPublishMutex);
-        CVPixelBufferUnlockBaseAddress(frame, kCVPixelBufferLock_ReadOnly);
-        return 1;
+    uint8_t *dst = (uint8_t *)gMap + sizeof(*header) + (size_t)target * AUX_SHARED_FRAME_SLOT_CAPACITY;
+    const int rot = gRotate, mirror = gMirror;
+    const size_t outW = (rot == 90 || rot == 270) ? height : width;
+    const size_t outH = (rot == 90 || rot == 270) ? width : height;
+    uint8_t *dstUV = dst + outW * outH;
+    if (rot != 0 || mirror) {
+        xformPlane(srcY, srcYStride, (int)width, (int)height, dst, outW, rot, mirror, 1);
+        xformPlane(srcUV, srcUVStride, (int)(width / 2), (int)(height / 2), dstUV, outW, rot, mirror, 2);
+    } else {
+        for (size_t row = 0; row < height; row++) memcpy(dst + row * width, srcY + row * srcYStride, width);
+        for (size_t row = 0; row < height / 2; row++) memcpy(dstUV + row * width, srcUV + row * srcUVStride, width);
     }
-    for (size_t row = 0; row < height; row++) {
-        memcpy(dst + row * width, srcY + row * srcYStride, width);
+    if (limitedRange) {
+        applyLUT(dst, outW * outH, gLumaLUT);
+        applyLUT(dstUV, outW * outH / 2, gChromaLUT);
     }
-    uint8_t *dstUV = dst + width * height;
-    for (size_t row = 0; row < height / 2; row++) {
-        memcpy(dstUV + row * width, srcUV + row * srcUVStride, width);
-    }
-    slot->width = (uint32_t)width;
-    slot->height = (uint32_t)height;
-    slot->yStride = (uint32_t)width;
-    slot->uvStride = (uint32_t)width;
-    slot->frameBytes = (uint32_t)(width * height * 3 / 2);
+    slot->width = (uint32_t)outW;
+    slot->height = (uint32_t)outH;
+    slot->yStride = (uint32_t)outW;
+    slot->uvStride = (uint32_t)outW;
+    slot->frameBytes = (uint32_t)(outW * outH * 3 / 2);
     __atomic_store_n(&slot->state, AUX_SHARED_SLOT_READY, __ATOMIC_RELEASE);
     __atomic_store_n(&header->activeSlot, target, __ATOMIC_RELEASE);
     __atomic_add_fetch(&header->sequence, 1, __ATOMIC_ACQ_REL);
